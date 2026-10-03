@@ -23,23 +23,23 @@
 //
 //     c, err := up.Upgrade(w, r)
 //     if err != nil {
-//         return // an appropriate 4xx/5xx response was already written
+//     return // an appropriate 4xx/5xx response was already written
 //     }
 //     defer c.Close(ws.StatusNormalClosure, "")
 //
 //     for {
-//         op, data, err := c.ReadMessage()
-//         if err != nil {
-//             // abnormal end: transport error, protocol violation, or an
-//             // application close code. See CloseCode for details.
-//             break
-//         }
-//         if op == 0 {
-//             // normal close (1000): ReadMessage returns (0, nil, nil)
-//             break
-//         }
-//         // op is OpText or OpBinary
-//         _ = c.WriteMessage(op, data)
+//     op, data, err := c.ReadMessage()
+//     if err != nil {
+//     // abnormal end: transport error, protocol violation, or an
+//     // application close code. See CloseCode for details.
+//     break
+//     }
+//     if op == 0 {
+//     // normal close (1000): ReadMessage returns (0, nil, nil)
+//     break
+//     }
+//     // op is OpText or OpBinary
+//     _ = c.WriteMessage(op, data)
 //     }
 //
 //  4. Close detection covers all four classes of death, funneled into the
@@ -178,6 +178,27 @@ type frameCodec struct {
 	bw       *bufio.Writer
 	isClient bool
 	maxMsg   int64
+
+	// Per-frame scratch, kept here instead of on each call's stack because
+	// the header/length/mask buffers otherwise escape to the heap through
+	// the read and random-number interfaces: one to three small
+	// allocations per frame. The read-side and write-side scratch are kept
+	// apart on purpose: the reader goroutine (readFrame) and the writer
+	// goroutines (writeFrame, serialized by the Conn's write mutex) run
+	// concurrently, so each side's scratch must be owned by exactly one.
+	// Neither side needs synchronization of its own.
+	in    [4]byte  // read: header (2) + 16-bit extended length (2)
+	len8  [8]byte  // read: extended length
+	mask  [4]byte  // read: mask key
+	hdr   [14]byte // write: header (max: 10-byte len + 4-byte mask)
+	rand4 [4]byte  // write: fresh per-frame mask key
+
+	// maskScratch is the masked-write copy. Masking must not modify the
+	// caller's payload, and the copy is safe to reuse: by the time
+	// writeFrame returns, bufio has consumed the bytes synchronously.
+	// It grows to the largest masked frame sent and stays there — a
+	// bounded, one-time cost per connection, not per message.
+	maskScratch []byte
 }
 
 func (f frame) isControl() bool { return f.opcode >= 8 }
@@ -186,35 +207,32 @@ func (f frame) isControl() bool { return f.opcode >= 8 }
 // frames and a server must not, so the peer's frames are masked exactly
 // when we are the server.
 func (fc *frameCodec) readFrame() (frame, error) {
-	var b [2]byte
-	if _, err := io.ReadFull(fc.br, b[:]); err != nil {
+	if _, err := io.ReadFull(fc.br, fc.in[:2]); err != nil {
 		return frame{}, err
 	}
-	f := frame{fin: b[0]&0x80 != 0, opcode: int(b[0] & 0x0f)}
-	if b[0]&0x70 != 0 {
+	f := frame{fin: fc.in[0]&0x80 != 0, opcode: int(fc.in[0] & 0x0f)}
+	if fc.in[0]&0x70 != 0 {
 		return frame{}, fmt.Errorf("%w: reserved bits set", errProtocol)
 	}
-	masked := b[1]&0x80 != 0
+	masked := fc.in[1]&0x80 != 0
 	if masked == fc.isClient {
 		return frame{}, fmt.Errorf("%w: frame masking violation", errProtocol)
 	}
 	var n int64
-	switch l := b[1] & 0x7f; l {
+	switch l := fc.in[1] & 0x7f; l {
 	case 126:
-		var x [2]byte
-		if _, err := io.ReadFull(fc.br, x[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, fc.in[2:4]); err != nil {
 			return frame{}, err
 		}
-		n = int64(binary.BigEndian.Uint16(x[:]))
+		n = int64(binary.BigEndian.Uint16(fc.in[2:4]))
 	case 127:
-		var x [8]byte
-		if _, err := io.ReadFull(fc.br, x[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, fc.len8[:]); err != nil {
 			return frame{}, err
 		}
-		if x[0] != 0 {
+		if fc.len8[0] != 0 {
 			return frame{}, fmt.Errorf("%w: frame too large", errProtocol)
 		}
-		n = int64(binary.BigEndian.Uint64(x[:]))
+		n = int64(binary.BigEndian.Uint64(fc.len8[:]))
 	default:
 		n = int64(l)
 	}
@@ -224,9 +242,8 @@ func (fc *frameCodec) readFrame() (frame, error) {
 	if n > fc.maxMsg {
 		return frame{}, fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit", errProtocol, n, fc.maxMsg)
 	}
-	var mask [4]byte
 	if masked {
-		if _, err := io.ReadFull(fc.br, mask[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, fc.mask[:]); err != nil {
 			return frame{}, err
 		}
 	}
@@ -236,7 +253,7 @@ func (fc *frameCodec) readFrame() (frame, error) {
 	}
 	if masked {
 		for i := range f.payload {
-			f.payload[i] ^= mask[i&3]
+			f.payload[i] ^= fc.mask[i&3]
 		}
 	}
 	return f, nil
@@ -245,7 +262,7 @@ func (fc *frameCodec) readFrame() (frame, error) {
 // writeFrame writes one complete (FIN set) frame. It does not take any
 // lock; a [Conn] serializes calls via its write mutex.
 func (fc *frameCodec) writeFrame(op int, payload []byte) error {
-	var hdr [14]byte
+	hdr := fc.hdr[:]
 	hdr[0] = 0x80 | byte(op)
 	l := len(payload)
 	hdrLen := 2
@@ -262,9 +279,10 @@ func (fc *frameCodec) writeFrame(op int, payload []byte) error {
 		hdrLen = 10
 	}
 	if fc.isClient {
-		if _, err := rand.Read(hdr[hdrLen : hdrLen+4]); err != nil {
+		if _, err := rand.Read(fc.rand4[:]); err != nil {
 			return err
 		}
+		copy(hdr[hdrLen:hdrLen+4], fc.rand4[:])
 		hdr[1] |= 0x80
 		hdrLen += 4
 	}
@@ -272,8 +290,12 @@ func (fc *frameCodec) writeFrame(op int, payload []byte) error {
 		return err
 	}
 	if fc.isClient {
-		// Masking must not modify the caller's buffer.
-		buf := make([]byte, l)
+		// Masking must not modify the caller's buffer, so the masked
+		// copy goes through reusable scratch (see maskScratch).
+		if len(fc.maskScratch) < l {
+			fc.maskScratch = make([]byte, l)
+		}
+		buf := fc.maskScratch[:l]
 		copy(buf, payload)
 		mask := hdr[hdrLen-4 : hdrLen]
 		for i := range buf {
@@ -339,8 +361,8 @@ type Conn struct {
 	closeErr      error // valid once state == stClosed; guarded by c.mu
 	handshakeData any
 
-	idleTimeout    time.Duration
-	lastActivity   time.Time
+	idleTimeout  time.Duration
+	lastActivity time.Time
 
 	inFrag  bool
 	fragOp  int
@@ -362,9 +384,9 @@ func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idle
 			isClient: isClient,
 			maxMsg:   maxMessageSize,
 		},
-		id:             atomic.AddUint64(&connSeq, 1),
-		idleTimeout:    idleTimeout,
-		lastActivity:   time.Now(),
+		id:           atomic.AddUint64(&connSeq, 1),
+		idleTimeout:  idleTimeout,
+		lastActivity: time.Now(),
 	}
 }
 

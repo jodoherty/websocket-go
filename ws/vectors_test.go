@@ -30,9 +30,13 @@ func (fakeAddr) Network() string { return "fake" }
 func (fakeAddr) String() string  { return "fake" }
 
 // fakeConn is a net.Conn whose reads come from data and whose writes are
-// discarded — enough to drive readFrame/writeFrameLocked without a real
+// recorded — enough to drive readFrame/writeFrameLocked without a real
 // socket.
-type fakeConn struct{ data []byte; off int }
+type fakeConn struct {
+	data    []byte
+	off     int
+	written []byte
+}
 
 func (f *fakeConn) Read(p []byte) (int, error) {
 	if f.off >= len(f.data) {
@@ -42,11 +46,14 @@ func (f *fakeConn) Read(p []byte) (int, error) {
 	f.off += n
 	return n, nil
 }
-func (f *fakeConn) Write(p []byte) (int, error) { return len(p), nil }
-func (f *fakeConn) Close() error                { return nil }
-func (f *fakeConn) LocalAddr() net.Addr         { return fakeAddr{} }
-func (f *fakeConn) RemoteAddr() net.Addr        { return fakeAddr{} }
-func (f *fakeConn) SetDeadline(time.Time) error { return nil }
+func (f *fakeConn) Write(p []byte) (int, error) {
+	f.written = append(f.written, p...)
+	return len(p), nil
+}
+func (f *fakeConn) Close() error                     { return nil }
+func (f *fakeConn) LocalAddr() net.Addr              { return fakeAddr{} }
+func (f *fakeConn) RemoteAddr() net.Addr             { return fakeAddr{} }
+func (f *fakeConn) SetDeadline(time.Time) error      { return nil }
 func (f *fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 
@@ -87,7 +94,7 @@ func TestRFC6455Frames(t *testing.T) {
 	// A fragmented unmasked text message: "Hel" + "lo" → "Hello".
 	cConn := newTestConn([]byte{
 		0x01, 0x03, 0x48, 0x65, 0x6c, // "Hel", fin=0
-		0x80, 0x02, 0x6c, 0x6f,       // "lo", fin=1
+		0x80, 0x02, 0x6c, 0x6f, // "lo", fin=1
 	}, true)
 	op, data, err := cConn.ReadMessage()
 	if err != nil || op != OpText || string(data) != "Hello" {
@@ -143,7 +150,7 @@ func TestFrameCodecRoundtrip(t *testing.T) {
 		for _, n := range []int{0, 1, 124, 125, 126, 127, 128, 255, 256, 65535, 65536, 65537, 1 << 20} {
 			payload := make([]byte, n)
 			for i := range payload {
-				payload[i] = byte(i * 31 + 7)
+				payload[i] = byte(i*31 + 7)
 			}
 			for op := range [3]int{OpText, OpBinary, OpPing} {
 				if op >= 8 && n > 125 {

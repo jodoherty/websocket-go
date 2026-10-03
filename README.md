@@ -70,6 +70,13 @@ rather than replace it.
    - Sequential `ReadMessage` calls need no synchronization between them —
      it's one goroutine.
 
+6. **One allocation per message.** The frame codec keeps its per-frame
+   buffers (header, mask key, masked copy) as per-connection scratch, so the
+   steady-state cost of a message is exactly one heap allocation — the
+   payload `ReadMessage` returns, which the caller owns. Writes allocate
+   nothing. This is pinned by the allocation-budget tests, not just
+   benchmarked.
+
 ## API
 
 ```go
@@ -121,6 +128,11 @@ ws/fuzz_test.go     FuzzReadFrame — codec safety fuzz target
 ws/keepalive_test.go keepalive timing decision, pinned at exact boundaries
 ws/concurrency_test.go close state machine under concurrent stress (-race)
 ws/bench_test.go    codec + round-trip benchmarks
+ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
+ws/branches_test.go error-branch coverage: malformed frames, control/fragment
+                    paths, armIdle ping, write failure paths
+ws/coverage_test.go closes out accessors, option functions, and rejection
+                    branches the other suites don't touch
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 e2e/            e2e suites:
@@ -204,12 +216,29 @@ Layers of evidence, weakest to strongest:
    either success or the recorded error, never a torn state; and writes
    after close must always fail. Each body runs ~200 iterations under
    `-race`.
-8. **Benchmarks** (`go test ./ws -run '^$' -bench . -benchmem`) — pin the
+8. **Allocation budget** (`ws/memory_test.go`) — pins the per-frame
+   allocation cost with `testing.AllocsPerRun` so a regression (an escaped
+   buffer, a fresh copy, a stray slice) fails CI instead of quietly raising
+   GC pressure on every message. The budget: a `writeFrame` does **zero**
+   allocations in steady state (all per-frame buffers are per-connection
+   scratch: the header, the random mask key, and the masked copy are
+   reused), and a `readFrame` does exactly **one** — the payload, which the
+   caller owns and so cannot be pooled.
+9. **Benchmarks** (`go test ./ws -run '^$' -bench . -benchmem`) — pin the
    per-message cost so a regression is visible: codec write/read on both
    sides of the masking rule, an end-to-end `WriteMessage`→`ReadMessage`
    round trip over an in-memory pipe, and the handshake accept key. On a
-   Ryzen 7600X a 1 KiB round trip is ~2.5 µs (~415 MB/s) and the masked
-   read path is ~730 ns/op.
+   Ryzen 7600X a 1 KiB round trip is ~1.8 µs (~570 MB/s) with a single
+   allocation (the payload), the masked client write is ~420 ns with zero
+   allocations, and the accept key is ~130 ns.
+10. **Coverage** — the library sits at **92% statement coverage** when the
+   unit and e2e suites are combined. The unit suite alone covers the codec,
+   state machine, and policy; the e2e suite (`go test ./e2e -cover
+   -coverpkg=./ws`) adds the TLS client path, the mTLS handshake, and the
+   real-network `Dial`. The two profiles are merged to get the combined
+   number. The remaining uncovered lines are deliberately defensive error
+   branches (e.g. a hijack failure mid-upgrade) that cannot be reached
+   through a well-formed connection.
 
 A note on `synctest`: we deliberately do *not* use it. `synctest` fakes the
 clock inside a bubble and only advances time when every goroutine is

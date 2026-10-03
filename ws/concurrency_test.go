@@ -262,7 +262,6 @@ func TestConcurrentWriteAndReadExercisesLocks(t *testing.T) {
 	}
 }
 
-
 // TestWriteAfterCloseErrors pins the write-after-close contract: a write on
 // a closed connection must never report success. After a non-normal close it
 // carries the recorded code and reason; after a normal closure (1000) it is
