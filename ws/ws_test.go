@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	ws "github.com/jodoherty/websocket/ws"
+	ws "github.com/jodoherty/websocket-go/ws"
 )
 
 const goodToken = "good-token"

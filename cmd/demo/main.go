@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jodoherty/websocket/ws"
+	"github.com/jodoherty/websocket-go/ws"
 )
 
 const (
