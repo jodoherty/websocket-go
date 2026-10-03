@@ -34,6 +34,8 @@ jobs:
           go test -covermode=count -coverprofile=bc-unit.out ./ws/
           go test -covermode=count -coverpkg=./ws -coverprofile=bc-e2e.out ./e2e/
           go run ./cmd/branchcov ws bc-unit.out bc-e2e.out
+      - name: MC/DC audit
+        run: go run ./cmd/mcdc ws
       - name: fuzz (10s)
         run: go test -fuzz=FuzzReadFrame -fuzztime=10s ./ws/
 

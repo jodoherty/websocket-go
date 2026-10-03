@@ -1,6 +1,6 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all lint staticcheck test race fuzz bench coverage branchcov e2e demo certgen
+.PHONY: all lint staticcheck test race fuzz bench coverage branchcov mcdc e2e demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -40,6 +40,13 @@ branchcov:
 	go test -covermode=count -coverprofile=bc-unit.out ./ws/
 	go test -covermode=count -coverpkg=./ws -coverprofile=bc-e2e.out ./e2e/
 	go run ./cmd/branchcov ws bc-unit.out bc-e2e.out
+
+# MC/DC audit: computes the required independence pairs for every
+# compound decision in ws/ and verifies each is traced to a test in
+# ws/mcdc_test.go (cmd/mcdc + its registry). Fails on any new or
+# untraced compound condition.
+mcdc:
+	go run ./cmd/mcdc ws
 
 # Full end-to-end: Go mTLS/interop test plus the Playwright suite
 # (Firefox + Chromium) against the real demo binary.

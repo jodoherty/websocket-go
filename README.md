@@ -151,6 +151,9 @@ ws/branchgaps_test.go pins the individually hard-to-reach error branches
 ws/coverage_test.go closes out accessors, option functions, and rejection
                     branches the other suites don't touch (Dial handshake
                     failures, reserved headers, the upgrade guards)
+ws/mcdc_test.go     MC/DC test matrix: one subtest per required
+                    independence pair, asserting the observable outcome
+                    only that decision flip produces
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
@@ -158,6 +161,9 @@ cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /c
 cmd/certgen/    generates the throwaway CA / server / client certificates
 cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
                 count-mode coverage profile (the stdlib has no branch mode)
+cmd/mcdc/       MC/DC audit: enumerates every compound decision, computes
+                the required independence pairs from the boolean structure,
+                and verifies each is traced to an existing test subtest
 e2e/            e2e suites:
                 ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
                                  binary, bearer accept/reject, mTLS rejection, close codes
@@ -168,7 +174,7 @@ e2e/            e2e suites:
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make lint / staticcheck / all / e2e / fuzz
 .github/workflows/ci.yml runs the gate on every push: lint, staticcheck, race tests,
-                    fuzz, coverage, browser e2e
+                    fuzz, statement + branch coverage, MC/DC audit, browser e2e
 ```
 
 ## Running
@@ -179,6 +185,7 @@ go vet ./...
 make all             # the full gate: strict lint + staticcheck + tests
 make coverage        # statement coverage (unit suite)
 make branchcov       # branch coverage (cmd/branchcov, unit + e2e merged)
+make mcdc            # MC/DC audit (cmd/mcdc: required pairs traced to tests)
 make e2e             # Go e2e + Playwright (Firefox and Chromium)
 ```
 
@@ -285,6 +292,26 @@ Layers of evidence, weakest to strongest:
    number; `cmd/branchcov` also documents two limits shared with every
    standard-profile tool (operand-level short-circuiting inside a boolean
    expression, and break-versus-condition-false loop exits).
+12. **MC/DC** — the strictest decision-criterion level in common use
+   (DO-178C, ISO 26262): for every decision with two or more conditions,
+   each condition must be shown to *independently* affect the outcome —
+   a pair of executions in which only that condition changes, every other
+   condition holds, and the decision flips. Go cannot observe this at
+   runtime (profiles carry no condition values, and recording them would
+   require instrumenting the source, which breaks short-circuit semantics
+   — `isReadTimeout`'s second operand reads the variable the first sets),
+   so the criterion is held the way DO-178C practice does for languages
+   without native support: `cmd/mcdc` statically enumerates every compound
+   decision in `ws.go` (each `&&`/`||` expression, nested ones included) and
+   computes the required independence pairs from the boolean structure;
+   `ws/mcdc_test.go` provides one subtest per pair, each asserting the
+   observable outcome that only that decision flip produces. The tool
+   re-checks every trace against the live source — a new or changed
+   compound condition, a renamed test, or a pair that no longer flips the
+   decision fails the gate. Current state: **8 compound decisions, 17
+   required pairs, all traced**; the other 94 if/for conditions are
+   single-condition (branch-level, no MC/DC requirement). `make mcdc`
+   reproduces the audit.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
 The keepalive read loop is timing logic — probe at the boundary, kill on
