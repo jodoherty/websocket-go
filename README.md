@@ -129,7 +129,9 @@ subprotocol negotiation, close-code semantics per RFC 6455.
 
 ```
 ws/ws.go            the entire library in one file — copy it into an
-                    existing project (package ws, stdlib only)
+                    existing project (package ws, stdlib only). Organized
+                    in 10 numbered sections, dependency-ordered, with a
+                    file map in the package doc.
 ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation
 ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)

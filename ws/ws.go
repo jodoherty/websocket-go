@@ -58,6 +58,22 @@
 //  3. Between sequential ReadMessage calls in the same goroutine there are no
 //     visibility concerns: handler-local state modified in one iteration is
 //     plainly visible in the next.
+//
+// # File map
+//
+// This is a single-file implementation, organized in dependency order so a
+// reader can work top to bottom:
+//
+//  1. protocol constants (close codes, frame opcodes)
+//  2. errors (CloseError, ErrClosed, internal sentinels)
+//  3. wire format (the frame codec: readFrame, writeFrame)
+//  4. Conn (state, constructor, terminal handling)
+//  5. reading (ReadMessage, keepalive probe)
+//  6. writing and closing (WriteMessage, Close, Closed)
+//  7. connection accessors (ID, addresses, deadlines)
+//  8. options (Option/Config and every With* function)
+//  9. server (Upgrader.Upgrade, Handle)
+//  10. client (Dial)
 package ws
 
 import (
@@ -82,6 +98,9 @@ import (
 	"time"
 )
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 1 · Protocol constants
+
 // Close status codes (RFC 6455 §7.4).
 const (
 	StatusNormalClosure       = 1000
@@ -97,6 +116,19 @@ const (
 	StatusServiceRestart      = 1012
 	StatusTryAgainLater       = 1013
 )
+
+// Frame opcodes (RFC 6455 §5.2).
+const (
+	OpContinuation = 0
+	OpText         = 1
+	OpBinary       = 2
+	OpClose        = 8
+	OpPing         = 9
+	OpPong         = 10
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2 · Errors
 
 // CloseError is returned by [Conn.ReadMessage] when the connection is closed
 // with a status code other than a normal closure (1000, or a close frame
@@ -123,6 +155,18 @@ func CloseCode(err error) (code int, reason string, ok bool) {
 	return 0, "", false
 }
 
+// ErrClosed is returned by [Conn.WriteMessage] when the connection has been
+// closed with a normal closure (1000). A normal closure records a nil
+// terminal error, so without a sentinel a write after such a close would
+// report success for a frame that is never sent.
+var ErrClosed = errors.New("ws: connection closed")
+
+// errProtocol marks a protocol violation that terminates the connection.
+var errProtocol = errors.New("ws: protocol violation")
+
+// errMessageTooBig marks a frame or message that exceeds maxMessageSize.
+var errMessageTooBig = errors.New("ws: message exceeds size limit")
+
 // closeErrFor maps a close code to the terminal error recorded on the
 // connection: a normal closure (1000, or an absent status) yields nil,
 // everything else yields a *CloseError so callers can see the code and
@@ -136,38 +180,17 @@ func closeErrFor(code int, reason string) error {
 	}
 }
 
-// ClientCert returns the client's first verified certificate from an
-// mTLS-terminated request, or nil if no client certificate was presented.
-// Chain verification has already been performed by the TLS layer; this is a
-// convenience for reading identity out of the handshake.
-func ClientCert(r *http.Request) *x509.Certificate {
-	if r.TLS == nil {
-		return nil
-	}
-	if len(r.TLS.PeerCertificates) == 0 {
-		return nil
-	}
-	return r.TLS.PeerCertificates[0]
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// 3 · Wire format: the frame codec
 
-// Frame opcodes (RFC 6455 §5.2).
-const (
-	OpContinuation = 0
-	OpText         = 1
-	OpBinary       = 2
-	OpClose        = 8
-	OpPing         = 9
-	OpPong         = 10
-)
-
-// errProtocol marks a protocol violation that terminates the connection.
-var errProtocol = errors.New("ws: protocol violation")
-
+// frame is one decoded RFC 6455 frame.
 type frame struct {
 	fin     bool
 	opcode  int
 	payload []byte
 }
+
+func (f frame) isControl() bool { return f.opcode >= 8 }
 
 // frameCodec is the byte-level half of a [Conn]: it reads and writes RFC
 // 6455 frames on a buffered stream pair. Masking enforcement depends on
@@ -201,8 +224,6 @@ type frameCodec struct {
 	// bounded, one-time cost per connection, not per message.
 	maskScratch []byte
 }
-
-func (f frame) isControl() bool { return f.opcode >= 8 }
 
 // readFrame reads one frame from the connection. A client must mask its
 // frames and a server must not, so the peer's frames are masked exactly
@@ -311,42 +332,13 @@ func (fc *frameCodec) writeFrame(op int, payload []byte) error {
 	return fc.bw.Flush()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 4 · Conn: state, constructor, terminal handling
+
 const (
 	stOpen int32 = iota
 	stClosed
 )
-
-var errMessageTooBig = errors.New("ws: message exceeds size limit")
-
-// ErrClosed is returned by [Conn.WriteMessage] when the connection has been
-// closed with a normal closure (1000). A normal closure records a nil
-// terminal error, so without a sentinel a write after such a close would
-// report success for a frame that is never sent.
-var ErrClosed = errors.New("ws: connection closed")
-
-// closedWriteErr is the error a write path returns for a closed
-// connection: the recorded close error when there is one, ErrClosed for a
-// normal closure.
-func (c *Conn) closedWriteErr() error {
-	if c.closeErr != nil {
-		return c.closeErr
-	}
-	return ErrClosed
-}
-
-// closeWriteTimeout bounds how long the close-frame write in [Conn.Close]
-// may take. The peer of a closing connection is often silent by
-// definition; an unbounded write would hang the closing goroutine (and
-// every goroutine waiting on the close) forever.
-const closeWriteTimeout = 5 * time.Second
-
-// defaultWriteTimeout bounds how long a single [Conn.WriteMessage] may block
-// writing to the transport. Without it, a write to a blackhole (peer not
-// reading and not sending RST) blocks forever while holding the write mutex,
-// which wedges [Conn.Close] — the closer never reaches its own bound or
-// nc.Close. A long-running server must not be able to leak a goroutine this
-// way. Disable the bound per-connection with WithWriteTimeout(0).
-const defaultWriteTimeout = 30 * time.Second
 
 var connSeq uint64
 
@@ -407,32 +399,6 @@ func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idle
 	}
 }
 
-// ID returns a unique identifier for the connection, useful as a key in
-// session registries.
-func (c *Conn) ID() uint64 { return c.id }
-
-// Subprotocol returns the negotiated subprotocol, or "" if none.
-func (c *Conn) Subprotocol() string { return c.subprotocol }
-
-// HandshakeData returns the value passed to the upgrade via
-// WithHandshakeData, or nil if none was provided.
-func (c *Conn) HandshakeData() any { return c.handshakeData }
-
-// RemoteAddr returns the peer's network address.
-func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
-
-// LocalAddr returns this endpoint's network address.
-func (c *Conn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
-
-// SetReadDeadline sets the underlying connection's read deadline. When the
-// idle timeout keepalive is enabled it is overridden by the keepalive for
-// the duration of each blocking read; use WithIdleTimeout(0) to manage
-// deadlines yourself.
-func (c *Conn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
-
-// SetWriteDeadline sets the underlying connection's write deadline.
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
-
 // finish records a terminal state. It is safe to call concurrently: the
 // first caller's error wins, and the returned error is the one recorded at
 // close time. A nil return means the connection closed normally (1000).
@@ -451,6 +417,9 @@ func (c *Conn) finish(err error) error {
 	_ = c.nc.Close()
 	return err
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5 · Reading
 
 // ReadMessage reads the next complete message from the connection.
 //
@@ -557,6 +526,23 @@ func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
 	return 0, nil, c.finish(closeErrFor(code, reason))
 }
 
+// armIdle arms the read deadline for the next blocking read: the point at
+// which the connection has been silent long enough to probe for liveness
+// (see ReadMessage). It sends no ping itself — the probe is issued in the
+// timeout path, only when silence is actually observed. While a probe is
+// outstanding the deadline is one full window past the probe, giving the
+// peer time to answer.
+func (c *Conn) armIdle() error {
+	if c.idleTimeout <= 0 {
+		return nil
+	}
+	deadline := c.lastActivity.Add(c.idleTimeout)
+	if c.probedSinceLastActivity {
+		deadline = c.probeAt.Add(c.idleTimeout)
+	}
+	return c.nc.SetReadDeadline(deadline)
+}
+
 // probeAction is the keepalive response to a read timeout, which can only
 // fire once silence has reached the idle threshold.
 type probeAction int
@@ -585,21 +571,31 @@ func isReadTimeout(err error) bool {
 	return errors.As(err, &nerr) && nerr.Timeout()
 }
 
-// armIdle arms the read deadline for the next blocking read: the point at
-// which the connection has been silent long enough to probe for liveness
-// (see ReadMessage). It sends no ping itself — the probe is issued in the
-// timeout path, only when silence is actually observed. While a probe is
-// outstanding the deadline is one full window past the probe, giving the
-// peer time to answer.
-func (c *Conn) armIdle() error {
-	if c.idleTimeout <= 0 {
-		return nil
+// ─────────────────────────────────────────────────────────────────────────────
+// 6 · Writing and closing
+
+// defaultWriteTimeout bounds how long a single [Conn.WriteMessage] may block
+// writing to the transport. Without it, a write to a blackhole (peer not
+// reading and not sending RST) blocks forever while holding the write mutex,
+// which wedges [Conn.Close] — the closer never reaches its own bound or
+// nc.Close. A long-running server must not be able to leak a goroutine this
+// way. Disable the bound per-connection with WithWriteTimeout(0).
+const defaultWriteTimeout = 30 * time.Second
+
+// closeWriteTimeout bounds how long the close-frame write in [Conn.Close]
+// may take. The peer of a closing connection is often silent by
+// definition; an unbounded write would hang the closing goroutine (and
+// every goroutine waiting on the close) forever.
+const closeWriteTimeout = 5 * time.Second
+
+// closedWriteErr is the error a write path returns for a closed
+// connection: the recorded close error when there is one, ErrClosed for a
+// normal closure.
+func (c *Conn) closedWriteErr() error {
+	if c.closeErr != nil {
+		return c.closeErr
 	}
-	deadline := c.lastActivity.Add(c.idleTimeout)
-	if c.probedSinceLastActivity {
-		deadline = c.probeAt.Add(c.idleTimeout)
-	}
-	return c.nc.SetReadDeadline(deadline)
+	return ErrClosed
 }
 
 // writeFrame writes a frame, taking the write lock. Control frames are
@@ -644,14 +640,6 @@ func (c *Conn) WriteMessage(op int, data []byte) error {
 	return c.fc.writeFrame(op, data)
 }
 
-// Closed reports whether the connection has been closed, from any goroutine.
-// It is the cheap, race-free signal a background writer goroutine needs to
-// stop: it can check Closed() (or select on work and bail when true) instead
-// of waiting for its next WriteMessage to fail with ErrClosed.
-func (c *Conn) Closed() bool {
-	return atomic.LoadInt32(&c.state) == stClosed
-}
-
 // Close closes the connection, sending a close frame with the given code and
 // reason before tearing down the transport. It is idempotent and safe to
 // call from any goroutine, including the pumping goroutine.
@@ -694,6 +682,46 @@ func (c *Conn) Close(code int, reason string) error {
 	return c.closeErr
 }
 
+// Closed reports whether the connection has been closed, from any goroutine.
+// It is the cheap, race-free signal a background writer goroutine needs to
+// stop: it can check Closed() (or select on work and bail when true) instead
+// of waiting for its next WriteMessage to fail with ErrClosed.
+func (c *Conn) Closed() bool {
+	return atomic.LoadInt32(&c.state) == stClosed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7 · Connection accessors
+
+// ID returns a unique identifier for the connection, useful as a key in
+// session registries.
+func (c *Conn) ID() uint64 { return c.id }
+
+// Subprotocol returns the negotiated subprotocol, or "" if none.
+func (c *Conn) Subprotocol() string { return c.subprotocol }
+
+// HandshakeData returns the value passed to the upgrade via
+// WithHandshakeData, or nil if none was provided.
+func (c *Conn) HandshakeData() any { return c.handshakeData }
+
+// RemoteAddr returns the peer's network address.
+func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
+
+// LocalAddr returns this endpoint's network address.
+func (c *Conn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
+
+// SetReadDeadline sets the underlying connection's read deadline. When the
+// idle timeout keepalive is enabled it is overridden by the keepalive for
+// the duration of each blocking read; use WithIdleTimeout(0) to manage
+// deadlines yourself.
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the underlying connection's write deadline.
+func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8 · Options
+
 // Option configures a [Upgrader] (via [NewUpgrader]) or a client connection
 // (via [Dial]). The same option names work on both sides where the setting
 // is symmetric (subprotocols, message size, idle timeout); client-only
@@ -718,13 +746,115 @@ type Config struct {
 	dialTimeout     time.Duration
 }
 
-// wsGUID is the magic GUID from RFC 6455 §1.3.
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+// Options shared by server and client.
 
-func acceptKey(key string) string {
-	sum := sha1.Sum([]byte(key + wsGUID)) //nolint:gosec
-	return base64.StdEncoding.EncodeToString(sum[:])
+// WithSubprotocols advertises (server) or requests (client) the given
+// subprotocols. The server selects the first one it advertises that the
+// client requested, if any; the result is visible on both sides via
+// [Conn.Subprotocol].
+func WithSubprotocols(list ...string) Option {
+	return func(c *Config) { c.Subprotocols = list }
 }
+
+// WithMaxMessageSize sets the maximum size of a single message (default
+// 16 MiB) on either side. Frames and fragmented messages beyond the limit
+// terminate the connection.
+func WithMaxMessageSize(n int64) Option {
+	return func(c *Config) { c.MaxMessageSize = n }
+}
+
+// WithIdleTimeout sets the keepalive window on either side (default 60s).
+// When no frame has been received for the window, the next blocking
+// [Conn.ReadMessage] probes the peer with a ping; the connection is
+// considered dead and the read fails with a timeout if the peer is still
+// silent after a second window. A pong (or any frame) from the peer resets
+// the clock, so an idle-but-alive connection is kept alive and probed
+// roughly every window. Pass zero to disable keepalive and manage deadlines
+// via [Conn.SetReadDeadline].
+func WithIdleTimeout(d time.Duration) Option {
+	return func(c *Config) { c.IdleTimeout = d }
+}
+
+// WithWriteTimeout bounds how long a single [Conn.WriteMessage] may block
+// writing to the transport, so a blackholed peer cannot wedge the write
+// mutex and, with it, [Conn.Close]. The default is 30 s; pass 0 to remove
+// the bound (a write then blocks until the transport completes or the
+// connection is closed).
+func WithWriteTimeout(d time.Duration) Option {
+	return func(c *Config) { c.WriteTimeout = d }
+}
+
+// Server-only options.
+
+// WithCheckOrigin sets the origin policy. The default is strict same-origin:
+// the request's Origin header must equal the request's scheme and Host, and
+// requests without an Origin header are rejected.
+func WithCheckOrigin(f func(r *http.Request) bool) Option {
+	return func(c *Config) { c.CheckOrigin = f }
+}
+
+// WithRequireClientCert requires the request to carry a client certificate
+// presented via mTLS and verified by the TLS layer (an
+// http.Server.TLSConfig with ClientAuth set to VerifyClientCertIfGiven or
+// RequireAndVerifyClientCert). Requests without a verified certificate are
+// rejected with 403 before the protocol switch.
+func WithRequireClientCert() Option {
+	return func(c *Config) { c.RequireClientCert = true }
+}
+
+// WithPreHandshake runs f on the request after protocol and origin checks,
+// before the protocol switch. Return an error to reject the upgrade with
+// 403, or a [*UpgradeError] to control the status code. Use it for policy
+// checks that need the full request (rate limiting, per-path checks,
+// logging).
+func WithPreHandshake(f func(r *http.Request) error) Option {
+	return func(c *Config) { c.PreHandshake = append(c.PreHandshake, f) }
+}
+
+// Client-only options.
+
+// WithHeader sets a request header on the client handshake. Browsers cannot
+// do this (they can only pass subprotocols and URLs), but programmatic
+// clients use it for bearer tokens and the like.
+func WithHeader(key, value string) Option {
+	return func(c *Config) {
+		if c.Headers == nil {
+			c.Headers = make(http.Header)
+		}
+		c.Headers.Set(key, value)
+	}
+}
+
+// WithTLS provides a complete TLS configuration for wss:// connections.
+func WithTLS(cfg *tls.Config) Option {
+	return func(c *Config) {
+		c.tlsConfigClient = cfg
+	}
+}
+
+// WithTLSClientCert enables mTLS by presenting the given client certificate
+// and key. Server certificate verification uses the system root store
+// (or cfg.InsecureSkipVerify if you say so via [WithTLS]). For custom root
+// stores or SNI control, use [WithTLS] directly.
+func WithTLSClientCert(cert *x509.Certificate, key any) Option {
+	return func(c *Config) {
+		cfg := c.tlsConfigClient
+		if cfg == nil {
+			cfg = &tls.Config{}
+		}
+		cfg.Certificates = []tls.Certificate{{Certificate: [][]byte{cert.Raw}, PrivateKey: key}}
+		c.tlsConfigClient = cfg
+	}
+}
+
+// WithDialTimeout bounds the connect + handshake time (default: the context
+// deadline, if any).
+func WithDialTimeout(d time.Duration) Option {
+	return func(c *Config) { c.dialTimeout = d }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9 · Server: upgrading a request to a connection
 
 // Upgrader validates the HTTP portion of a WebSocket handshake and performs
 // the protocol switch to [Conn].
@@ -763,6 +893,21 @@ func NewUpgrader(opts ...Option) *Upgrader {
 	}
 }
 
+// ClientCert returns the client's first verified certificate from an
+// mTLS-terminated request, or nil if no client certificate was presented.
+// Chain verification has already been performed by the TLS layer; this is a
+// convenience for reading identity out of the handshake.
+func ClientCert(r *http.Request) *x509.Certificate {
+	if r.TLS == nil {
+		return nil
+	}
+	if len(r.TLS.PeerCertificates) == 0 {
+		return nil
+	}
+	return r.TLS.PeerCertificates[0]
+}
+
+// handshakeOpts carries the settings for a single upgrade.
 type handshakeOpts struct {
 	data any
 }
@@ -776,67 +921,6 @@ type HandshakeOption func(*handshakeOpts)
 // message loop without globals.
 func WithHandshakeData(v any) HandshakeOption {
 	return func(o *handshakeOpts) { o.data = v }
-}
-
-// WithCheckOrigin sets the origin policy. The default is strict same-origin:
-// the request's Origin header must equal the request's scheme and Host, and
-// requests without an Origin header are rejected.
-func WithCheckOrigin(f func(r *http.Request) bool) Option {
-	return func(c *Config) { c.CheckOrigin = f }
-}
-
-// WithRequireClientCert requires the request to carry a client certificate
-// presented via mTLS and verified by the TLS layer (an
-// http.Server.TLSConfig with ClientAuth set to VerifyClientCertIfGiven or
-// RequireAndVerifyClientCert). Requests without a verified certificate are
-// rejected with 403 before the protocol switch.
-func WithRequireClientCert() Option {
-	return func(c *Config) { c.RequireClientCert = true }
-}
-
-// WithSubprotocols advertises (server) or requests (client) the given
-// subprotocols. The server selects the first one it advertises that the
-// client requested, if any; the result is visible on both sides via
-// [Conn.Subprotocol].
-func WithSubprotocols(list ...string) Option {
-	return func(c *Config) { c.Subprotocols = list }
-}
-
-// WithMaxMessageSize sets the maximum size of a single message (default
-// 16 MiB) on either side. Frames and fragmented messages beyond the limit
-// terminate the connection.
-func WithMaxMessageSize(n int64) Option {
-	return func(c *Config) { c.MaxMessageSize = n }
-}
-
-// WithIdleTimeout sets the keepalive window on either side (default 60s).
-// When no frame has been received for the window, the next blocking
-// [Conn.ReadMessage] probes the peer with a ping; the connection is
-// considered dead and the read fails with a timeout if the peer is still
-// silent after a second window. A pong (or any frame) from the peer resets
-// the clock, so an idle-but-alive connection is kept alive and probed
-// roughly every window. Pass zero to disable keepalive and manage deadlines
-// via [Conn.SetReadDeadline].
-func WithIdleTimeout(d time.Duration) Option {
-	return func(c *Config) { c.IdleTimeout = d }
-}
-
-// WithWriteTimeout bounds how long a single [Conn.WriteMessage] may block
-// writing to the transport, so a blackholed peer cannot wedge the write
-// mutex and, with it, [Conn.Close]. The default is 30 s; pass 0 to remove
-// the bound (a write then blocks until the transport completes or the
-// connection is closed).
-func WithWriteTimeout(d time.Duration) Option {
-	return func(c *Config) { c.WriteTimeout = d }
-}
-
-// WithPreHandshake runs f on the request after protocol and origin checks,
-// before the protocol switch. Return an error to reject the upgrade with
-// 403, or a [*UpgradeError] to control the status code. Use it for policy
-// checks that need the full request (rate limiting, per-path checks,
-// logging).
-func WithPreHandshake(f func(r *http.Request) error) Option {
-	return func(c *Config) { c.PreHandshake = append(c.PreHandshake, f) }
 }
 
 // UpgradeError is returned by [Upgrader.Upgrade] when the handshake is
@@ -972,6 +1056,8 @@ func Handle(fn func(r *http.Request, c *Conn) error) http.Handler {
 	return NewUpgrader().Handle(fn)
 }
 
+// Handshake helpers, shared by [Upgrader.Upgrade] and [Dial].
+
 func defaultCheckOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -1007,53 +1093,22 @@ func negotiateProtocol(server []string, clientHeader string) string {
 	return ""
 }
 
-// Client-side settings, filled in from the same [Option] set as the
-// upgrader; the symmetric fields (subprotocols, sizes, idle timeout) read
-// from Config, the client-only ones live here.
+// wsGUID is the magic GUID from RFC 6455 §1.3.
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func acceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + wsGUID)) //nolint:gosec
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 · Client: dialing
+
+// dialConfig is the client-only slice of [Config], extracted in [Dial].
 type dialConfig struct {
 	headers   http.Header
 	tlsConfig *tls.Config
 	timeout   time.Duration
-}
-
-// WithHeader sets a request header on the client handshake. Browsers cannot
-// do this (they can only pass subprotocols and URLs), but programmatic
-// clients use it for bearer tokens and the like.
-func WithHeader(key, value string) Option {
-	return func(c *Config) {
-		if c.Headers == nil {
-			c.Headers = make(http.Header)
-		}
-		c.Headers.Set(key, value)
-	}
-}
-
-// WithTLS provides a complete TLS configuration for wss:// connections.
-func WithTLS(cfg *tls.Config) Option {
-	return func(c *Config) {
-		c.tlsConfigClient = cfg
-	}
-}
-
-// WithTLSClientCert enables mTLS by presenting the given client certificate
-// and key. Server certificate verification uses the system root store
-// (or cfg.InsecureSkipVerify if you say so via [WithTLS]). For custom root
-// stores or SNI control, use [WithTLS] directly.
-func WithTLSClientCert(cert *x509.Certificate, key any) Option {
-	return func(c *Config) {
-		cfg := c.tlsConfigClient
-		if cfg == nil {
-			cfg = &tls.Config{}
-		}
-		cfg.Certificates = []tls.Certificate{{Certificate: [][]byte{cert.Raw}, PrivateKey: key}}
-		c.tlsConfigClient = cfg
-	}
-}
-
-// WithDialTimeout bounds the connect + handshake time (default: the context
-// deadline, if any).
-func WithDialTimeout(d time.Duration) Option {
-	return func(c *Config) { c.dialTimeout = d }
 }
 
 // Dial opens a WebSocket client connection to rawurl (ws:// or wss://).
