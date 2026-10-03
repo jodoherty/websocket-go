@@ -147,6 +147,9 @@ ws/branches_test.go error-branch coverage: malformed frames, control/fragment
                     paths, armIdle ping, write failure paths
 ws/coverage_test.go closes out accessors, option functions, and rejection
                     branches the other suites don't touch
+ws/examples_test.go executable documentation: Example functions, compiled
+                    and run on every go test with pinned output; also
+                    integration tests of Handle, Upgrade, Dial, CloseCode
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 e2e/            e2e suites:
