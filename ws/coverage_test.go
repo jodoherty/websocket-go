@@ -574,7 +574,7 @@ func TestUpgradeResponseAlreadyStarted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The server responds (a 500, not a 101) and tears the connection
+	// The server responds (a 400, not a 101) and tears the connection
 	// down; drain until it closes or the deadline fires.
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var response []byte
@@ -592,8 +592,8 @@ func TestUpgradeResponseAlreadyStarted(t *testing.T) {
 	}
 	upgradeErr := &ws.UpgradeError{}
 	if !errors.As(upErr, &upgradeErr) ||
-		upgradeErr.Status != http.StatusInternalServerError ||
-		!strings.Contains(upgradeErr.Msg, "response already started") {
-		t.Fatalf("Upgrade = %v, want a 500 'response already started'; server response was:\n%s", upErr, response)
+		upgradeErr.Status != http.StatusBadRequest ||
+		!strings.Contains(upgradeErr.Msg, "unconsumed request data") {
+		t.Fatalf("Upgrade = %v, want a 400 'unconsumed request data'; server response was:\n%s", upErr, response)
 	}
 }

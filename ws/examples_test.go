@@ -38,11 +38,12 @@ func wsURL(httpURL string) string {
 // Example is the whole trip: a session on a plain http.ServeMux, and a
 // client that connects, sends a message, and receives the echo.
 //
-// The origin check is relaxed because programmatic clients (unlike
-// browsers) do not send an Origin header; a deployment serving browser
-// pages would keep the default same-origin policy.
+// The upgrader runs its default origin policy: requests without an Origin
+// header (programmatic clients) are allowed, and a browser presenting an
+// Origin that is not the page's own origin is rejected. Use
+// [WithCheckOrigin] to customize.
 func Example() {
-	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
+	up := NewUpgrader()
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {

@@ -94,7 +94,7 @@ func (u *Upgrader) Handle(fn func(r *http.Request, c *Conn) error) http.Handler
 func Handle(fn func(r *http.Request, c *Conn) error) http.Handler
 
 // Options (shared by server and client where symmetric)
-WithCheckOrigin(f)         // default: strict same-origin
+WithCheckOrigin(f)         // default: same-origin when an Origin header is present
 WithRequireClientCert()    // mTLS gate, 403 without a verified client cert
 WithSubprotocols(...)
 WithMaxMessageSize(n)      // default 16 MiB

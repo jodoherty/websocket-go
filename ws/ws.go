@@ -123,6 +123,13 @@ const (
 	closeCodeMax = 4999
 )
 
+// Status codes that must (or should) not be set as a status in a close
+// frame payload (RFC 6455 §7.4).
+const (
+	closeCodeUnexpected = 1004 // received an unexpected or unsupported status
+	closeCodeTLSFailure = 1015 // TLS handshake failure
+)
+
 // Frame opcodes (RFC 6455 §5.2).
 const (
 	OpContinuation = 0
@@ -222,6 +229,8 @@ var (
 	errBadScheme       = errors.New("ws: unsupported scheme")
 	errBadCloseCode    = errors.New("ws: invalid close code")
 	errHandshakeFailed = errors.New("ws: handshake failed")
+	errBadSubprotocol  = errors.New("ws: invalid subprotocol")
+	errBadHeader       = errors.New("ws: invalid request header")
 )
 
 // closeErrFor maps a close code to the terminal error recorded on the
@@ -636,15 +645,59 @@ func (c *Conn) keepaliveTimeout(err error) (bool, error) {
 
 // peerClose handles a close frame received from the peer: reply with the same
 // code, tear down, and report the outcome.
+//
+// A close frame without a payload closes normally (1005 "no status"). A
+// payload must carry a usable status code — in 1000-4999 and none of the
+// codes that must or should not be set as a status on the wire (1004, 1005,
+// 1006, 1015; RFC 6455 §7.4) — or the connection is failed with 1002
+// (§7.1.5); an unusable code is never echoed back.
 func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
-	code, reason := StatusNoStatusReceived, ""
-	if len(payload) >= closeCodeBytes {
-		code = int(binary.BigEndian.Uint16(payload[:closeCodeBytes]))
-		reason = string(payload[closeCodeBytes:])
+	if len(payload) == 1 {
+		return 0, nil, c.failProtocol("close frame with one-byte payload")
 	}
-	_ = c.Close(code, reason)
+	if len(payload) >= closeCodeBytes {
+		code := int(binary.BigEndian.Uint16(payload[:closeCodeBytes]))
+		if !usableCloseCode(code) {
+			return 0, nil, c.failProtocol(fmt.Sprintf("close frame with unusable status code %d", code))
+		}
+		reason := string(payload[closeCodeBytes:])
+		_ = c.Close(code, reason)
 
-	return 0, nil, c.finish(closeErrFor(code, reason))
+		return 0, nil, c.finish(closeErrFor(code, reason))
+	}
+
+	// len(payload) == 0: no status received; closes normally.
+	_ = c.Close(StatusNoStatusReceived, "")
+
+	return 0, nil, c.finish(nil)
+}
+
+// failProtocol tears the connection down with 1002 (protocol error) and
+// returns the violation for ReadMessage to report.
+func (c *Conn) failProtocol(what string) error {
+	err := fmt.Errorf("%w: %s", errProtocol, what)
+	_ = c.Close(StatusProtocolError, what)
+
+	return c.finish(err)
+}
+
+// mustNotSetCloseCode reports whether code must (or should) not appear as a
+// status code in a close frame payload (RFC 6455 §7.4): 1004 (SHOULD NOT),
+// and 1005, 1006, 1015 (MUST NOT). Such codes go out with an empty payload,
+// and a close frame received with one is a protocol error.
+func mustNotSetCloseCode(code int) bool {
+	switch code {
+	case closeCodeUnexpected, StatusNoStatusReceived, StatusAbnormalClosure, closeCodeTLSFailure:
+		return true
+	}
+
+	return false
+}
+
+// usableCloseCode reports whether code is a usable status code in a close
+// frame payload: in 1000-4999 and not reserved (see mustNotSetCloseCode).
+func usableCloseCode(code int) bool {
+	return code >= closeCodeMin && code <= closeCodeMax && !mustNotSetCloseCode(code)
 }
 
 // handleData processes one data or continuation frame. It returns complete
@@ -746,9 +799,11 @@ func (c *Conn) closedWriteErr() error {
 	return ErrClosed
 }
 
-// writeFrame writes a frame, taking the write lock. Control frames are
-// rejected here; use [Close] to send a close frame. A closed connection
-// yields [Conn.closedWriteErr], never a silent success.
+// writeFrame writes a frame, taking the write lock. It serves every frame
+// write on the connection — data frames ([Conn.WriteMessage]), the
+// automatic pong and keepalive ping, and the close frame ([Conn.Close]) —
+// each of which validates its own use. A closed connection yields
+// [Conn.closedWriteErr], never a silent success.
 func (c *Conn) writeFrame(opcode int, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -766,6 +821,12 @@ func (c *Conn) writeFrame(opcode int, payload []byte) error {
 // On a closed connection WriteMessage always fails: with the recorded close
 // error, or [ErrClosed] after a normal closure (1000) — never a silent
 // success for a frame that will not be sent.
+//
+// The write lock is held for the whole transport write, so a writer stuck
+// at the [WithWriteTimeout] bound delays by that bound the automatic pong
+// the read path answers to a peer ping. A peer whose keepalive window is
+// shorter than the write bound may therefore declare the connection dead
+// while a write is in flight; tune the two to match.
 func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	if opcode != OpText && opcode != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
@@ -798,19 +859,20 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 // reason before tearing down the transport. It is idempotent and safe to
 // call from any goroutine, including the pumping goroutine.
 //
-// Close codes must be in the range 1000-4999. The return value is the
-// terminal error recorded on the connection — nil for a normal closure
-// (1000), a [*CloseError] otherwise — not the status of the close-frame
-// write, which is best effort: the kernel delivers queued data before the
-// FIN, so the frame reaches the peer in order when the transport allows.
-// Concurrent Close callers all observe the same recorded error, from the
-// first one to close.
+// Close codes must be in the range 1000-4999. Codes that must (or should)
+// not be set as a status on the wire — 1004, 1005, 1006, 1015 — go out with
+// an empty payload. The return value is the terminal error recorded on the
+// connection — nil for a normal closure (1000), a [*CloseError] otherwise —
+// not the status of the close-frame write, which is best effort: the kernel
+// delivers queued data before the FIN, so the frame reaches the peer in
+// order when the transport allows. Concurrent Close callers all observe the
+// same recorded error, from the first one to close.
 func (c *Conn) Close(code int, reason string) error {
 	if code < closeCodeMin || code > closeCodeMax {
 		return fmt.Errorf("%w: %d", errBadCloseCode, code)
 	}
 	var payload []byte
-	if code != StatusNoStatusReceived && code != StatusAbnormalClosure {
+	if !mustNotSetCloseCode(code) {
 		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
 		reason = reason[:min(len(reason), maxCloseReason)]
 		payload = make([]byte, closeCodeBytes+len(reason))
@@ -926,8 +988,11 @@ func WithMaxMessageSize(n int64) Option {
 // considered dead and the read fails with a timeout if the peer is still
 // silent after a second window. A pong (or any frame) from the peer resets
 // the clock, so an idle-but-alive connection is kept alive and probed
-// roughly every window. Pass zero to disable keepalive and manage deadlines
-// via [Conn.SetReadDeadline].
+// roughly every window. The read deadline spans a whole frame, so a single
+// frame that takes longer than the window to arrive — a large message on a
+// slow link — triggers the probe and, if it is still incomplete after a
+// second window, the kill. Pass zero to disable keepalive and manage
+// deadlines via [Conn.SetReadDeadline].
 func WithIdleTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.IdleTimeout = d }
 }
@@ -943,9 +1008,10 @@ func WithWriteTimeout(d time.Duration) Option {
 
 // Server-only options.
 
-// WithCheckOrigin sets the origin policy. The default is strict same-origin:
-// the request's Origin header must equal the request's scheme and Host, and
-// requests without an Origin header are rejected.
+// WithCheckOrigin sets the origin policy. The default is strict same-origin
+// for requests that carry an Origin header (it must equal the request's
+// scheme and Host); requests without one — programmatic clients — are
+// allowed. See [NewUpgrader] for the rationale.
 func WithCheckOrigin(check func(r *http.Request) bool) Option {
 	return func(cfg *Config) { cfg.CheckOrigin = check }
 }
@@ -1027,10 +1093,13 @@ type Upgrader struct {
 	preHandshake      []func(r *http.Request) error
 }
 
-// NewUpgrader creates an Upgrader with sensible defaults: same-origin origin
-// checking, a 16 MiB message size limit, and a 60 second keepalive window:
-// a connection silent for that long is probed with a ping, and is considered
-// dead if it is still silent after a second window.
+// NewUpgrader creates an Upgrader with sensible defaults: strict same-origin
+// origin checking for requests that carry an Origin header (requests without
+// one — programmatic clients — are allowed, since browsers always send it
+// and a wrong-origin browser is still rejected), a 16 MiB message size
+// limit, and a 60 second keepalive window: a connection silent for that long
+// is probed with a ping, and is considered dead if it is still silent after
+// a second window.
 func NewUpgrader(opts ...Option) *Upgrader {
 	cfg := &Config{
 		CheckOrigin:    defaultCheckOrigin,
@@ -1125,6 +1194,11 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 	if key == "" {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Key header")
 	}
+	// RFC 6455 §4.1: the key must be well-formed — the base64 of 16 octets.
+	raw, decodeErr := base64.StdEncoding.DecodeString(key)
+	if decodeErr != nil || len(raw) != wsKeyBytes {
+		return "", rejectStatus(writer, http.StatusBadRequest, "malformed Sec-WebSocket-Key header")
+	}
 
 	return key, nil
 }
@@ -1204,6 +1278,11 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	if rejection != nil {
 		return nil, rejection
 	}
+	// RFC 6455 §4.1: a request body must not be present; its bytes would be
+	// indistinguishable from the first frames on the hijacked connection.
+	if request.Body != http.NoBody {
+		return reject(writer, http.StatusBadRequest, "request body not allowed")
+	}
 
 	hj, ok := writer.(http.Hijacker)
 	if !ok {
@@ -1214,16 +1293,20 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	if err != nil {
 		return nil, fmt.Errorf("ws: hijack failed: %w", err)
 	}
-	// If the handler already wrote a response that has not been flushed,
-	// its bytes are still sitting in buf; switching protocols now would
-	// corrupt the stream. (A fully flushed response cannot be detected
-	// after the fact; return before calling Upgrade when the request is
-	// rejected, and never write to writer after calling it.)
+	// buf holds any request bytes net/http read but did not consume —
+	// pipelined requests; a body on the GET is caught earlier by the
+	// request-body check. Switching protocols now would desynchronize the
+	// stream, so reject with 400. (Bytes a handler wrote to the
+	// ResponseWriter are flushed by net/http before the switch, so an
+	// accidental pre-upgrade write reaches the client as the earlier
+	// response rather than a corrupt stream; rejected requests should
+	// return before calling Upgrade, and nothing may be written to writer
+	// after it succeeds.)
 	if buf.Reader.Buffered() > 0 {
 		_ = raw.Close()
 
 		return nil, &UpgradeError{
-			Status: http.StatusInternalServerError, Msg: "response already started"}
+			Status: http.StatusBadRequest, Msg: "unconsumed request data"}
 	}
 
 	protocol := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
@@ -1271,10 +1354,17 @@ func Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
 
 // Handshake helpers, shared by [Upgrader.Upgrade] and [Dial].
 
+// defaultCheckOrigin enforces strict same-origin on requests that carry an
+// Origin header: it must equal the request's scheme and Host. Requests
+// without an Origin are allowed: browsers always send Origin, while
+// programmatic clients (this package's [Dial], curl, other libraries) usually
+// do not, so rejecting them would bar plain clients out by default. A
+// cross-origin browser is still rejected, because it always presents an
+// Origin.
 func defaultCheckOrigin(request *http.Request) bool {
 	origin := request.Header.Get("Origin")
 	if origin == "" {
-		return false
+		return true
 	}
 	scheme := "http"
 	if request.TLS != nil {
@@ -1306,6 +1396,21 @@ func negotiateProtocol(server []string, clientHeader string) string {
 	}
 
 	return ""
+}
+
+// validSubprotocol reports whether s is a valid subprotocol token: printable
+// US-ASCII excluding space and double quote (RFC 6455 §1.9).
+func validSubprotocol(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r <= 0x20 || r >= 0x7f || r == '"' {
+			return false
+		}
+	}
+
+	return true
 }
 
 // wsGUID is the magic GUID from RFC 6455 §1.3.
@@ -1436,6 +1541,11 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 	fmt.Fprintf(&req, "Sec-WebSocket-Key: %s\r\n", key)
 	fmt.Fprintf(&req, "Sec-WebSocket-Version: %s\r\n", websocketVer)
 	if len(subprotocols) > 0 {
+		for _, subprotocol := range subprotocols {
+			if !validSubprotocol(subprotocol) {
+				return "", fmt.Errorf("%w: %q", errBadSubprotocol, subprotocol)
+			}
+		}
 		fmt.Fprintf(&req, "Sec-WebSocket-Protocol: %s\r\n", strings.Join(subprotocols, ", "))
 	}
 	for headerKey, values := range headers {
@@ -1448,6 +1558,9 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 			continue
 		}
 		for _, value := range values {
+			if strings.ContainsAny(value, "\r\n") {
+				return "", fmt.Errorf("%w: %s value contains a line break", errBadHeader, headerKey)
+			}
 			fmt.Fprintf(&req, "%s: %s\r\n", headerKey, value)
 		}
 	}
@@ -1472,6 +1585,11 @@ func readHandshakeResponse(reader *bufio.Reader, key string) (string, error) {
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		return "", fmt.Errorf("%w: server replied %s", errHandshakeFailed, resp.Status)
+	}
+	// RFC 6455 §4.1: the 101 must carry the websocket upgrade tokens.
+	if !headerContainsToken(resp.Header, "Upgrade", "websocket") ||
+		!headerContainsToken(resp.Header, "Connection", "Upgrade") {
+		return "", fmt.Errorf("%w: 101 response missing the upgrade headers", errHandshakeFailed)
 	}
 	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
 		return "", fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, got)

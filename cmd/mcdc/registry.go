@@ -13,13 +13,16 @@ package main
 
 // Test names referenced by the traces.
 const (
-	testControlFrame   = "TestMCDCControlFrame"
-	testIsReadTimeout  = "TestMCDCIsReadTimeout"
-	testWriteOpcode    = "TestMCDCWriteMessageOpcode"
-	testCloseCodeRange = "TestMCDCCloseCodeRange"
-	testClosePayload   = "TestMCDCCloseCodePayload"
-	testRequireCert    = "TestMCDCRequireClientCert"
-	testDialScheme     = "TestMCDCDialScheme"
+	testControlFrame     = "TestMCDCControlFrame"
+	testIsReadTimeout    = "TestMCDCIsReadTimeout"
+	testWriteOpcode      = "TestMCDCWriteMessageOpcode"
+	testCloseCodeRange   = "TestMCDCCloseCodeRange"
+	testRequireCert      = "TestMCDCRequireClientCert"
+	testDialScheme       = "TestMCDCDialScheme"
+	testMCDCCloseCode    = "TestMCDCCloseCode"
+	testMCDCWebSocketKey = "TestMCDCWebSocketKey"
+	testMCDCSubprotocol  = "TestMCDCSubprotocol"
+	testMCDCUpgrade101   = "TestMCDCUpgrade101"
 )
 
 // pairTrace is one traced MC/DC independence pair.
@@ -94,6 +97,18 @@ func frameTraces() []decisionTrace {
 				{1, []bool{true, false}, []bool{true, true}, testWriteOpcode, "notBinary"},
 			},
 		},
+		// ws.go: code >= closeCodeMin && code <= closeCodeMax (nested in the
+		// usableCloseCode decision)
+		{
+			expr:       "code >= closeCodeMin && code <= closeCodeMax",
+			conditions: []string{"code >= closeCodeMin", "code <= closeCodeMax"},
+			pairs: []pairTrace{
+				// 999 (below range) fails with 1002; 1000 closes normally.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCCloseCode, "min"},
+				// 5000 (above range) fails with 1002; 1000 closes normally.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCCloseCode, "max"},
+			},
+		},
 		// ws.go: code < closeCodeMin || code > closeCodeMax
 		{
 			expr:       "code < closeCodeMin || code > closeCodeMax",
@@ -105,15 +120,19 @@ func frameTraces() []decisionTrace {
 				{1, []bool{false, true}, []bool{false, false}, testCloseCodeRange, "aboveMax"},
 			},
 		},
-		// ws.go: code != StatusNoStatusReceived && code != StatusAbnormalClosure
+		// ws.go: code >= closeCodeMin && code <= closeCodeMax &&
+		// !mustNotSetCloseCode(code)
 		{
-			expr:       "code != StatusNoStatusReceived && code != StatusAbnormalClosure",
-			conditions: []string{"code != StatusNoStatusReceived", "code != StatusAbnormalClosure"},
+			expr:       "code >= closeCodeMin && code <= closeCodeMax && !mustNotSetCloseCode(code)",
+			conditions: []string{"code >= closeCodeMin", "code <= closeCodeMax", "!mustNotSetCloseCode(code)"},
 			pairs: []pairTrace{
-				// 1005 carries no payload, 1000 carries code + reason.
-				{0, []bool{false, true}, []bool{true, true}, testClosePayload, "noStatusReceived"},
-				// 1006 carries no payload, 1000 carries code + reason.
-				{1, []bool{true, false}, []bool{true, true}, testClosePayload, "abnormalClosure"},
+				// 999 (below range) fails with 1002; 1000 closes normally.
+				{0, []bool{true, true, true}, []bool{false, true, true}, testMCDCCloseCode, "min"},
+				// 5000 (above range) fails with 1002; 1000 closes normally.
+				{1, []bool{true, true, true}, []bool{true, false, true}, testMCDCCloseCode, "max"},
+				// 1004 (must not be set on the wire) fails with 1002 and is
+				// not echoed; 1000 closes normally.
+				{2, []bool{true, true, true}, []bool{true, true, false}, testMCDCCloseCode, "forbidden"},
 			},
 		},
 	}
@@ -144,6 +163,67 @@ func handshakeTraces() []decisionTrace {
 				{0, []bool{false, true}, []bool{true, true}, testDialScheme, "notWs"},
 				// wss:// passes the check, http:// fails it (notWs true in both).
 				{1, []bool{true, false}, []bool{true, true}, testDialScheme, "notWss"},
+			},
+		},
+		// ws.go: decodeErr != nil || len(raw) != wsKeyBytes
+		{
+			expr:       "decodeErr != nil || len(raw) != wsKeyBytes",
+			conditions: []string{"decodeErr != nil", "len(raw) != wsKeyBytes"},
+			pairs: []pairTrace{
+				// "!!!!" is not base64: 400. The same 16-byte key, well
+				// formed, is accepted: 101.
+				{0, []bool{true, false}, []bool{false, false}, testMCDCWebSocketKey, "decode"},
+				// "QUFB" decodes to 3 bytes: 400. A 16-byte key is
+				// accepted: 101.
+				{1, []bool{false, true}, []bool{false, false}, testMCDCWebSocketKey, "len"},
+			},
+		},
+		// ws.go: r <= 0x20 || r >= 0x7f || r == '"' (validSubprotocol)
+		{
+			expr:       `r <= 0x20 || r >= 0x7f || r == '"'`,
+			conditions: []string{"r <= 0x20", "r >= 0x7f", `r == '"'`},
+			pairs: []pairTrace{
+				// A control character is rejected; the printable "a" is
+				// accepted.
+				{0, []bool{true, false, false}, []bool{false, false, false}, testMCDCSubprotocol, "low"},
+				// DEL (0x7f) is rejected; the printable "a" is accepted.
+				{1, []bool{false, true, false}, []bool{false, false, false}, testMCDCSubprotocol, "high"},
+				// A double quote is rejected; the printable "a" is
+				// accepted.
+				{2, []bool{false, false, true}, []bool{false, false, false}, testMCDCSubprotocol, "quote"},
+			},
+		},
+		// ws.go: r <= 0x20 || r >= 0x7f (nested in the validSubprotocol
+		// decision)
+		{
+			expr:       "r <= 0x20 || r >= 0x7f",
+			conditions: []string{"r <= 0x20", "r >= 0x7f"},
+			pairs: []pairTrace{
+				// A control character is rejected; the printable "a" is
+				// accepted.
+				{0, []bool{true, false}, []bool{false, false}, testMCDCSubprotocol, "low"},
+				// DEL (0x7f) is rejected; the printable "a" is accepted.
+				{1, []bool{false, true}, []bool{false, false}, testMCDCSubprotocol, "high"},
+			},
+		},
+		// ws.go: the negated "Upgrade"-token check OR the negated
+		// "Connection"-token check on the 101 response. Concatenated so
+		// the line stays under the lll limit; the evaluated string must
+		// match the normalized source expression exactly.
+		{
+			expr: `!headerContainsToken(resp.Header, "Upgrade", "websocket") || ` +
+				`!headerContainsToken(resp.Header, "Connection", "Upgrade")`,
+			conditions: []string{
+				`!headerContainsToken(resp.Header, "Upgrade", "websocket")`,
+				`!headerContainsToken(resp.Header, "Connection", "Upgrade")`,
+			},
+			pairs: []pairTrace{
+				// A 101 without "Upgrade: websocket" is rejected; with both
+				// tokens it is accepted.
+				{0, []bool{true, false}, []bool{false, false}, testMCDCUpgrade101, "upgrade"},
+				// A 101 without "Connection: Upgrade" is rejected; with both
+				// tokens it is accepted.
+				{1, []bool{false, true}, []bool{false, false}, testMCDCUpgrade101, "connection"},
 			},
 		},
 	}

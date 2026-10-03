@@ -186,14 +186,17 @@ func TestHandshakeData(t *testing.T) {
 	}
 }
 
+// TestOriginEnforced pins the default origin policy: requests without an
+// Origin header (programmatic clients) are allowed, and requests with an
+// Origin are enforced against the request's own scheme and Host.
 func TestOriginEnforced(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()
 
-	// No Origin at all: default policy rejects.
+	// No Origin at all: programmatic clients are allowed by default.
 	_, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict")
-	if err == nil {
-		t.Fatal("dial without Origin succeeded, want 403 rejection")
+	if err != nil {
+		t.Fatalf("dial without Origin failed, want allowed: %v", err)
 	}
 	// Wrong origin.
 	_, err = ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict",
