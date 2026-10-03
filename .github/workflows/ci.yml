@@ -29,6 +29,11 @@ jobs:
         run: |
           go test -coverprofile=cov.out ./ws/
           go tool cover -func=cov.out | tail -1
+      - name: branch coverage
+        run: |
+          go test -covermode=count -coverprofile=bc-unit.out ./ws/
+          go test -covermode=count -coverpkg=./ws -coverprofile=bc-e2e.out ./e2e/
+          go run ./cmd/branchcov ws bc-unit.out bc-e2e.out
       - name: fuzz (10s)
         run: go test -fuzz=FuzzReadFrame -fuzztime=10s ./ws/
 

@@ -1,6 +1,6 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all lint staticcheck test race fuzz bench coverage e2e demo certgen
+.PHONY: all lint staticcheck test race fuzz bench coverage branchcov e2e demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -31,6 +31,15 @@ bench:
 
 coverage:
 	go test -coverprofile=cov.out ./ws/ && go tool cover -func=cov.out | tail -1
+
+# Branch coverage. Go's built-in -cover counts statements only; this
+# derives per-branch outcomes (if true/false, for entry/exit, switch
+# cases) from a count-mode profile with cmd/branchcov, merging the unit
+# and e2e suites (the latter via -coverpkg).
+branchcov:
+	go test -covermode=count -coverprofile=bc-unit.out ./ws/
+	go test -covermode=count -coverpkg=./ws -coverprofile=bc-e2e.out ./e2e/
+	go run ./cmd/branchcov ws bc-unit.out bc-e2e.out
 
 # Full end-to-end: Go mTLS/interop test plus the Playwright suite
 # (Firefox + Chromium) against the real demo binary.

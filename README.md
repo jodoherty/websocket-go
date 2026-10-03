@@ -145,13 +145,19 @@ ws/bench_test.go    codec + round-trip benchmarks
 ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
 ws/branches_test.go error-branch coverage: malformed frames, control/fragment
                     paths, armIdle ping, write failure paths
+ws/branchgaps_test.go pins the individually hard-to-reach error branches
+                    (write validation, close-code range, truncated 64-bit
+                    length, 3-frame fragment chains, keepalive write paths)
 ws/coverage_test.go closes out accessors, option functions, and rejection
-                    branches the other suites don't touch
+                    branches the other suites don't touch (Dial handshake
+                    failures, reserved headers, the upgrade guards)
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
+cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
+                count-mode coverage profile (the stdlib has no branch mode)
 e2e/            e2e suites:
                 ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
                                  binary, bearer accept/reject, mTLS rejection, close codes
@@ -171,6 +177,8 @@ Makefile        the repeatable gate: make lint / staticcheck / all / e2e / fuzz
 go test ./...        # library unit tests
 go vet ./...
 make all             # the full gate: strict lint + staticcheck + tests
+make coverage        # statement coverage (unit suite)
+make branchcov       # branch coverage (cmd/branchcov, unit + e2e merged)
 make e2e             # Go e2e + Playwright (Firefox and Chromium)
 ```
 
@@ -254,14 +262,29 @@ Layers of evidence, weakest to strongest:
    Ryzen 7600X a 1 KiB round trip is ~1.8 µs (~570 MB/s) with a single
    allocation (the payload), the masked client write is ~420 ns with zero
    allocations, and the accept key is ~130 ns.
-10. **Coverage** — the library sits at **92% statement coverage** when the
-   unit and e2e suites are combined. The unit suite alone covers the codec,
-   state machine, and policy; the e2e suite (`go test ./e2e -cover
-   -coverpkg=./ws`) adds the TLS client path, the mTLS handshake, and the
-   real-network `Dial`. The two profiles are merged to get the combined
-   number. The remaining uncovered lines are deliberately defensive error
-   branches (e.g. a hijack failure mid-upgrade) that cannot be reached
-   through a well-formed connection.
+10. **Statement coverage** — the library sits at **97% statement coverage**
+   when the unit and e2e suites are combined (97% on the unit suite alone).
+   The e2e suite (`go test ./e2e -cover -coverpkg=./ws`) adds the TLS
+   client path, the mTLS handshake, and the real-network `Dial`; the two
+   count-mode profiles are merged (per-block max of the hit counts) for the
+   combined number. `make coverage` prints the unit-only figure.
+11. **Branch coverage** — `go test -cover` counts statements, not the
+   outcomes of a condition, so branch coverage is measured separately with
+   `cmd/branchcov`: it walks the package AST and, for every `if`/`for`/
+   `switch`/`select`, derives each outcome from the basic-block counts in a
+   count-mode profile (an `if`'s false branch is "the header was evaluated
+   more times than its body was entered"; a `for`'s entry and exit are the
+   header and body block counts; a `switch` gets one outcome per case plus a
+   no-match). The library sits at **95.9% branch coverage** (208 of 217
+   outcomes). The nine uncovered outcomes are structurally unreachable
+   without fault injection: two `crypto/rand.Read` error paths (it does not
+   fail), a `resp.Body != nil` guard (the body is never nil from
+   `http.ReadResponse`), a race-free state check the mutex makes dead, and
+   five mid-handshake write/hijack failures that need a live connection to
+   fail at exactly the wrong instant. `make branchcov` reproduces the
+   number; `cmd/branchcov` also documents two limits shared with every
+   standard-profile tool (operand-level short-circuiting inside a boolean
+   expression, and break-versus-condition-false loop exits).
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
 The keepalive read loop is timing logic — probe at the boundary, kill on

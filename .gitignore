@@ -5,3 +5,11 @@ e2e/playwright-report/
 e2e/.test/
 /demo
 /certgen
+
+# coverage / branch-coverage profile outputs
+/cov.out
+/bc-unit.out
+/bc-e2e.out
+
+# local build artifacts
+/branchcov

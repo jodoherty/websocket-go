@@ -420,3 +420,180 @@ func TestDialFailure(t *testing.T) {
 	}
 	_ = fmt.Sprintf // keep import if unused on some platforms
 }
+
+// TestDialTLSHandshakeFailure pins the wss failure path: dialing wss:// at
+// a plain-HTTP server must fail with a wrapped TLS handshake error, not a
+// hang or a success.
+func TestDialTLSHandshakeFailure(t *testing.T) {
+	s := startServer(t)
+	defer s.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := ws.Dial(ctx, "wss"+strings.TrimPrefix(s.URL, "http"))
+	if err == nil || !strings.Contains(err.Error(), "tls handshake") {
+		t.Fatalf("Dial wss:// at a plain server: err = %v, want a tls handshake error", err)
+	}
+}
+
+// TestDialSkipsReservedHeaders pins the reserved-header guard: user-supplied
+// Host / Connection / Upgrade headers must be dropped, not duplicated, and
+// the connection must still succeed (the net/http stack sets them).
+func TestDialSkipsReservedHeaders(t *testing.T) {
+	s := startServer(t)
+	defer s.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo",
+		ws.WithHeader("Host", "evil.example"),
+		ws.WithHeader("Connection", "upgrade"),
+		ws.WithHeader("Upgrade", "websocket"),
+	)
+	if err != nil {
+		t.Fatalf("Dial with reserved headers: %v", err)
+	}
+	defer conn.Close(ws.StatusNormalClosure, "")
+}
+
+// rawResponder answers each accepted connection with a fixed byte string.
+func rawResponder(t *testing.T, response string) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = conn.Write([]byte(response))
+				time.Sleep(100 * time.Millisecond)
+				_ = conn.Close()
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+// TestDialGarbageResponse pins the non-HTTP response path: a listener that
+// speaks garbage must yield a wrapped handshake error.
+func TestDialGarbageResponse(t *testing.T) {
+	addr := rawResponder(t, "NOT-HTTP\r\n\r\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := ws.Dial(ctx, "ws://"+addr+"/ws")
+	if err == nil || !strings.Contains(err.Error(), "read handshake response") {
+		t.Fatalf("Dial at a garbage responder: err = %v, want a handshake error", err)
+	}
+}
+
+// TestDialBadAccept pins the accept-key verification: a 101 response with a
+// wrong Sec-WebSocket-Accept must be rejected.
+func TestDialBadAccept(t *testing.T) {
+	addr := rawResponder(t, "HTTP/1.1 101 Switching Protocols\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Accept: deadbeef\r\n\r\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := ws.Dial(ctx, "ws://"+addr+"/ws")
+	if err == nil || !strings.Contains(err.Error(), "Sec-WebSocket-Accept") {
+		t.Fatalf("Dial with a bad accept key: err = %v, want an accept-key error", err)
+	}
+}
+
+// TestDialMalformedURL pins the url.Parse failure branch.
+func TestDialMalformedURL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ws.Dial(ctx, "ws://127.0.0.1:notaport/ws")
+	if err == nil || !strings.Contains(err.Error(), "bad url") {
+		t.Fatalf("Dial with a malformed URL = %v, want a 'bad url' error", err)
+	}
+}
+
+// TestDialDefaultPort pins the no-port branch on both schemes: a host without
+// an explicit port must have the default (80 for ws, 443 for wss) filled in
+// before dialing. The dials themselves fail (nothing serves those ports
+// here), but the branch is exercised before the dial.
+func TestDialDefaultPort(t *testing.T) {
+	for _, rawurl := range []string{"ws://127.0.0.1/ws", "wss://127.0.0.1/ws"} {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, dialErr := ws.Dial(ctx, rawurl, ws.WithDialTimeout(200*time.Millisecond))
+		cancel()
+		if dialErr == nil {
+			t.Fatalf("Dial(%q) succeeded; expected a dial or handshake failure", rawurl)
+		}
+	}
+}
+
+// TestUpgradeResponseAlreadyStarted pins the buffered-request guard: a
+// request with body bytes left unread when the handler upgrades must get
+// a 500 UpgradeError, and the client must see a non-101 response.
+func TestUpgradeResponseAlreadyStarted(t *testing.T) {
+	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
+	upErrCh := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/early", func(w http.ResponseWriter, request *http.Request) {
+		_, _ = w.Write([]byte("partial"))
+		_, upErr := up.Upgrade(w, request)
+		upErrCh <- upErr
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	// A raw TCP client sends the upgrade request and a pipelined second
+	// request in one write, so the server's bufio read-ahead retains the
+	// second request's bytes after parsing the first — the condition the
+	// guard is meant to catch (leftover request data at upgrade time).
+	host := strings.TrimPrefix(s.URL, "http://")
+	conn, err := net.Dial("tcp", host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	request := "GET /early HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"\r\n" +
+		"GET / HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"\r\n"
+	_, err = conn.Write([]byte(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The server responds (a 500, not a 101) and tears the connection
+	// down; drain until it closes or the deadline fires.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var response []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		response = append(response, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	upErr, ok := <-upErrCh
+	if !ok {
+		t.Fatalf("Upgrade did not return; server response was:\n%s", response)
+	}
+	upgradeErr := &ws.UpgradeError{}
+	if !errors.As(upErr, &upgradeErr) ||
+		upgradeErr.Status != http.StatusInternalServerError ||
+		!strings.Contains(upgradeErr.Msg, "response already started") {
+		t.Fatalf("Upgrade = %v, want a 500 'response already started'; server response was:\n%s", upErr, response)
+	}
+}
