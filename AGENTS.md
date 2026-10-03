@@ -25,6 +25,22 @@ Rules that preserve it:
 If a change genuinely requires a second file, stop and discuss it — the
 single-file property is the project's central design commitment.
 
+## Licensing: public domain, no attribution
+
+All code in this repository is released into the public domain under the
+Unlicense (see `LICENSE`).
+
+- Never add copyright notices or author attribution anywhere: no
+  "Copyright (c) ..." headers, no author name comments, no `@author`
+  tags — in implementation files, test files, comments, docs, commit
+  messages, or generated tooling.
+- `ws/ws.go` carries a short Unlicense notice at the top of the file so
+  the license travels with the file when it is vendored by copying
+  (the drop-in property above). Keep that notice, keep it free of any
+  attribution, and do not add copyright headers to any other file:
+  vendoring this package means copying `ws/ws.go`, and that file alone
+  is the unit of distribution.
+
 ## Concurrency and allocation invariants
 
 - `Conn.ReadMessage` is owned by one pumping goroutine; `WriteMessage` and

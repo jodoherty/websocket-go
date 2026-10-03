@@ -1,3 +1,8 @@
+// This software is released into the public domain under the Unlicense
+// (https://unlicense.org). The full license text is in LICENSE at the
+// repository root; it is repeated here so the license travels with the
+// file when it is vendored by copying, as this package is designed to be.
+//
 // Package ws is a WebSocket (RFC 6455) implementation for Go that uses only
 // the standard library.
 //
