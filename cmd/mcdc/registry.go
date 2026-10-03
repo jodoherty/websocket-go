@@ -13,16 +13,18 @@ package main
 
 // Test names referenced by the traces.
 const (
-	testControlFrame     = "TestMCDCControlFrame"
-	testIsReadTimeout    = "TestMCDCIsReadTimeout"
-	testWriteOpcode      = "TestMCDCWriteMessageOpcode"
-	testCloseCodeRange   = "TestMCDCCloseCodeRange"
-	testRequireCert      = "TestMCDCRequireClientCert"
-	testDialScheme       = "TestMCDCDialScheme"
-	testMCDCCloseCode    = "TestMCDCCloseCode"
-	testMCDCWebSocketKey = "TestMCDCWebSocketKey"
-	testMCDCSubprotocol  = "TestMCDCSubprotocol"
-	testMCDCUpgrade101   = "TestMCDCUpgrade101"
+	testControlFrame        = "TestMCDCControlFrame"
+	testIsReadTimeout       = "TestMCDCIsReadTimeout"
+	testWriteOpcode         = "TestMCDCWriteMessageOpcode"
+	testCloseCodeRange      = "TestMCDCCloseCodeRange"
+	testRequireCert         = "TestMCDCRequireClientCert"
+	testDialScheme          = "TestMCDCDialScheme"
+	testMCDCCloseCode       = "TestMCDCCloseCode"
+	testMCDCWebSocketKey    = "TestMCDCWebSocketKey"
+	testMCDCSubprotocol     = "TestMCDCSubprotocol"
+	testMCDCUpgrade101      = "TestMCDCUpgrade101"
+	testMCDCHandleCloseCode = "TestMCDCHandleCloseCode"
+	testMCDCTruncateReason  = "TestMCDCTruncateReason"
 )
 
 // pairTrace is one traced MC/DC independence pair.
@@ -42,11 +44,13 @@ type decisionTrace struct {
 }
 
 // registry is the complete trace set: frame-path decisions plus
-// handshake-path decisions.
+// close-code, handshake, and server-path decisions.
 func registry() []decisionTrace {
 	traces := frameTraces()
+	traces = append(traces, closeTraces()...)
+	traces = append(traces, handshakeTraces()...)
 
-	return append(traces, handshakeTraces()...)
+	return append(traces, serverTraces()...)
 }
 
 // frameTraces covers the frame codec and message paths.
@@ -97,6 +101,13 @@ func frameTraces() []decisionTrace {
 				{1, []bool{true, false}, []bool{true, true}, testWriteOpcode, "notBinary"},
 			},
 		},
+	}
+}
+
+// closeTraces covers the close-code validation decisions and the close
+// reason truncation.
+func closeTraces() []decisionTrace {
+	return []decisionTrace{
 		// ws.go: code >= closeCodeMin && code <= closeCodeMax (nested in the
 		// usableCloseCode decision)
 		{
@@ -118,6 +129,19 @@ func frameTraces() []decisionTrace {
 				{0, []bool{true, false}, []bool{false, false}, testCloseCodeRange, "belowMin"},
 				// 5000 rejected, 1000 accepted (belowMin false in both).
 				{1, []bool{false, true}, []bool{false, false}, testCloseCodeRange, "aboveMax"},
+			},
+		},
+		// ws.go (truncateReason): n > 0 && !utf8.RuneStart(reason[n])
+		{
+			expr:       "n > 0 && !utf8.RuneStart(reason[n])",
+			conditions: []string{"n > 0", "!utf8.RuneStart(reason[n])"},
+			pairs: []pairTrace{
+				// A 2-byte rune split across the bound backs off one byte;
+				// a start byte at the bound does not.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCTruncateReason, "runeBoundary"},
+				// An all-continuation (invalid UTF-8) reason runs the loop
+				// down to n == 0 and yields the empty string.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCTruncateReason, "invalidUTF8"},
 			},
 		},
 		// ws.go: code >= closeCodeMin && code <= closeCodeMax &&
@@ -224,6 +248,23 @@ func handshakeTraces() []decisionTrace {
 				// A 101 without "Connection: Upgrade" is rejected; with both
 				// tokens it is accepted.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCUpgrade101, "connection"},
+			},
+		},
+	}
+}
+
+// serverTraces covers the server session-path decisions.
+func serverTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (Handle): code < closeCodeMin || code > closeCodeMax
+		{
+			expr:       "code < closeCodeMin || code > closeCodeMax",
+			conditions: []string{"code < closeCodeMin", "code > closeCodeMax"},
+			pairs: []pairTrace{
+				// 999 remapped to 1002, 1000 passed through unchanged.
+				{0, []bool{true, false}, []bool{false, false}, testMCDCHandleCloseCode, "belowMin"},
+				// 5000 remapped to 1002, 4999 passed through unchanged.
+				{1, []bool{false, true}, []bool{false, false}, testMCDCHandleCloseCode, "aboveMax"},
 			},
 		},
 	}

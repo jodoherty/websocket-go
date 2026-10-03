@@ -33,12 +33,18 @@ import (
 // gatedConn is a fake net.Conn for synctest bubbles. Reads block until a
 // frame is pushed (bubble channel) or the read deadline fires (bubble timer
 // from time.After, set through SetReadDeadline). Writes are recorded so the
-// test can observe probe pings and their (fake-clock) times.
+// test can observe probe pings and their (fake-clock) times; with
+// stallWrite set, a write blocks on the write deadline instead of
+// completing, modeling a blackholed transport.
 type gatedConn struct {
 	mu      sync.Mutex
 	buf     []byte
 	dataSig chan struct{} // bubble channel; one token per push
 	readDL  <-chan time.Time
+
+	stallWrite    bool
+	writeDL       <-chan time.Time
+	writeDeadline time.Time // last non-zero write deadline set
 
 	pingMu sync.Mutex
 	pings  []time.Time
@@ -88,6 +94,20 @@ func (g *gatedConn) Write(p []byte) (int, error) {
 		g.pings = append(g.pings, time.Now())
 		g.pingMu.Unlock()
 	}
+	if g.stallWrite {
+		g.mu.Lock()
+		dl := g.writeDL
+		g.mu.Unlock()
+		if dl == nil {
+			// A stalled write with no deadline is unbounded by definition;
+			// fail loudly instead of wedging the fake-clock test.
+			return 0, errUnboundedWrite
+		}
+		<-dl
+
+		return 0, os.ErrDeadlineExceeded
+	}
+
 	return len(p), nil
 }
 
@@ -103,11 +123,31 @@ func (g *gatedConn) SetReadDeadline(t time.Time) error {
 	g.mu.Unlock()
 	return nil
 }
-func (g *gatedConn) SetWriteDeadline(time.Time) error { return nil }
-func (g *gatedConn) SetDeadline(time.Time) error      { return nil }
-func (g *gatedConn) LocalAddr() net.Addr              { return fakeAddr{} }
-func (g *gatedConn) RemoteAddr() net.Addr             { return fakeAddr{} }
-func (g *gatedConn) Close() error                     { return nil }
+func (g *gatedConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		g.mu.Lock()
+		g.writeDL = nil
+		g.mu.Unlock()
+		return nil
+	}
+	g.mu.Lock()
+	g.writeDL = time.After(time.Until(t)) // bubble timer
+	g.writeDeadline = t
+	g.mu.Unlock()
+	return nil
+}
+
+// lastWriteDeadline returns the last non-zero write deadline applied.
+func (g *gatedConn) lastWriteDeadline() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	return g.writeDeadline
+}
+func (g *gatedConn) SetDeadline(time.Time) error { return nil }
+func (g *gatedConn) LocalAddr() net.Addr         { return fakeAddr{} }
+func (g *gatedConn) RemoteAddr() net.Addr        { return fakeAddr{} }
+func (g *gatedConn) Close() error                { return nil }
 
 func (g *gatedConn) pingCount() int {
 	g.pingMu.Lock()
@@ -248,5 +288,48 @@ func TestKeepaliveActivityResetsClock(t *testing.T) {
 		// End the bubble cleanly: a close frame lets the reader return.
 		nc.push([]byte{0x88, 0x00})
 		synctest.Wait()
+	})
+}
+
+// errUnboundedWrite is reported by a stalled gatedConn write that had no
+// write deadline armed: the exact failure mode the bounded-write
+// regression test below guards against.
+var errUnboundedWrite = errors.New("ws test: stalled write with no write deadline")
+
+// TestKeepaliveProbeWriteBounded pins that an internal frame written to a
+// stalled transport carries the write-timeout bound: the probe ping fails
+// on its deadline, the read loop recovers and reports the failure
+// (no wedge), and the connection is still closable afterwards. If the
+// bound were missing, the stalled write would fail with
+// errUnboundedWrite, which is not a timeout-classified error.
+func TestKeepaliveProbeWriteBounded(t *testing.T) {
+	idle := time.Second
+	writeTimeout := 500 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		nc := newGatedConn()
+		nc.stallWrite = true
+		c := newConn(nc, nc, true, 1<<20, idle, writeTimeout)
+		errc := startRead(t, c)
+		synctest.Wait() // reader durably blocked on the read deadline at idle
+
+		synctest.Sleep(idle) // t = idle: the silence timeout probes with a ping
+		synctest.Wait()      // the ping write is durably blocked on its deadline
+		if dl := nc.lastWriteDeadline(); dl.IsZero() {
+			t.Fatal("probe ping was written with no write deadline: a stalled " +
+				"transport would wedge the read loop and the write mutex")
+		}
+
+		synctest.Sleep(writeTimeout) // t = idle+writeTimeout: the ping write fails
+		err := <-errc                // the read loop must have recovered
+		var nerr net.Error
+		if err == nil || !errors.As(err, &nerr) || !nerr.Timeout() {
+			t.Fatalf("read loop after failed probe write: %v, want a timeout-classified error", err)
+		}
+		// The failed probe recorded a terminal error, so Close returns it
+		// instead of waiting on the (long finished) stalled write.
+		closeErr := c.Close(StatusNormalClosure, "")
+		if closeErr == nil {
+			t.Fatal("Close returned nil; the failed probe write should have recorded a terminal error")
+		}
 	})
 }

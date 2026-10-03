@@ -1,8 +1,3 @@
-// This software is released into the public domain under the Unlicense
-// (https://unlicense.org). The full license text is in LICENSE at the
-// repository root; it is repeated here so the license travels with the
-// file when it is vendored by copying, as this package is designed to be.
-//
 // Package ws is a WebSocket (RFC 6455) implementation for Go that uses only
 // the standard library.
 //
@@ -81,6 +76,11 @@
 //  10. client (Dial)
 package ws
 
+// This software is released into the public domain under the Unlicense
+// (https://unlicense.org). The full license text is in LICENSE at the
+// repository root; it is repeated here so the license travels with the
+// file when it is vendored by copying, as this package is designed to be.
+
 import (
 	"bufio"
 	"bytes"
@@ -101,6 +101,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,8 +335,8 @@ func (fc *frameCodec) readFrame() (frame, error) {
 	return frm, nil
 }
 
-// readFramePayload reads the payload and, when masked, the mask key, then
-// unmask in place.
+// readFramePayload reads the mask key (when masked) and the payload, then
+// unmasks in place.
 func (fc *frameCodec) readFramePayload(size int64, masked bool) ([]byte, error) {
 	if masked {
 		_, err := io.ReadFull(fc.br, fc.mask[:])
@@ -638,8 +639,8 @@ func (c *Conn) keepaliveTimeout(err error) (bool, error) {
 	}
 	c.probedSinceLastActivity = true
 	c.probeAt = time.Now()
-	// The write is bounded by the write timeout, so a blackholed
-	// transport cannot wedge the read loop here.
+	// The ping write carries the write-timeout bound (see Conn.writeFrame),
+	// so a blackholed transport cannot wedge the read loop here.
 	pingErr := c.writeFrame(OpPing, nil)
 	if pingErr != nil {
 		return false, pingErr
@@ -703,6 +704,20 @@ func mustNotSetCloseCode(code int) bool {
 // frame payload: in 1000-4999 and not reserved (see mustNotSetCloseCode).
 func usableCloseCode(code int) bool {
 	return code >= closeCodeMin && code <= closeCodeMax && !mustNotSetCloseCode(code)
+}
+
+// truncateReason bounds a close reason to the on-wire limit, backing off to
+// a UTF-8 rune boundary so the truncated reason stays valid UTF-8.
+func truncateReason(reason string) string {
+	if len(reason) <= maxCloseReason {
+		return reason
+	}
+	n := maxCloseReason
+	for n > 0 && !utf8.RuneStart(reason[n]) {
+		n--
+	}
+
+	return reason[:n]
 }
 
 // handleData processes one data or continuation frame. It returns complete
@@ -815,6 +830,14 @@ func (c *Conn) writeFrame(opcode int, payload []byte) error {
 	if c.state.Load() == stClosed {
 		return c.closedWriteErr()
 	}
+	if c.writeTimeout > 0 {
+		// The same bound WriteMessage applies: an internal frame (pong,
+		// keepalive ping) written to a stalled transport must fail on
+		// deadline, not wedge the read loop or hold the write mutex
+		// against Close. Cleared on return so the bound is per-frame.
+		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
+	}
 
 	return c.fc.writeFrame(opcode, payload)
 }
@@ -879,7 +902,7 @@ func (c *Conn) Close(code int, reason string) error {
 	var payload []byte
 	if !mustNotSetCloseCode(code) {
 		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
-		reason = reason[:min(len(reason), maxCloseReason)]
+		reason = truncateReason(reason)
 		payload = make([]byte, closeCodeBytes+len(reason))
 		binary.BigEndian.PutUint16(payload, uint16(code))
 		copy(payload[closeCodeBytes:], reason)
@@ -1017,6 +1040,11 @@ func WithWriteTimeout(d time.Duration) Option {
 // for requests that carry an Origin header (it must equal the request's
 // scheme and Host); requests without one — programmatic clients — are
 // allowed. See [NewUpgrader] for the rationale.
+//
+// The default compares against the request's Host exactly as received, so a
+// Host that carries an explicit default port ("example.com:80") counts as a
+// different origin, and behind a TLS-terminating proxy (request.TLS nil) the
+// scheme is taken to be http; set a custom check for such deployments.
 func WithCheckOrigin(check func(r *http.Request) bool) Option {
 	return func(cfg *Config) { cfg.CheckOrigin = check }
 }
@@ -1332,7 +1360,9 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 // Handle returns an [http.Handler] that upgrades the request with u and then
 // invokes handler, running the session for as long as the connection lives.
 // When handler returns, the connection is closed: with the code carried by a
-// returned [*CloseError], if any, or 1000 otherwise.
+// returned [*CloseError], if any, or 1000 otherwise. An out-of-range code on
+// a returned *CloseError is remapped to 1002 so the connection is always
+// torn down.
 //
 // The returned handler is ordinary: wrap it in further middleware as needed.
 func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
@@ -1343,7 +1373,15 @@ func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Han
 		}
 		err = handler(r, conn)
 		if closeErr, ok := errors.AsType[*CloseError](err); ok {
-			_ = conn.Close(closeErr.Code, closeErr.Reason)
+			code := closeErr.Code
+			if code < closeCodeMin || code > closeCodeMax {
+				// An out-of-range code cannot go on the wire; tear down with
+				// 1002 so the connection is always closed.
+				_ = conn.Close(StatusProtocolError, "invalid close code from handler")
+
+				return
+			}
+			_ = conn.Close(code, closeErr.Reason)
 
 			return
 		}
@@ -1561,6 +1599,9 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 			strings.EqualFold(headerKey, "Sec-WebSocket-Version"),
 			strings.EqualFold(headerKey, "Sec-WebSocket-Protocol"):
 			continue
+		}
+		if strings.ContainsAny(headerKey, "\r\n") {
+			return "", fmt.Errorf("%w: %s contains a line break", errBadHeader, headerKey)
 		}
 		for _, value := range values {
 			if strings.ContainsAny(value, "\r\n") {

@@ -31,6 +31,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestMCDCControlFrame traces
@@ -339,6 +340,103 @@ func TestMCDCDialScheme(t *testing.T) {
 		}
 		if !badScheme(t, "http://127.0.0.1:1/ws") {
 			t.Fatal("http:// must fail the scheme check")
+		}
+	})
+}
+
+// TestMCDCHandleCloseCode traces
+// "code < closeCodeMin || code > closeCodeMax" in Upgrader.Handle: a close
+// code carried by a handler-returned *CloseError but out of range cannot go
+// on the wire, so Handle remaps it to 1002 instead of leaking the
+// connection.
+func TestMCDCHandleCloseCode(t *testing.T) {
+	t.Parallel()
+
+	// seen returns the terminal error the client's ReadMessage reports when
+	// the handler closes with the given code: nil for a normal closure, a
+	// *CloseError carrying the code on the wire otherwise.
+	seen := func(t *testing.T, code int) error {
+		t.Helper()
+		up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
+		mux := http.NewServeMux()
+		mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Conn) error {
+			return &CloseError{Code: code, Reason: "probe"}
+		}))
+		s := httptest.NewServer(mux)
+		t.Cleanup(s.Close)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		c, err := Dial(ctx, "ws"+strings.TrimPrefix(s.URL, "http")+"/ws")
+		if err != nil {
+			t.Fatalf("dial handler code %d: %v", code, err)
+		}
+		_, _, termErr := c.ReadMessage()
+
+		return termErr
+	}
+
+	t.Run("belowMin", func(t *testing.T) {
+		t.Parallel()
+		// (belowMin=T, aboveMax=F) flips to (F, F): 999 is remapped to
+		// 1002; 1000 closes normally (nil terminal error) instead.
+		if code, _, ok := CloseCode(seen(t, closeCodeMin-1)); !ok || code != StatusProtocolError {
+			t.Fatalf("handler code %d: client close code %d (ok=%v), want 1002 remap", closeCodeMin-1, code, ok)
+		}
+		if code, _, ok := CloseCode(seen(t, closeCodeMin)); ok {
+			t.Fatalf("handler code %d: close code %d on the wire, want normal closure",
+				closeCodeMin, code)
+		}
+	})
+
+	t.Run("aboveMax", func(t *testing.T) {
+		t.Parallel()
+		// (belowMin=F, aboveMax=T) flips to (F, F): 5000 is remapped to
+		// 1002; 4999 goes through unchanged.
+		if code, _, ok := CloseCode(seen(t, closeCodeMax+1)); !ok || code != StatusProtocolError {
+			t.Fatalf("handler code %d: client close code %d (ok=%v), want 1002 remap", closeCodeMax+1, code, ok)
+		}
+		if code, _, ok := CloseCode(seen(t, closeCodeMax)); !ok || code != closeCodeMax {
+			t.Fatalf("handler code %d: close code %d (ok=%v), want 4999 unchanged",
+				closeCodeMax, code, ok)
+		}
+	})
+}
+
+// TestMCDCTruncateReason traces
+// "n > 0 && !utf8.RuneStart(s[n])" in truncateReason: a reason over the
+// on-wire limit is cut at maxCloseReason, backing off over continuation
+// bytes to a rune boundary.
+func TestMCDCTruncateReason(t *testing.T) {
+	t.Parallel()
+
+	t.Run("runeBoundary", func(t *testing.T) {
+		t.Parallel()
+		// (!RuneStart=T) flips to (!RuneStart=F): a 2-byte rune split across
+		// the bound backs off one byte; a start byte at the bound does not.
+		split := strings.Repeat("\u00e9", 62) // 124 bytes; index 123 is a continuation byte
+		got := truncateReason(split)
+		if len(got) != maxCloseReason-1 {
+			t.Fatalf("split rune truncated to %d bytes, want %d", len(got), maxCloseReason-1)
+		}
+		if !utf8.ValidString(got) {
+			t.Fatalf("truncated split-rune reason is not valid UTF-8: %q", got)
+		}
+		if got := truncateReason(strings.Repeat("a", maxCloseReason+10)); len(got) != maxCloseReason {
+			t.Fatalf("ASCII reason truncated to %d bytes, want %d", len(got), maxCloseReason)
+		}
+	})
+
+	t.Run("invalidUTF8", func(t *testing.T) {
+		t.Parallel()
+		// (n>0=T, !RuneStart=T) flips to (n>0=F, !RuneStart=T): an all-
+		// continuation (invalid UTF-8) reason runs the loop to n == 0 and
+		// yields the empty string instead of a panic.
+		got := truncateReason(strings.Repeat("\x80", maxCloseReason+10))
+		if got != "" {
+			t.Fatalf("all-continuation reason truncated to %q, want empty", got)
+		}
+		if got := truncateReason("short"); got != "short" {
+			t.Fatalf("under-limit reason altered: %q", got)
 		}
 	})
 }

@@ -442,6 +442,12 @@ func TestClientRejectsLineBreakHeader(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "line break") {
 		t.Fatalf("line-break header: %v, want line break rejection", err)
 	}
+	// The same injection via the header key: canonicalization does not
+	// strip CR/LF from keys, so the key must be checked too.
+	_, err = Dial(ctx, host, WithHeader("X-Test\r\nX-Inject: 1", "v"))
+	if err == nil || !strings.Contains(err.Error(), "line break") {
+		t.Fatalf("line-break header key: %v, want line break rejection", err)
+	}
 }
 
 // echoServer runs an echo session over the package's own upgrader and

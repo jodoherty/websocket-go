@@ -34,10 +34,11 @@ Unlicense (see `LICENSE`).
   "Copyright (c) ..." headers, no author name comments, no `@author`
   tags — in implementation files, test files, comments, docs, commit
   messages, or generated tooling.
-- `ws/ws.go` carries a short Unlicense notice at the top of the file so
-  the license travels with the file when it is vendored by copying
-  (the drop-in property above). Keep that notice, keep it free of any
-  attribution, and do not add copyright headers to any other file:
+- `ws/ws.go` carries a short Unlicense notice at the top of the file,
+  directly after the package clause (so the package doc comment stays in
+  valid position), so the license travels with the file when it is vendored
+  by copying (the drop-in property above). Keep that notice, keep it free
+  of any attribution, and do not add copyright headers to any other file:
   vendoring this package means copying `ws/ws.go`, and that file alone
   is the unit of distribution.
 
