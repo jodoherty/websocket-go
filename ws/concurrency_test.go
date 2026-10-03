@@ -29,7 +29,7 @@ import (
 // no sockets, no TLS, so the tests are fast and hermetic.
 func pipeConnPair() (server, client *Conn) {
 	sr, cr := net.Pipe()
-	return newConn(sr, sr, false, 1<<20, 0), newConn(cr, cr, true, 1<<20, 0)
+	return newConn(sr, sr, false, 1<<20, 0, 0), newConn(cr, cr, true, 1<<20, 0, 0)
 }
 
 // drain reads conn until it terminates, then signals done. Use it on a pipe

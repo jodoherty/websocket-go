@@ -44,9 +44,10 @@
 //
 //  4. Close detection covers all four classes of death, funneled into the
 //     single ReadMessage return: a close frame from the peer, a transport
-//     error, a keepalive timeout (a silent peer is detected after
-//     Upgrader.idleTimeout via a ping sent inline in the read path — no
-//     background goroutines), and a local [Conn.Close] call.
+//     error, a keepalive timeout (a silent peer is probed with a ping once
+//     silence reaches Upgrader.idleTimeout, and the connection is considered
+//     dead if it is still silent after a second window — all inline in the
+//     read path, no background goroutines), and a local [Conn.Close] call.
 //
 // # Concurrency
 //
@@ -339,6 +340,14 @@ func (c *Conn) closedWriteErr() error {
 // every goroutine waiting on the close) forever.
 const closeWriteTimeout = 5 * time.Second
 
+// defaultWriteTimeout bounds how long a single [Conn.WriteMessage] may block
+// writing to the transport. Without it, a write to a blackhole (peer not
+// reading and not sending RST) blocks forever while holding the write mutex,
+// which wedges [Conn.Close] — the closer never reaches its own bound or
+// nc.Close. A long-running server must not be able to leak a goroutine this
+// way. Disable the bound per-connection with WithWriteTimeout(0).
+const defaultWriteTimeout = 30 * time.Second
+
 var connSeq uint64
 
 // Conn is an open WebSocket connection.
@@ -362,14 +371,21 @@ type Conn struct {
 	handshakeData any
 
 	idleTimeout  time.Duration
+	writeTimeout time.Duration
 	lastActivity time.Time
+	// probedSinceLastActivity and probeAt are keepalive probe state, touched
+	// only by the reading goroutine. After a silence timeout the connection
+	// pings once (probeAt records when); a second silence timeout without
+	// any activity in between means the peer is dead.
+	probedSinceLastActivity bool
+	probeAt                 time.Time
 
 	inFrag  bool
 	fragOp  int
 	fragBuf []byte
 }
 
-func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idleTimeout time.Duration) *Conn {
+func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idleTimeout, writeTimeout time.Duration) *Conn {
 	var br *bufio.Reader
 	if existing, ok := r.(*bufio.Reader); ok {
 		br = existing
@@ -386,6 +402,7 @@ func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idle
 		},
 		id:           atomic.AddUint64(&connSeq, 1),
 		idleTimeout:  idleTimeout,
+		writeTimeout: writeTimeout,
 		lastActivity: time.Now(),
 	}
 }
@@ -466,10 +483,28 @@ func (c *Conn) ReadMessage() (opcode int, data []byte, err error) {
 		}
 		var f frame
 		if f, err = c.fc.readFrame(); err != nil {
-			return 0, nil, c.finish(err)
+			if !isReadTimeout(err) {
+				return 0, nil, c.finish(err)
+			}
+			// The connection has been silent for the idle threshold.
+			if probeDecision(c.probedSinceLastActivity) == probeKill {
+				return 0, nil, c.finish(err)
+			}
+			c.probedSinceLastActivity = true
+			c.probeAt = time.Now()
+			// Probe the peer. The write is bounded by the write timeout,
+			// so a blackholed transport cannot wedge the read loop here.
+			if perr := c.writeFrame(OpPing, nil); perr != nil {
+				return 0, nil, c.finish(perr)
+			}
+			// armIdle re-arms with the grace window (probeAt + idle);
+			// a pong or any frame refreshes lastActivity and resets the
+			// probe state, a second timeout kills.
+			continue
 		}
 		_ = c.nc.SetReadDeadline(time.Time{}) // clear the keepalive deadline
 		c.lastActivity = time.Now()
+		c.probedSinceLastActivity = false
 
 		switch f.opcode {
 		case OpPing:
@@ -522,30 +557,47 @@ func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
 	return 0, nil, c.finish(closeErrFor(code, reason))
 }
 
-// keepaliveDecision decides, before a blocking read, whether the connection
-// has been quiet long enough to warrant a ping first, and which read
-// deadline to set. It is pure in its inputs so the timing boundary can be
-// tested exactly, without a clock or a socket.
-func keepaliveDecision(lastActivity, now time.Time, idle time.Duration) (ping bool, deadline time.Time) {
-	deadline = lastActivity.Add(idle)
-	if now.After(deadline) {
-		ping = true
-		deadline = now.Add(idle)
+// probeAction is the keepalive response to a read timeout, which can only
+// fire once silence has reached the idle threshold.
+type probeAction int
+
+const (
+	probePing probeAction = iota // first timeout: probe liveness with a ping
+	probeKill                    // second timeout: the peer never answered
+)
+
+// probeDecision decides the keepalive response to a silence timeout. The
+// first timeout probes with a ping: a live peer pongs, and a reset
+// connection often fails the ping write outright, both of which settle the
+// question faster than a second full window of waiting. If the connection
+// times out again without any activity, the peer is considered dead.
+func probeDecision(probedOnce bool) probeAction {
+	if probedOnce {
+		return probeKill
 	}
-	return ping, deadline
+	return probePing
 }
 
-// armIdle bounds the next blocking read. Every blocking read is therefore
-// bounded when the idle timeout is set; see [keepaliveDecision].
+// isReadTimeout reports whether err is a read-deadline timeout, as opposed
+// to a transport error or EOF.
+func isReadTimeout(err error) bool {
+	var nerr net.Error
+	return errors.As(err, &nerr) && nerr.Timeout()
+}
+
+// armIdle arms the read deadline for the next blocking read: the point at
+// which the connection has been silent long enough to probe for liveness
+// (see ReadMessage). It sends no ping itself — the probe is issued in the
+// timeout path, only when silence is actually observed. While a probe is
+// outstanding the deadline is one full window past the probe, giving the
+// peer time to answer.
 func (c *Conn) armIdle() error {
 	if c.idleTimeout <= 0 {
 		return nil
 	}
-	ping, deadline := keepaliveDecision(c.lastActivity, time.Now(), c.idleTimeout)
-	if ping {
-		if err := c.writeFrame(OpPing, nil); err != nil {
-			return err
-		}
+	deadline := c.lastActivity.Add(c.idleTimeout)
+	if c.probedSinceLastActivity {
+		deadline = c.probeAt.Add(c.idleTimeout)
 	}
 	return c.nc.SetReadDeadline(deadline)
 }
@@ -581,7 +633,23 @@ func (c *Conn) WriteMessage(op int, data []byte) error {
 	if atomic.LoadInt32(&c.state) == stClosed {
 		return c.closedWriteErr()
 	}
+	if c.writeTimeout > 0 {
+		// Bound the write so a blackholed transport cannot hold the write
+		// mutex forever: a stuck write must fail (releasing the mutex) so
+		// [Conn.Close] can still tear the connection down. Cleared on return
+		// so the bound is per-write, not sticky.
+		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		defer c.nc.SetWriteDeadline(time.Time{})
+	}
 	return c.fc.writeFrame(op, data)
+}
+
+// Closed reports whether the connection has been closed, from any goroutine.
+// It is the cheap, race-free signal a background writer goroutine needs to
+// stop: it can check Closed() (or select on work and bail when true) instead
+// of waiting for its next WriteMessage to fail with ErrClosed.
+func (c *Conn) Closed() bool {
+	return atomic.LoadInt32(&c.state) == stClosed
 }
 
 // Close closes the connection, sending a close frame with the given code and
@@ -639,6 +707,7 @@ type Config struct {
 	Subprotocols      []string
 	MaxMessageSize    int64
 	IdleTimeout       time.Duration
+	WriteTimeout      time.Duration
 	PreHandshake      []func(r *http.Request) error
 
 	// Client-only fields, settable through the corresponding Options.
@@ -665,17 +734,20 @@ type Upgrader struct {
 	subprotocols      []string
 	maxMessageSize    int64
 	idleTimeout       time.Duration
+	writeTimeout      time.Duration
 	preHandshake      []func(r *http.Request) error
 }
 
 // NewUpgrader creates an Upgrader with sensible defaults: same-origin origin
-// checking, a 16 MiB message size limit, and a 60 second idle timeout for
-// keepalive detection of silently dead peers.
+// checking, a 16 MiB message size limit, and a 60 second keepalive window:
+// a connection silent for that long is probed with a ping, and is considered
+// dead if it is still silent after a second window.
 func NewUpgrader(opts ...Option) *Upgrader {
 	c := &Config{
 		CheckOrigin:    defaultCheckOrigin,
 		MaxMessageSize: 16 << 20,
 		IdleTimeout:    60 * time.Second,
+		WriteTimeout:   defaultWriteTimeout,
 	}
 	for _, o := range opts {
 		o(c)
@@ -686,6 +758,7 @@ func NewUpgrader(opts ...Option) *Upgrader {
 		subprotocols:      c.Subprotocols,
 		maxMessageSize:    c.MaxMessageSize,
 		idleTimeout:       c.IdleTimeout,
+		writeTimeout:      c.WriteTimeout,
 		preHandshake:      c.PreHandshake,
 	}
 }
@@ -736,13 +809,25 @@ func WithMaxMessageSize(n int64) Option {
 	return func(c *Config) { c.MaxMessageSize = n }
 }
 
-// WithIdleTimeout sets the keepalive idle timeout on either side (default
-// 60s). When no frame has been received within the window, the next
-// [Conn.ReadMessage] sends a ping and waits up to the timeout for any frame
-// (pong included) before failing. Pass zero to disable keepalive and manage
-// deadlines via [Conn.SetReadDeadline].
+// WithIdleTimeout sets the keepalive window on either side (default 60s).
+// When no frame has been received for the window, the next blocking
+// [Conn.ReadMessage] probes the peer with a ping; the connection is
+// considered dead and the read fails with a timeout if the peer is still
+// silent after a second window. A pong (or any frame) from the peer resets
+// the clock, so an idle-but-alive connection is kept alive and probed
+// roughly every window. Pass zero to disable keepalive and manage deadlines
+// via [Conn.SetReadDeadline].
 func WithIdleTimeout(d time.Duration) Option {
 	return func(c *Config) { c.IdleTimeout = d }
+}
+
+// WithWriteTimeout bounds how long a single [Conn.WriteMessage] may block
+// writing to the transport, so a blackholed peer cannot wedge the write
+// mutex and, with it, [Conn.Close]. The default is 30 s; pass 0 to remove
+// the bound (a write then blocks until the transport completes or the
+// connection is closed).
+func WithWriteTimeout(d time.Duration) Option {
+	return func(c *Config) { c.WriteTimeout = d }
 }
 
 // WithPreHandshake runs f on the request after protocol and origin checks,
@@ -853,7 +938,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, opts ...Hands
 		return nil, fmt.Errorf("ws: write handshake response: %w", err)
 	}
 
-	c := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout)
+	c := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	c.subprotocol = protocol
 	c.handshakeData = ho.data
 	return c, nil
@@ -993,15 +1078,18 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 		}
 	}
 
-	cfg := &Config{Headers: make(http.Header)}
+	cfg := &Config{
+		// Defaults are applied before the options run so an explicit
+		// WithXxx(0) — WithIdleTimeout(0) to disable keepalive, or
+		// WithWriteTimeout(0) to remove the write bound — is preserved
+		// instead of clobbered by a post-hoc "zero means unset" default.
+		Headers:        make(http.Header),
+		MaxMessageSize: 16 << 20,
+		IdleTimeout:    60 * time.Second,
+		WriteTimeout:   defaultWriteTimeout,
+	}
 	for _, o := range opts {
 		o(cfg)
-	}
-	if cfg.MaxMessageSize == 0 {
-		cfg.MaxMessageSize = 16 << 20
-	}
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 60 * time.Second
 	}
 	dialCfg := &dialConfig{headers: cfg.Headers, tlsConfig: cfg.tlsConfigClient, timeout: cfg.dialTimeout}
 	if d := dialCfg.timeout; d > 0 {
@@ -1083,7 +1171,7 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	nc.SetReadDeadline(time.Time{})
 	nc.SetWriteDeadline(time.Time{})
 
-	c := newConn(nc, br, true, cfg.MaxMessageSize, cfg.IdleTimeout)
+	c := newConn(nc, br, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
 	c.subprotocol = resp.Header.Get("Sec-WebSocket-Protocol")
 	return c, nil
 }

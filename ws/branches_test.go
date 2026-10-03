@@ -83,49 +83,51 @@ func TestReadFrameRejectsMalformed(t *testing.T) {
 	}
 }
 
-// TestArmIdleSendsPing covers armIdle's active branch: idle past the
-// timeout, a ping must be written and the read deadline armed. The happy
-// keepalive test in ws_test.go only exercises the timeout outcome.
-func TestArmIdleSendsPing(t *testing.T) {
+// TestKeepaliveProbeSequence covers the redesigned keepalive end to end on a
+// real pipe: a silent peer is probed with a ping once the idle window
+// elapses and killed with a timeout only after a second window. The peer
+// end is drained so probe pings never block the synchronous pipe.
+func TestKeepaliveProbeSequence(t *testing.T) {
 	sr, cr := net.Pipe()
 	defer cr.Close()
 	defer sr.Close()
-	c := newConn(cr, cr, true, 1<<20, 100*time.Millisecond)
-	c.lastActivity = time.Now().Add(-time.Second)
+	c := newConn(cr, cr, true, 1<<20, 100*time.Millisecond, 0)
 
-	// The pipe is synchronous: the ping write inside armIdle blocks until
-	// the far end reads it, so armIdle runs alongside the reader.
-	done := make(chan error, 1)
-	go func() { done <- c.armIdle() }()
+	// Drain everything the conn sends (probe pings).
+	pings := make(chan int, 8)
+	go func() {
+		peer := &frameCodec{br: bufio.NewReader(sr), isClient: false, maxMsg: 1 << 20}
+		for {
+			f, err := peer.readFrame()
+			if err != nil {
+				return
+			}
+			if f.opcode == OpPing {
+				pings <- 1
+			}
+		}
+	}()
 
-	// The ping must have hit the wire: read it off the far end.
-	peer := &frameCodec{br: bufio.NewReader(sr), isClient: false, maxMsg: 1 << 20}
-	f, err := peer.readFrame()
-	if err != nil {
-		t.Fatalf("peer readFrame: %v", err)
-	}
-	if f.opcode != OpPing || !f.fin {
-		t.Fatalf("peer frame = (op=%d fin=%v), want ping", f.opcode, f.fin)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("armIdle: %v", err)
-	}
-
-	// And the read deadline must be armed: with activity just reset, the
-	// next ReadMessage arms a fresh deadline (no second ping) and the
-	// read of the silent pipe must fail with a timeout, not block.
-	c.lastActivity = time.Now()
 	start := time.Now()
-	if _, _, err := c.ReadMessage(); err == nil {
+	_, _, err := c.ReadMessage()
+	elapsed := time.Since(start)
+	if err == nil {
 		t.Fatal("ReadMessage returned nil from a silent peer")
-	} else {
-		var nerr net.Error
-		if !errors.As(err, &nerr) || !nerr.Timeout() {
-			t.Fatalf("ReadMessage error = %v, want a timeout", err)
-		}
-		if elapsed := time.Since(start); elapsed < 50*time.Millisecond || elapsed > time.Second {
-			t.Fatalf("timeout after %v, want close to the 100ms idle window", elapsed)
-		}
+	}
+	var nerr net.Error
+	if !errors.As(err, &nerr) || !nerr.Timeout() {
+		t.Fatalf("ReadMessage error = %v, want a timeout", err)
+	}
+	// Silence is fatal at 2*idle (100ms to first probe + 100ms grace), and
+	// no earlier: allow a wide window, but not less than the full sequence.
+	if elapsed < 180*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("silent peer killed after %v, want ~200ms (idle probe + grace)", elapsed)
+	}
+	select {
+	case <-pings:
+		// At least one probe ping went out before the kill.
+	default:
+		t.Fatal("no keepalive ping observed before the kill")
 	}
 }
 
@@ -134,7 +136,7 @@ func TestArmIdleDisabled(t *testing.T) {
 	sr, cr := net.Pipe()
 	defer cr.Close()
 	defer sr.Close()
-	c := newConn(cr, cr, true, 1<<20, 0)
+	c := newConn(cr, cr, true, 1<<20, 0, 0)
 	c.lastActivity = time.Time{} // arbitrarily stale
 	if err := c.armIdle(); err != nil {
 		t.Fatalf("armIdle with idleTimeout 0: %v", err)
@@ -170,7 +172,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	})
 	t.Run("ping gets an automatic pong", func(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x89, 0x00, 0x81, 0x02, 'H', 'i'}}
-		c := newConn(fc, fc, true, 1<<20, 0)
+		c := newConn(fc, fc, true, 1<<20, 0, 0)
 		op, data, err := c.ReadMessage()
 		if err != nil || op != OpText || string(data) != "Hi" {
 			t.Fatalf("ReadMessage = (%d, %q, %v)", op, data, err)
@@ -209,7 +211,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	})
 	t.Run("fragment overflow", func(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x01, 0x02, 'a', 'b', 0x80, 0x02, 'c', 'd'}}
-		c := newConn(fc, fc, true, 3, 0) // maxMsg 3 < 2+2 total
+		c := newConn(fc, fc, true, 3, 0, 0) // maxMsg 3 < 2+2 total
 		if _, _, err := c.ReadMessage(); err == nil || !errors.Is(err, errMessageTooBig) {
 			t.Fatalf("err = %v, want errMessageTooBig", err)
 		}
@@ -220,7 +222,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 // broken pipe must fail the write, and the codec must surface bufio errors.
 func TestWriteErrorPaths(t *testing.T) {
 	sr, cr := net.Pipe()
-	c := newConn(cr, cr, true, 1<<20, 0)
+	c := newConn(cr, cr, true, 1<<20, 0, 0)
 	// Closing the peer's end breaks our writes: a synchronous pipe fails
 	// in-flight writes once the other end goes away.
 	sr.Close()

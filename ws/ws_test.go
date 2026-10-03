@@ -255,8 +255,9 @@ func TestUpgradeRequiredHeaders(t *testing.T) {
 
 func TestKeepaliveDetectsDeadPeer(t *testing.T) {
 	// A "server" that accepts a websocket, echoes nothing, and then goes
-	// silent. With a short idle timeout the client's next ReadMessage must
-	// fail with a timeout rather than block forever.
+	// silent. With a short keepalive window the client probes with a ping
+	// after one window, and its next ReadMessage must fail with a timeout
+	// after the second window (~2x the window) rather than block forever.
 	up := ws.NewUpgrader(
 		ws.WithCheckOrigin(func(*http.Request) bool { return true }),
 		ws.WithIdleTimeout(300*time.Millisecond),
@@ -287,7 +288,7 @@ func TestKeepaliveDetectsDeadPeer(t *testing.T) {
 	if !errors.As(err, &nerr) || !nerr.Timeout() {
 		t.Fatalf("err = %v, want a timeout net.Error", err)
 	}
-	if elapsed < 250*time.Millisecond || elapsed > 10*time.Second {
-		t.Fatalf("silent peer detected after %v, want ~300ms", elapsed)
+	if elapsed < 500*time.Millisecond || elapsed > 10*time.Second {
+		t.Fatalf("silent peer detected after %v, want ~600ms (300ms probe + 300ms grace)", elapsed)
 	}
 }

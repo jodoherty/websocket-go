@@ -1,71 +1,44 @@
 package ws
 
 import (
+	"errors"
+	"net"
+	"os"
 	"testing"
-	"time"
 )
 
-// TestKeepaliveDecision pins the keepalive timing boundary exactly. The
-// decision is pure (lastActivity, now, idle → ping? deadline), so no clock
-// or socket is involved: the cases that matter — "quiet enough to ping",
-// "exactly at the boundary", "one nanosecond past it" — are testable
-// deterministically.
-func TestKeepaliveDecision(t *testing.T) {
-	base := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-	idle := 30 * time.Second
+// The keepalive timing used to live in a pure decision function
+// (lastActivity, now, idle → ping?, deadline). The redesign moved the
+// decision into the read loop (probe on timeout), so the pure, clock-free
+// unit is now the probe state machine itself: a silence timeout either
+// probes (first time) or kills (repeat), and the read-deadline error is
+// distinguished from real transport errors.
 
-	cases := []struct {
-		name         string
-		lastActivity time.Time
-		now          time.Time
-		wantPing     bool
-		wantDeadline time.Time
-	}{
-		{
-			name:         "quiet within the window: no ping, deadline at window end",
-			lastActivity: base,
-			now:          base.Add(10 * time.Second),
-			wantPing:     false,
-			wantDeadline: base.Add(idle),
-		},
-		{
-			name:         "exactly at the boundary: no ping (After, not !Before)",
-			lastActivity: base,
-			now:          base.Add(idle),
-			wantPing:     false,
-			wantDeadline: base.Add(idle),
-		},
-		{
-			name:         "one nanosecond past the boundary: ping, fresh window",
-			lastActivity: base,
-			now:          base.Add(idle + time.Nanosecond),
-			wantPing:     true,
-			wantDeadline: base.Add(2*idle + time.Nanosecond),
-		},
-		{
-			name:         "long idle: ping, window restarts from now",
-			lastActivity: base,
-			now:          base.Add(5 * time.Minute),
-			wantPing:     true,
-			wantDeadline: base.Add(5*time.Minute + idle),
-		},
-		{
-			name:         "activity after now is impossible, but must not ping",
-			lastActivity: base.Add(idle),
-			now:          base,
-			wantPing:     false,
-			wantDeadline: base.Add(2 * idle),
-		},
+func TestProbeDecision(t *testing.T) {
+	if probeDecision(false) != probePing {
+		t.Fatal("first silence timeout must probe with a ping")
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ping, deadline := keepaliveDecision(tc.lastActivity, tc.now, idle)
-			if ping != tc.wantPing {
-				t.Errorf("ping = %v, want %v", ping, tc.wantPing)
-			}
-			if !deadline.Equal(tc.wantDeadline) {
-				t.Errorf("deadline = %v, want %v", deadline, tc.wantDeadline)
-			}
-		})
+	if probeDecision(true) != probeKill {
+		t.Fatal("second silence timeout must kill")
+	}
+}
+
+// TestIsReadTimeout pins the error classification the read loop relies on:
+// a deadline timeout must not be treated as a transport error (which would
+// end the connection without probing), and a real error must not be treated
+// as a timeout (which would probe forever).
+func TestIsReadTimeout(t *testing.T) {
+	deadlineErr := &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}
+	if !isReadTimeout(deadlineErr) {
+		t.Fatal("wrapped deadline error not classified as a timeout")
+	}
+	if !isReadTimeout(os.ErrDeadlineExceeded) {
+		t.Fatal("bare deadline error not classified as a timeout")
+	}
+	if isReadTimeout(errors.New("connection reset")) {
+		t.Fatal("plain error classified as a timeout")
+	}
+	if isReadTimeout(&net.OpError{Op: "read", Err: errors.New("connection reset")}) {
+		t.Fatal("wrapped reset classified as a timeout")
 	}
 }

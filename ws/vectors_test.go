@@ -63,7 +63,7 @@ func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 // frames from the (client) peer.
 func newTestConn(data []byte, isClient bool) *Conn {
 	fc := &fakeConn{data: data}
-	return newConn(fc, fc, isClient, 1<<20, 0)
+	return newConn(fc, fc, isClient, 1<<20, 0, 0)
 }
 
 // newTestCodec is the codec-level equivalent: decode frames from data with

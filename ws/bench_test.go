@@ -92,8 +92,8 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 		payload[i] = byte(i)
 	}
 	sr, cr := net.Pipe()
-	server := newConn(sr, sr, false, 1<<20, 0)
-	client := newConn(cr, cr, true, 1<<20, 0)
+	server := newConn(sr, sr, false, 1<<20, 0, 0)
+	client := newConn(cr, cr, true, 1<<20, 0, 0)
 	defer client.Close(StatusNormalClosure, "")
 	defer server.Close(StatusNormalClosure, "")
 

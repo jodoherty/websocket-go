@@ -60,15 +60,22 @@ rather than replace it.
      with code and reason
    - resets, timeouts, protocol violations → the error, directly or wrapped
 
-   The keepalive (default 60 s) detects silently dead peers (crash, power
-   loss, NAT expiry) by sending a ping inline in the read path and bounding
-   the wait — no background goroutines, `WithIdleTimeout(0)` to disable.
+   The keepalive (default 60 s window) detects silently dead peers (crash,
+   power loss, NAT expiry): a connection silent for one window is probed
+   with a ping sent inline in the read path, and is considered dead if it is
+   still silent after a second window. A pong — or any frame — from the
+   peer resets the clock, so an idle-but-alive connection is kept alive.
+   No background goroutines; `WithIdleTimeout(0)` disables it.
 
 5. **Concurrency rules, minimal.**
    - `WriteMessage` / `Close`: safe from any goroutine.
    - `ReadMessage`: owned by the pumping goroutine; never two at once.
    - Sequential `ReadMessage` calls need no synchronization between them —
      it's one goroutine.
+   - Writes are bounded by a per-connection write timeout (default 30 s),
+     so a blackholed transport cannot hold the write mutex forever and
+     wedge `Close`; `Conn.Closed()` gives a background writer a race-free
+     signal to stop. `WithWriteTimeout(0)` restores unbounded writes.
 
 6. **One allocation per message.** The frame codec keeps its per-frame
    buffers (header, mask key, masked copy) as per-connection scratch, so the
@@ -91,7 +98,8 @@ WithCheckOrigin(f)         // default: strict same-origin
 WithRequireClientCert()    // mTLS gate, 403 without a verified client cert
 WithSubprotocols(...)
 WithMaxMessageSize(n)      // default 16 MiB
-WithIdleTimeout(d)         // default 60 s keepalive; 0 disables
+WithIdleTimeout(d)         // default 60 s window: probe at d, dead at 2d
+WithWriteTimeout(d)        // default 30 s write bound; 0 disables
 WithPreHandshake(f)        // policy hook before the switch; *UpgradeError controls status
 WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
@@ -101,6 +109,7 @@ Conn.WriteMessage(op int, data []byte) error   // fails on a closed conn: record
 Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns recorded error
 Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
 Conn.SetReadDeadline / SetWriteDeadline
+Conn.Closed() bool         // race-free "am I closed?" for background writers
 
 // Sentinel
 var ErrClosed  // returned by WriteMessage after a normal closure (1000)
@@ -125,7 +134,10 @@ ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation
 ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)
 ws/fuzz_test.go     FuzzReadFrame — codec safety fuzz target
-ws/keepalive_test.go keepalive timing decision, pinned at exact boundaries
+ws/keepalive_test.go keepalive probe state machine + timeout classification
+ws/keepalive_synctest_test.go keepalive read loop on a fake clock
+                    (testing/synctest): exact probe/kill/refresh timelines
+ws/longrunning_test.go write-deadline wedge regression + Closed() signal
 ws/concurrency_test.go close state machine under concurrent stress (-race)
 ws/bench_test.go    codec + round-trip benchmarks
 ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
@@ -240,16 +252,23 @@ Layers of evidence, weakest to strongest:
    branches (e.g. a hijack failure mid-upgrade) that cannot be reached
    through a well-formed connection.
 
-A note on `synctest`: we deliberately do *not* use it. `synctest` fakes the
-clock inside a bubble and only advances time when every goroutine is
-durably blocked, but network I/O (including `net.Pipe`) is not durably
-blocked, so a bubble with a live reader never idles. Our keepalive has no
-background goroutine and no timer — it is a pure decision
-(`keepaliveDecision`, unit-tested at exact timing boundaries) plus a read
-deadline — so there is no clock-driven concurrency for `synctest` to make
-deterministic. The concurrency that *does* exist is the write mutex and the
-close state machine, which the stress tests in (7) exercise under the race
-detector instead.
+A note on `synctest`: we use it exactly where it fits, and nowhere else.
+The keepalive read loop is timing logic — probe at the boundary, kill on
+the repeat, reset on activity — so `ws/keepalive_synctest_test.go` drives
+it in a bubble with a fake `net.Conn` whose Read blocks on a bubble
+channel or a bubble timer: the clock advances *exactly* to each deadline,
+and the tests assert a ping fired at the precise boundary instant (0.00 s
+of real time, immune to machine load). That works because every blocking
+point in the bubble is a channel or timer. The two things `synctest`
+cannot model are exactly the two things our other tests avoid it for:
+blocking on I/O (real sockets and `net.Pipe` are not durably blocked, so
+the clock never advances) and handing a mutex between goroutines (a mutex
+waiter is not durably blocked either — which is why the write-wedge
+regression test in `longrunning_test.go` uses a channel-gated fake conn
+with a short real timer instead). Using `synctest` on the keepalive also
+caught a real design bug: the original implementation's ping was
+unreachable in the read loop, and `WithIdleTimeout` silently killed idle
+connections instead of keeping them alive.
 
 Security-relevant invariants baked into the design: clients must mask
 (enforced both directions — RFC §10.3), message size limits (DoS bound),
