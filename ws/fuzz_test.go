@@ -1,6 +1,8 @@
 package ws
 
 import (
+	"bufio"
+	"bytes"
 	"testing"
 )
 
@@ -14,14 +16,14 @@ func FuzzReadFrame(f *testing.F) {
 	seed := [][]byte{
 		{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f},
 		{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58},
-		{0x81},                // truncated header
-		{0x81, 0x7e, 0x00},    // truncated 16-bit length
+		{0x81},                 // truncated header
+		{0x81, 0x7e, 0x00},     // truncated 16-bit length
 		{0x81, 0x7e, 0xff, 0xff, 0x48}, // length longer than payload
-		{0x80, 0x00},          // continuation without start
-		{0x82, 0x00},          // empty binary
-		{0x89, 0x80},          // ping, no mask (client side violation)
+		{0x80, 0x00},           // continuation without start
+		{0x82, 0x00},           // empty binary
+		{0x89, 0x80},           // ping, no mask (client side violation)
 		{0x8a, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58},
-		{0x83, 0x00},          // reserved opcode
+		{0x83, 0x00},           // reserved opcode
 		{0x81, 0x03, 0x48, 0x65, 0x6c},
 		{},
 	}
@@ -29,14 +31,18 @@ func FuzzReadFrame(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Exercise both sides of the masking rule on the same input.
+		// Exercise both sides of the masking rule on the same input. The
+		// codec is a pure function of its stream: no connection state,
+		// so this targets exactly the byte-level decoding logic.
 		for _, isClient := range []bool{true, false} {
-			c := newTestConn(data, isClient)
+			fc := &frameCodec{
+				br:       bufio.NewReader(bytes.NewReader(data)),
+				isClient: isClient,
+				maxMsg:   1 << 20,
+			}
 			// A single readFrame call may not panic; it returns either a
 			// frame or an error.
-			f, err := c.readFrame()
-			_ = f
-			_ = err
+			_, _ = fc.readFrame()
 		}
 	})
 }

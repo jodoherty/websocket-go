@@ -59,12 +59,18 @@ func newTestConn(data []byte, isClient bool) *Conn {
 	return newConn(fc, fc, isClient, 1<<20, 0)
 }
 
+// newTestCodec is the codec-level equivalent: decode frames from data with
+// the given side of the masking rule. No connection state involved.
+func newTestCodec(data []byte, isClient bool) *frameCodec {
+	return &frameCodec{br: bufio.NewReader(bytes.NewReader(data)), isClient: isClient, maxMsg: 1 << 20}
+}
+
 // RFC 6455 §5.7 examples.
 func TestRFC6455Frames(t *testing.T) {
 	t.Parallel()
 
 	// A single-frame unmasked text message: "Hello".
-	c := newTestConn([]byte{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f}, true)
+	c := newTestCodec([]byte{0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f}, true)
 	f, err := c.readFrame()
 	if err != nil || f.opcode != OpText || !f.fin || string(f.payload) != "Hello" {
 		t.Fatalf("unmasked text: (%+v, %v), want text \"Hello\"", f, err)
@@ -72,30 +78,30 @@ func TestRFC6455Frames(t *testing.T) {
 
 	// A single-frame masked text message: "Hello".
 	// (We are the server here, so we expect the client's frame to be masked.)
-	c = newTestConn([]byte{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58}, false)
+	c = newTestCodec([]byte{0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58}, false)
 	f, err = c.readFrame()
 	if err != nil || f.opcode != OpText || !f.fin || string(f.payload) != "Hello" {
 		t.Fatalf("masked text: (%+v, %v), want text \"Hello\"", f, err)
 	}
 
 	// A fragmented unmasked text message: "Hel" + "lo" → "Hello".
-	c = newTestConn([]byte{
+	cConn := newTestConn([]byte{
 		0x01, 0x03, 0x48, 0x65, 0x6c, // "Hel", fin=0
 		0x80, 0x02, 0x6c, 0x6f,       // "lo", fin=1
 	}, true)
-	op, data, err := c.ReadMessage()
+	op, data, err := cConn.ReadMessage()
 	if err != nil || op != OpText || string(data) != "Hello" {
 		t.Fatalf("fragmented text: (%d, %q, %v), want text \"Hello\"", op, data, err)
 	}
 
 	// Unmasked ping / masked pong (RFC 6455 §5.7): ping is answered inline
 	// with a pong matching the body, and ReadMessage never sees either.
-	c = newTestConn([]byte{
+	cConn = newTestConn([]byte{
 		0x89, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f, // ping "Hello" (unmasked, from server side)
 	}, true)
 	// Consume the ping by feeding the next frame, an EOF: ReadMessage must
 	// have consumed the ping without returning it.
-	_, _, err = c.ReadMessage()
+	_, _, err = cConn.ReadMessage()
 	if err == nil {
 		t.Fatal("ReadMessage after a lone ping should hit EOF, got nil")
 	}
@@ -108,7 +114,7 @@ func TestRFC6455Frames(t *testing.T) {
 	var buf []byte
 	buf = append(buf, 0x82, 0x7e, 0x01, 0x00)
 	buf = append(buf, payload...)
-	c = newTestConn(buf, true)
+	c = newTestCodec(buf, true)
 	f, err = c.readFrame()
 	if err != nil || f.opcode != OpBinary || !bytes.Equal(f.payload, payload) {
 		t.Fatalf("256-byte binary: op=%d len=%d err=%v", f.opcode, len(f.payload), err)
@@ -121,7 +127,7 @@ func TestRFC6455Frames(t *testing.T) {
 	}
 	buf = []byte{0x82, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}
 	buf = append(buf, big...)
-	c = newTestConn(buf, true)
+	c = newTestCodec(buf, true)
 	f, err = c.readFrame()
 	if err != nil || f.opcode != OpBinary || !bytes.Equal(f.payload, big) {
 		t.Fatalf("64KiB binary: op=%d len=%d err=%v", f.opcode, len(f.payload), err)
@@ -145,13 +151,12 @@ func TestFrameCodecRoundtrip(t *testing.T) {
 				}
 
 				var sink bytes.Buffer
-				wc := newConn(nil, nil, isClient, 1<<20, 0)
-				wc.bw = bufio.NewWriterSize(&sink, 16)
-				if err := wc.writeFrameLocked(op, payload); err != nil {
+				wc := frameCodec{bw: bufio.NewWriterSize(&sink, 16), isClient: isClient, maxMsg: 1 << 20}
+				if err := wc.writeFrame(op, payload); err != nil {
 					t.Fatalf("write (%v, %d, %d): %v", isClient, op, n, err)
 				}
 
-				rc := newTestConn(sink.Bytes(), !isClient) // peer side: masking expectation flipped
+				rc := newTestCodec(sink.Bytes(), !isClient) // peer side: masking expectation flipped
 				f, err := rc.readFrame()
 				if err != nil {
 					t.Fatalf("read (%v, %d, %d): %v", isClient, op, n, err)

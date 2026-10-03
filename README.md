@@ -90,10 +90,13 @@ WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
 // Conn
 Conn.ReadMessage() (op int, data []byte, err error)
-Conn.WriteMessage(op int, data []byte) error
-Conn.Close(code int, reason string) error
+Conn.WriteMessage(op int, data []byte) error   // fails on a closed conn: recorded error, or ErrClosed
+Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns recorded error
 Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
 Conn.SetReadDeadline / SetWriteDeadline
+
+// Sentinel
+var ErrClosed  // returned by WriteMessage after a normal closure (1000)
 
 // Client
 func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)
@@ -115,6 +118,9 @@ ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation
 ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)
 ws/fuzz_test.go     FuzzReadFrame — codec safety fuzz target
+ws/keepalive_test.go keepalive timing decision, pinned at exact boundaries
+ws/concurrency_test.go close state machine under concurrent stress (-race)
+ws/bench_test.go    codec + round-trip benchmarks
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 e2e/            e2e suites:
@@ -190,6 +196,31 @@ Layers of evidence, weakest to strongest:
 6. **Race detector** (`go test -race ./...`) — the concurrency guarantees
    (write/close from any goroutine, single reader) hold under the
    scheduler's stress.
+7. **Concurrency stress tests** (`ws/concurrency_test.go`) — the `Conn`
+   state machine is hammered from many goroutines against the documented
+   contract: N simultaneous `Close` calls must all observe the same
+   winner's recorded error; `ReadMessage` racing a local `Close` must
+   terminate consistently; many writers racing a `Close` must each get
+   either success or the recorded error, never a torn state; and writes
+   after close must always fail. Each body runs ~200 iterations under
+   `-race`.
+8. **Benchmarks** (`go test ./ws -run '^$' -bench . -benchmem`) — pin the
+   per-message cost so a regression is visible: codec write/read on both
+   sides of the masking rule, an end-to-end `WriteMessage`→`ReadMessage`
+   round trip over an in-memory pipe, and the handshake accept key. On a
+   Ryzen 7600X a 1 KiB round trip is ~2.5 µs (~415 MB/s) and the masked
+   read path is ~730 ns/op.
+
+A note on `synctest`: we deliberately do *not* use it. `synctest` fakes the
+clock inside a bubble and only advances time when every goroutine is
+durably blocked, but network I/O (including `net.Pipe`) is not durably
+blocked, so a bubble with a live reader never idles. Our keepalive has no
+background goroutine and no timer — it is a pure decision
+(`keepaliveDecision`, unit-tested at exact timing boundaries) plus a read
+deadline — so there is no clock-driven concurrency for `synctest` to make
+deterministic. The concurrency that *does* exist is the write mutex and the
+close state machine, which the stress tests in (7) exercise under the race
+detector instead.
 
 Security-relevant invariants baked into the design: clients must mask
 (enforced both directions — RFC §10.3), message size limits (DoS bound),

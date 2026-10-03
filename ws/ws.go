@@ -168,14 +168,26 @@ type frame struct {
 	payload []byte
 }
 
+// frameCodec is the byte-level half of a [Conn]: it reads and writes RFC
+// 6455 frames on a buffered stream pair. Masking enforcement depends on
+// which side we are on; everything else is independent of connection state,
+// so it lives in its own struct — frame encoding and decoding can be
+// benchmarked, fuzzed, and tested with plain buffers, no live connection.
+type frameCodec struct {
+	br       *bufio.Reader
+	bw       *bufio.Writer
+	isClient bool
+	maxMsg   int64
+}
+
 func (f frame) isControl() bool { return f.opcode >= 8 }
 
 // readFrame reads one frame from the connection. A client must mask its
 // frames and a server must not, so the peer's frames are masked exactly
 // when we are the server.
-func (c *Conn) readFrame() (frame, error) {
+func (fc *frameCodec) readFrame() (frame, error) {
 	var b [2]byte
-	if _, err := io.ReadFull(c.br, b[:]); err != nil {
+	if _, err := io.ReadFull(fc.br, b[:]); err != nil {
 		return frame{}, err
 	}
 	f := frame{fin: b[0]&0x80 != 0, opcode: int(b[0] & 0x0f)}
@@ -183,20 +195,20 @@ func (c *Conn) readFrame() (frame, error) {
 		return frame{}, fmt.Errorf("%w: reserved bits set", errProtocol)
 	}
 	masked := b[1]&0x80 != 0
-	if masked == c.isClient {
+	if masked == fc.isClient {
 		return frame{}, fmt.Errorf("%w: frame masking violation", errProtocol)
 	}
 	var n int64
 	switch l := b[1] & 0x7f; l {
 	case 126:
 		var x [2]byte
-		if _, err := io.ReadFull(c.br, x[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, x[:]); err != nil {
 			return frame{}, err
 		}
 		n = int64(binary.BigEndian.Uint16(x[:]))
 	case 127:
 		var x [8]byte
-		if _, err := io.ReadFull(c.br, x[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, x[:]); err != nil {
 			return frame{}, err
 		}
 		if x[0] != 0 {
@@ -209,17 +221,17 @@ func (c *Conn) readFrame() (frame, error) {
 	if f.isControl() && (!f.fin || n > 125) {
 		return frame{}, fmt.Errorf("%w: invalid control frame", errProtocol)
 	}
-	if n > c.maxMessageSize {
-		return frame{}, fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit", errProtocol, n, c.maxMessageSize)
+	if n > fc.maxMsg {
+		return frame{}, fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit", errProtocol, n, fc.maxMsg)
 	}
 	var mask [4]byte
 	if masked {
-		if _, err := io.ReadFull(c.br, mask[:]); err != nil {
+		if _, err := io.ReadFull(fc.br, mask[:]); err != nil {
 			return frame{}, err
 		}
 	}
 	f.payload = make([]byte, n)
-	if _, err := io.ReadFull(c.br, f.payload); err != nil {
+	if _, err := io.ReadFull(fc.br, f.payload); err != nil {
 		return frame{}, err
 	}
 	if masked {
@@ -230,9 +242,9 @@ func (c *Conn) readFrame() (frame, error) {
 	return f, nil
 }
 
-// writeFrameLocked writes one complete (FIN set) frame. The caller must hold
-// c.mu.
-func (c *Conn) writeFrameLocked(op int, payload []byte) error {
+// writeFrame writes one complete (FIN set) frame. It does not take any
+// lock; a [Conn] serializes calls via its write mutex.
+func (fc *frameCodec) writeFrame(op int, payload []byte) error {
 	var hdr [14]byte
 	hdr[0] = 0x80 | byte(op)
 	l := len(payload)
@@ -249,17 +261,17 @@ func (c *Conn) writeFrameLocked(op int, payload []byte) error {
 		binary.BigEndian.PutUint64(hdr[2:10], uint64(l))
 		hdrLen = 10
 	}
-	if c.isClient {
+	if fc.isClient {
 		if _, err := rand.Read(hdr[hdrLen : hdrLen+4]); err != nil {
 			return err
 		}
 		hdr[1] |= 0x80
 		hdrLen += 4
 	}
-	if _, err := c.bw.Write(hdr[:hdrLen]); err != nil {
+	if _, err := fc.bw.Write(hdr[:hdrLen]); err != nil {
 		return err
 	}
-	if c.isClient {
+	if fc.isClient {
 		// Masking must not modify the caller's buffer.
 		buf := make([]byte, l)
 		copy(buf, payload)
@@ -267,13 +279,13 @@ func (c *Conn) writeFrameLocked(op int, payload []byte) error {
 		for i := range buf {
 			buf[i] ^= mask[i&3]
 		}
-		if _, err := c.bw.Write(buf); err != nil {
+		if _, err := fc.bw.Write(buf); err != nil {
 			return err
 		}
-	} else if _, err := c.bw.Write(payload); err != nil {
+	} else if _, err := fc.bw.Write(payload); err != nil {
 		return err
 	}
-	return c.bw.Flush()
+	return fc.bw.Flush()
 }
 
 const (
@@ -282,6 +294,28 @@ const (
 )
 
 var errMessageTooBig = errors.New("ws: message exceeds size limit")
+
+// ErrClosed is returned by [Conn.WriteMessage] when the connection has been
+// closed with a normal closure (1000). A normal closure records a nil
+// terminal error, so without a sentinel a write after such a close would
+// report success for a frame that is never sent.
+var ErrClosed = errors.New("ws: connection closed")
+
+// closedWriteErr is the error a write path returns for a closed
+// connection: the recorded close error when there is one, ErrClosed for a
+// normal closure.
+func (c *Conn) closedWriteErr() error {
+	if c.closeErr != nil {
+		return c.closeErr
+	}
+	return ErrClosed
+}
+
+// closeWriteTimeout bounds how long the close-frame write in [Conn.Close]
+// may take. The peer of a closing connection is often silent by
+// definition; an unbounded write would hang the closing goroutine (and
+// every goroutine waiting on the close) forever.
+const closeWriteTimeout = 5 * time.Second
 
 var connSeq uint64
 
@@ -294,19 +328,17 @@ var connSeq uint64
 // Conn is not safe for concurrent use of ReadMessage from multiple
 // goroutines.
 type Conn struct {
-	nc          net.Conn
-	br          *bufio.Reader
-	bw          *bufio.Writer
-	isClient    bool
-	mu          sync.Mutex // serializes the write path
+	nc net.Conn
+	fc frameCodec
+	mu sync.Mutex // serializes the write path
+
 	id          uint64
 	subprotocol string
 
 	state         int32 // stOpen or stClosed (atomic)
-	closeErr      error // valid once state == stClosed
+	closeErr      error // valid once state == stClosed; guarded by c.mu
 	handshakeData any
 
-	maxMessageSize int64
 	idleTimeout    time.Duration
 	lastActivity   time.Time
 
@@ -323,12 +355,14 @@ func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idle
 		br = bufio.NewReaderSize(r, 16<<10)
 	}
 	return &Conn{
-		nc:             nc,
-		br:             br,
-		bw:             bufio.NewWriterSize(nc, 16<<10),
-		isClient:       isClient,
+		nc: nc,
+		fc: frameCodec{
+			br:       br,
+			bw:       bufio.NewWriterSize(nc, 16<<10),
+			isClient: isClient,
+			maxMsg:   maxMessageSize,
+		},
 		id:             atomic.AddUint64(&connSeq, 1),
-		maxMessageSize: maxMessageSize,
 		idleTimeout:    idleTimeout,
 		lastActivity:   time.Now(),
 	}
@@ -363,12 +397,20 @@ func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadlin
 // finish records a terminal state. It is safe to call concurrently: the
 // first caller's error wins, and the returned error is the one recorded at
 // close time. A nil return means the connection closed normally (1000).
+//
+// The state transition and the closeErr write happen under c.mu so that no
+// reader — which also reads closeErr under c.mu — can ever observe the
+// closed state without the recorded error.
 func (c *Conn) finish(err error) error {
-	if atomic.CompareAndSwapInt32(&c.state, stOpen, stClosed) {
+	c.mu.Lock()
+	if atomic.LoadInt32(&c.state) == stOpen {
+		atomic.StoreInt32(&c.state, stClosed)
 		c.closeErr = err
 	}
+	err = c.closeErr
+	c.mu.Unlock()
 	_ = c.nc.Close()
-	return c.closeErr
+	return err
 }
 
 // ReadMessage reads the next complete message from the connection.
@@ -391,14 +433,17 @@ func (c *Conn) finish(err error) error {
 // ReadMessage must only be called from one goroutine at a time.
 func (c *Conn) ReadMessage() (opcode int, data []byte, err error) {
 	if atomic.LoadInt32(&c.state) == stClosed {
-		return 0, nil, c.closeErr
+		c.mu.Lock()
+		err = c.closeErr
+		c.mu.Unlock()
+		return 0, nil, err
 	}
 	for {
 		if err := c.armIdle(); err != nil {
 			return 0, nil, c.finish(err)
 		}
 		var f frame
-		if f, err = c.readFrame(); err != nil {
+		if f, err = c.fc.readFrame(); err != nil {
 			return 0, nil, c.finish(err)
 		}
 		_ = c.nc.SetReadDeadline(time.Time{}) // clear the keepalive deadline
@@ -427,7 +472,7 @@ func (c *Conn) ReadMessage() (opcode int, data []byte, err error) {
 			if !c.inFrag {
 				return 0, nil, c.finish(fmt.Errorf("%w: continuation frame without start", errProtocol))
 			}
-			if int64(len(c.fragBuf)+len(f.payload)) > c.maxMessageSize {
+			if int64(len(c.fragBuf)+len(f.payload)) > c.fc.maxMsg {
 				c.inFrag, c.fragBuf = false, nil
 				return 0, nil, c.finish(fmt.Errorf("%w: %w", errProtocol, errMessageTooBig))
 			}
@@ -455,60 +500,79 @@ func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
 	return 0, nil, c.finish(closeErrFor(code, reason))
 }
 
-// armIdle bounds the next blocking read. If the connection has been quiet
-// for longer than the idle timeout, a ping is sent first and the deadline
-// starts fresh; otherwise the deadline is the remainder of the idle window.
-// Every blocking read is therefore bounded when the idle timeout is set.
+// keepaliveDecision decides, before a blocking read, whether the connection
+// has been quiet long enough to warrant a ping first, and which read
+// deadline to set. It is pure in its inputs so the timing boundary can be
+// tested exactly, without a clock or a socket.
+func keepaliveDecision(lastActivity, now time.Time, idle time.Duration) (ping bool, deadline time.Time) {
+	deadline = lastActivity.Add(idle)
+	if now.After(deadline) {
+		ping = true
+		deadline = now.Add(idle)
+	}
+	return ping, deadline
+}
+
+// armIdle bounds the next blocking read. Every blocking read is therefore
+// bounded when the idle timeout is set; see [keepaliveDecision].
 func (c *Conn) armIdle() error {
 	if c.idleTimeout <= 0 {
 		return nil
 	}
-	deadline := c.lastActivity.Add(c.idleTimeout)
-	if time.Now().After(deadline) {
+	ping, deadline := keepaliveDecision(c.lastActivity, time.Now(), c.idleTimeout)
+	if ping {
 		if err := c.writeFrame(OpPing, nil); err != nil {
 			return err
 		}
-		deadline = time.Now().Add(c.idleTimeout)
 	}
 	return c.nc.SetReadDeadline(deadline)
 }
 
 // writeFrame writes a frame, taking the write lock. Control frames are
-// rejected here; use [Close] to send a close frame.
+// rejected here; use [Close] to send a close frame. A closed connection
+// yields [Conn.closedWriteErr], never a silent success.
 func (c *Conn) writeFrame(op int, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if atomic.LoadInt32(&c.state) == stClosed {
-		return c.closeErr
+		return c.closedWriteErr()
 	}
-	return c.writeFrameLocked(op, payload)
+	return c.fc.writeFrame(op, payload)
 }
 
 // WriteMessage writes a complete text or binary message. It is safe to call
 // from any goroutine. Writes do not fragment: the message is sent in a
 // single frame, so messages must fit within maxMessageSize.
+//
+// On a closed connection WriteMessage always fails: with the recorded close
+// error, or [ErrClosed] after a normal closure (1000) — never a silent
+// success for a frame that will not be sent.
 func (c *Conn) WriteMessage(op int, data []byte) error {
 	if op != OpText && op != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
 	}
-	if int64(len(data)) > c.maxMessageSize {
-		return fmt.Errorf("%w: message of %d bytes exceeds the %d byte limit", errMessageTooBig, len(data), c.maxMessageSize)
+	if int64(len(data)) > c.fc.maxMsg {
+		return fmt.Errorf("%w: message of %d bytes exceeds the %d byte limit", errMessageTooBig, len(data), c.fc.maxMsg)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if atomic.LoadInt32(&c.state) == stClosed {
-		return c.closeErr
+		return c.closedWriteErr()
 	}
-	return c.writeFrameLocked(op, data)
+	return c.fc.writeFrame(op, data)
 }
 
 // Close closes the connection, sending a close frame with the given code and
 // reason before tearing down the transport. It is idempotent and safe to
 // call from any goroutine, including the pumping goroutine.
 //
-// Close codes must be in the range 1000-4999. Code 1000 is a normal closure:
-// ReadMessage returns (0, nil, nil) after such a close. Any other code is
-// reported as a [*CloseError].
+// Close codes must be in the range 1000-4999. The return value is the
+// terminal error recorded on the connection — nil for a normal closure
+// (1000), a [*CloseError] otherwise — not the status of the close-frame
+// write, which is best effort: the kernel delivers queued data before the
+// FIN, so the frame reaches the peer in order when the transport allows.
+// Concurrent Close callers all observe the same recorded error, from the
+// first one to close.
 func (c *Conn) Close(code int, reason string) error {
 	if code < 1000 || code > 4999 {
 		return fmt.Errorf("ws: invalid close code %d", code)
@@ -528,13 +592,16 @@ func (c *Conn) Close(code int, reason string) error {
 	}
 	atomic.StoreInt32(&c.state, stClosed)
 	c.closeErr = closeErrFor(code, reason)
-	err := c.writeFrameLocked(OpClose, payload)
+	// The close frame is sent best-effort: the kernel delivers queued data
+	// before the FIN, so it reaches the peer in order when the transport
+	// allows. The write is bounded — a silent or half-dead peer must not be
+	// able to hold the close open forever.
+	_ = c.nc.SetWriteDeadline(time.Now().Add(closeWriteTimeout))
+	_ = c.fc.writeFrame(OpClose, payload)
+	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
-	// The kernel delivers queued data before the FIN, so the close frame
-	// reaches the peer in order; the peer may respond or drop, either way
-	// our teardown is complete.
 	_ = c.nc.Close()
-	return err
+	return c.closeErr
 }
 
 // Option configures a [Upgrader] (via [NewUpgrader]) or a client connection
