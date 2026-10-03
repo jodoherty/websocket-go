@@ -64,7 +64,7 @@
 // This is a single-file implementation, organized in dependency order so a
 // reader can work top to bottom:
 //
-//  1. protocol constants (close codes, frame opcodes)
+//  1. protocol constants (close codes, frame opcodes, wire format, defaults)
 //  2. errors (CloseError, ErrClosed, internal sentinels)
 //  3. wire format (the frame codec: readFrame, writeFrame)
 //  4. Conn (state, constructor, terminal handling)
@@ -117,6 +117,12 @@ const (
 	StatusTryAgainLater       = 1013
 )
 
+// Close code range: close codes must be in 1000-4999 (RFC 6455 §7.4).
+const (
+	closeCodeMin = 1000
+	closeCodeMax = 4999
+)
+
 // Frame opcodes (RFC 6455 §5.2).
 const (
 	OpContinuation = 0
@@ -125,6 +131,49 @@ const (
 	OpClose        = 8
 	OpPing         = 9
 	OpPong         = 10
+)
+
+// Wire format constants (RFC 6455 §5-§6).
+const (
+	finBit     = 0x80 // frame[0] high bit: final fragment
+	rsvMask    = 0x70 // frame[0] reserved bits, must be zero
+	opcodeMask = 0x0f // frame[0] low 4 bits: opcode
+	maskBit    = 0x80 // frame[1] high bit: payload is masked
+	lenMask    = 0x7f // frame[1] low 7 bits: payload length
+	len16      = 126  // 16-bit extended length follows the header
+	len64      = 127  // 64-bit extended length follows the header
+	len16Max   = 0xffff
+)
+
+// Frame size limits (RFC 6455 §5.5, §7.1).
+const (
+	maxShortLen       = 125 // largest length encoded in the 7 header bits
+	maxControlPayload = 125 // max control-frame payload
+	closeCodeBytes    = 2   // close payload: 2-byte status code prefix
+	maxCloseReason    = 123 // close payload caps at 125 bytes total
+)
+
+// Header lengths for each payload-length encoding.
+const (
+	hdrLen7Bit  = 2  // 7-bit length
+	hdrLen16Bit = 4  // header + 16-bit extended length
+	hdrLen64Bit = 10 // header + 64-bit extended length
+)
+
+// Defaults shared by [NewUpgrader] and [Dial].
+const (
+	defaultMaxMessageSize = 16 << 20
+	defaultIdleTimeout    = 60 * time.Second
+	defaultWriteTimeout   = 30 * time.Second
+	closeWriteTimeout     = 5 * time.Second
+
+	bufSize        = 16 << 10 // bufio buffer for reads and writes
+	wsKeyBytes     = 16       // raw key bytes, base64-encoded into the handshake
+	websocketVer   = "13"     // Sec-WebSocket-Version (the only valid value)
+	wsScheme       = "ws"     // plain-text scheme
+	wssScheme      = "wss"    // TLS scheme
+	wsDefaultPort  = ":80"    // appended when the URL has no port
+	wssDefaultPort = ":443"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,11 +196,12 @@ func (e *CloseError) Error() string {
 // CloseCode extracts the close code and reason from an error returned by
 // [Conn.ReadMessage] or stored on a connection. ok is false if the error
 // does not carry a close code.
-func CloseCode(err error) (code int, reason string, ok bool) {
-	var ce *CloseError
-	if errors.As(err, &ce) {
-		return ce.Code, ce.Reason, true
+func CloseCode(err error) (int, string, bool) {
+	closeErr, ok := errors.AsType[*CloseError](err)
+	if ok {
+		return closeErr.Code, closeErr.Reason, true
 	}
+
 	return 0, "", false
 }
 
@@ -167,6 +217,13 @@ var errProtocol = errors.New("ws: protocol violation")
 // errMessageTooBig marks a frame or message that exceeds maxMessageSize.
 var errMessageTooBig = errors.New("ws: message exceeds size limit")
 
+// Static error bases, wrapped with context where the detail varies.
+var (
+	errBadScheme       = errors.New("ws: unsupported scheme")
+	errBadCloseCode    = errors.New("ws: invalid close code")
+	errHandshakeFailed = errors.New("ws: handshake failed")
+)
+
 // closeErrFor maps a close code to the terminal error recorded on the
 // connection: a normal closure (1000, or an absent status) yields nil,
 // everything else yields a *CloseError so callers can see the code and
@@ -176,6 +233,7 @@ func closeErrFor(code int, reason string) error {
 	case StatusNormalClosure, StatusNoStatusReceived:
 		return nil
 	default:
+
 		return &CloseError{Code: code, Reason: reason}
 	}
 }
@@ -190,7 +248,7 @@ type frame struct {
 	payload []byte
 }
 
-func (f frame) isControl() bool { return f.opcode >= 8 }
+func (f frame) isControl() bool { return f.opcode >= OpClose }
 
 // frameCodec is the byte-level half of a [Conn]: it reads and writes RFC
 // 6455 frames on a buffered stream pair. Masking enforcement depends on
@@ -229,107 +287,160 @@ type frameCodec struct {
 // frames and a server must not, so the peer's frames are masked exactly
 // when we are the server.
 func (fc *frameCodec) readFrame() (frame, error) {
-	if _, err := io.ReadFull(fc.br, fc.in[:2]); err != nil {
-		return frame{}, err
+	_, err := io.ReadFull(fc.br, fc.in[:2])
+	if err != nil {
+		return frame{}, fmt.Errorf("ws: read frame header: %w", err)
 	}
-	f := frame{fin: fc.in[0]&0x80 != 0, opcode: int(fc.in[0] & 0x0f)}
-	if fc.in[0]&0x70 != 0 {
+	frm := frame{fin: fc.in[0]&finBit != 0, opcode: int(fc.in[0] & opcodeMask)}
+	if fc.in[0]&rsvMask != 0 {
 		return frame{}, fmt.Errorf("%w: reserved bits set", errProtocol)
 	}
-	masked := fc.in[1]&0x80 != 0
+	masked := fc.in[1]&maskBit != 0
 	if masked == fc.isClient {
 		return frame{}, fmt.Errorf("%w: frame masking violation", errProtocol)
 	}
-	var n int64
-	switch l := fc.in[1] & 0x7f; l {
-	case 126:
-		if _, err := io.ReadFull(fc.br, fc.in[2:4]); err != nil {
-			return frame{}, err
-		}
-		n = int64(binary.BigEndian.Uint16(fc.in[2:4]))
-	case 127:
-		if _, err := io.ReadFull(fc.br, fc.len8[:]); err != nil {
-			return frame{}, err
-		}
-		if fc.len8[0] != 0 {
-			return frame{}, fmt.Errorf("%w: frame too large", errProtocol)
-		}
-		n = int64(binary.BigEndian.Uint64(fc.len8[:]))
-	default:
-		n = int64(l)
-	}
-	if f.isControl() && (!f.fin || n > 125) {
-		return frame{}, fmt.Errorf("%w: invalid control frame", errProtocol)
-	}
-	if n > fc.maxMsg {
-		return frame{}, fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit", errProtocol, n, fc.maxMsg)
-	}
-	if masked {
-		if _, err := io.ReadFull(fc.br, fc.mask[:]); err != nil {
-			return frame{}, err
-		}
-	}
-	f.payload = make([]byte, n)
-	if _, err := io.ReadFull(fc.br, f.payload); err != nil {
+	size, err := fc.readFrameLen(int(fc.in[1] & lenMask))
+	if err != nil {
 		return frame{}, err
 	}
+	if frm.isControl() && (!frm.fin || size > maxControlPayload) {
+		return frame{}, fmt.Errorf("%w: invalid control frame", errProtocol)
+	}
+	if size > fc.maxMsg {
+		return frame{}, fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit",
+			errProtocol, size, fc.maxMsg)
+	}
+
+	payload, err := fc.readFramePayload(size, masked)
+	if err != nil {
+		return frame{}, err
+	}
+	frm.payload = payload
+
+	return frm, nil
+}
+
+// readFramePayload reads the payload and, when masked, the mask key, then
+// unmask in place.
+func (fc *frameCodec) readFramePayload(size int64, masked bool) ([]byte, error) {
 	if masked {
-		for i := range f.payload {
-			f.payload[i] ^= fc.mask[i&3]
+		_, err := io.ReadFull(fc.br, fc.mask[:])
+		if err != nil {
+			return nil, fmt.Errorf("ws: read mask key: %w", err)
 		}
 	}
-	return f, nil
+	payload := make([]byte, size)
+	_, readErr := io.ReadFull(fc.br, payload)
+	if readErr != nil {
+		return nil, fmt.Errorf("ws: read payload: %w", readErr)
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= fc.mask[i&3]
+		}
+	}
+
+	return payload, nil
+}
+
+// readFrameLen reads and validates the payload length for a header whose 7
+// length bits held shortLen.
+func (fc *frameCodec) readFrameLen(shortLen int) (int64, error) {
+	switch shortLen {
+	case len16:
+		_, err := io.ReadFull(fc.br, fc.in[2:4])
+		if err != nil {
+			return 0, fmt.Errorf("ws: read 16-bit length: %w", err)
+		}
+
+		return int64(binary.BigEndian.Uint16(fc.in[2:4])), nil
+	case len64:
+		_, err := io.ReadFull(fc.br, fc.len8[:])
+		if err != nil {
+			return 0, fmt.Errorf("ws: read 64-bit length: %w", err)
+		}
+		if fc.len8[0] != 0 {
+			return 0, fmt.Errorf("%w: frame too large", errProtocol)
+		}
+		// len8[0] == 0 above, so the value is < 2^63: the conversion
+		// below cannot overflow.
+
+		return int64(binary.BigEndian.Uint64(fc.len8[:])), nil //nolint:gosec // bounded above
+	default:
+
+		return int64(shortLen), nil
+	}
+}
+
+// encodeFrameLen encodes payloadLen into the header and returns the total
+// header length in bytes, not counting the mask key.
+func encodeFrameLen(hdr []byte, payloadLen int) int {
+	switch {
+	case payloadLen <= maxShortLen:
+		hdr[1] = byte(payloadLen) //nolint:gosec // payloadLen <= 125 here
+
+		return hdrLen7Bit
+	case payloadLen <= len16Max:
+		hdr[1] = len16
+		binary.BigEndian.PutUint16(hdr[2:4], uint16(payloadLen))
+
+		return hdrLen16Bit
+	default:
+		hdr[1] = len64
+		binary.BigEndian.PutUint64(hdr[2:10], uint64(payloadLen))
+
+		return hdrLen64Bit
+	}
 }
 
 // writeFrame writes one complete (FIN set) frame. It does not take any
 // lock; a [Conn] serializes calls via its write mutex.
-func (fc *frameCodec) writeFrame(op int, payload []byte) error {
+func (fc *frameCodec) writeFrame(opcode int, payload []byte) error {
 	hdr := fc.hdr[:]
-	hdr[0] = 0x80 | byte(op)
-	l := len(payload)
-	hdrLen := 2
-	switch {
-	case l <= 125:
-		hdr[1] = byte(l)
-	case l <= 0xffff:
-		hdr[1] = 126
-		binary.BigEndian.PutUint16(hdr[2:4], uint16(l))
-		hdrLen = 4
-	default:
-		hdr[1] = 127
-		binary.BigEndian.PutUint64(hdr[2:10], uint64(l))
-		hdrLen = 10
-	}
+	// opcode is a 4-bit value (0-15), so the conversion cannot overflow.
+	hdr[0] = finBit | byte(opcode) //nolint:gosec // 4-bit opcode
+	hdrLen := encodeFrameLen(hdr, len(payload))
 	if fc.isClient {
-		if _, err := rand.Read(fc.rand4[:]); err != nil {
-			return err
+		_, randErr := rand.Read(fc.rand4[:])
+		if randErr != nil {
+			return fmt.Errorf("ws: generate frame mask: %w", randErr)
 		}
 		copy(hdr[hdrLen:hdrLen+4], fc.rand4[:])
-		hdr[1] |= 0x80
+		hdr[1] |= maskBit
 		hdrLen += 4
 	}
-	if _, err := fc.bw.Write(hdr[:hdrLen]); err != nil {
-		return err
+	_, hdrErr := fc.bw.Write(hdr[:hdrLen])
+	if hdrErr != nil {
+		return fmt.Errorf("ws: write frame header: %w", hdrErr)
 	}
 	if fc.isClient {
 		// Masking must not modify the caller's buffer, so the masked
 		// copy goes through reusable scratch (see maskScratch).
-		if len(fc.maskScratch) < l {
-			fc.maskScratch = make([]byte, l)
+		if len(fc.maskScratch) < len(payload) {
+			fc.maskScratch = make([]byte, len(payload))
 		}
-		buf := fc.maskScratch[:l]
+		buf := fc.maskScratch[:len(payload)]
 		copy(buf, payload)
 		mask := hdr[hdrLen-4 : hdrLen]
 		for i := range buf {
 			buf[i] ^= mask[i&3]
 		}
-		if _, err := fc.bw.Write(buf); err != nil {
-			return err
+		_, payloadErr := fc.bw.Write(buf)
+		if payloadErr != nil {
+			return fmt.Errorf("ws: write payload: %w", payloadErr)
 		}
-	} else if _, err := fc.bw.Write(payload); err != nil {
-		return err
+	} else {
+		_, payloadErr := fc.bw.Write(payload)
+		if payloadErr != nil {
+			return fmt.Errorf("ws: write payload: %w", payloadErr)
+		}
 	}
-	return fc.bw.Flush()
+	flushErr := fc.bw.Flush()
+	if flushErr != nil {
+		return fmt.Errorf("ws: flush frame: %w", flushErr)
+	}
+
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,7 +451,8 @@ const (
 	stClosed
 )
 
-var connSeq uint64
+//nolint:gochecknoglobals // monotonic per-process sequence for Conn.ID
+var connSeq atomic.Uint64
 
 // Conn is an open WebSocket connection.
 //
@@ -358,8 +470,8 @@ type Conn struct {
 	id          uint64
 	subprotocol string
 
-	state         int32 // stOpen or stClosed (atomic)
-	closeErr      error // valid once state == stClosed; guarded by c.mu
+	state         atomic.Int32 // stOpen or stClosed
+	closeErr      error        // valid once state == stClosed; guarded by c.mu
 	handshakeData any
 
 	idleTimeout  time.Duration
@@ -377,22 +489,25 @@ type Conn struct {
 	fragBuf []byte
 }
 
-func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idleTimeout, writeTimeout time.Duration) *Conn {
-	var br *bufio.Reader
-	if existing, ok := r.(*bufio.Reader); ok {
-		br = existing
+func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int64,
+	idleTimeout, writeTimeout time.Duration,
+) *Conn {
+	var reader *bufio.Reader
+	if existing, ok := stream.(*bufio.Reader); ok {
+		reader = existing
 	} else {
-		br = bufio.NewReaderSize(r, 16<<10)
+		reader = bufio.NewReaderSize(stream, bufSize)
 	}
+
 	return &Conn{
-		nc: nc,
+		nc: conn,
 		fc: frameCodec{
-			br:       br,
-			bw:       bufio.NewWriterSize(nc, 16<<10),
+			br:       reader,
+			bw:       bufio.NewWriterSize(conn, bufSize),
 			isClient: isClient,
 			maxMsg:   maxMessageSize,
 		},
-		id:           atomic.AddUint64(&connSeq, 1),
+		id:           connSeq.Add(1),
 		idleTimeout:  idleTimeout,
 		writeTimeout: writeTimeout,
 		lastActivity: time.Now(),
@@ -408,13 +523,14 @@ func newConn(nc net.Conn, r io.Reader, isClient bool, maxMessageSize int64, idle
 // closed state without the recorded error.
 func (c *Conn) finish(err error) error {
 	c.mu.Lock()
-	if atomic.LoadInt32(&c.state) == stOpen {
-		atomic.StoreInt32(&c.state, stClosed)
+	if c.state.Load() == stOpen {
+		c.state.Store(stClosed)
 		c.closeErr = err
 	}
 	err = c.closeErr
 	c.mu.Unlock()
 	_ = c.nc.Close()
+
 	return err
 }
 
@@ -439,91 +555,133 @@ func (c *Conn) finish(err error) error {
 // background goroutine.
 //
 // ReadMessage must only be called from one goroutine at a time.
-func (c *Conn) ReadMessage() (opcode int, data []byte, err error) {
-	if atomic.LoadInt32(&c.state) == stClosed {
+func (c *Conn) ReadMessage() (int, []byte, error) {
+	if c.state.Load() == stClosed {
 		c.mu.Lock()
-		err = c.closeErr
+		closeErr := c.closeErr
 		c.mu.Unlock()
-		return 0, nil, err
+
+		return 0, nil, closeErr
 	}
 	for {
-		if err := c.armIdle(); err != nil {
-			return 0, nil, c.finish(err)
+		armErr := c.armIdle()
+		if armErr != nil {
+			return 0, nil, c.finish(armErr)
 		}
-		var f frame
-		if f, err = c.fc.readFrame(); err != nil {
-			if !isReadTimeout(err) {
-				return 0, nil, c.finish(err)
+		frm, err := c.fc.readFrame()
+		if err != nil {
+			retry, connErr := c.keepaliveTimeout(err)
+			if retry {
+				continue
 			}
-			// The connection has been silent for the idle threshold.
-			if probeDecision(c.probedSinceLastActivity) == probeKill {
-				return 0, nil, c.finish(err)
-			}
-			c.probedSinceLastActivity = true
-			c.probeAt = time.Now()
-			// Probe the peer. The write is bounded by the write timeout,
-			// so a blackholed transport cannot wedge the read loop here.
-			if perr := c.writeFrame(OpPing, nil); perr != nil {
-				return 0, nil, c.finish(perr)
-			}
-			// armIdle re-arms with the grace window (probeAt + idle);
-			// a pong or any frame refreshes lastActivity and resets the
-			// probe state, a second timeout kills.
-			continue
+
+			return 0, nil, c.finish(connErr)
 		}
 		_ = c.nc.SetReadDeadline(time.Time{}) // clear the keepalive deadline
 		c.lastActivity = time.Now()
 		c.probedSinceLastActivity = false
 
-		switch f.opcode {
+		switch frm.opcode {
 		case OpPing:
-			if err := c.writeFrame(OpPong, f.payload); err != nil {
-				return 0, nil, c.finish(err)
+			pingErr := c.writeFrame(OpPong, frm.payload)
+			if pingErr != nil {
+				return 0, nil, c.finish(pingErr)
 			}
+
 			continue
 		case OpPong:
+
 			continue
 		case OpClose:
-			return c.peerClose(f.payload)
-		case OpText, OpBinary:
-			if c.inFrag {
-				return 0, nil, c.finish(fmt.Errorf("%w: data frame while message is in progress", errProtocol))
+			return c.peerClose(frm.payload)
+		case OpText, OpBinary, OpContinuation:
+			msgOp, payload, complete, msgErr := c.handleData(frm)
+			if msgErr != nil {
+				return 0, nil, c.finish(msgErr)
 			}
-			if f.fin {
-				return f.opcode, f.payload, nil
+			if !complete {
+				continue
 			}
-			c.inFrag, c.fragOp, c.fragBuf = true, f.opcode, f.payload
-			continue
-		case OpContinuation:
-			if !c.inFrag {
-				return 0, nil, c.finish(fmt.Errorf("%w: continuation frame without start", errProtocol))
-			}
-			if int64(len(c.fragBuf)+len(f.payload)) > c.fc.maxMsg {
-				c.inFrag, c.fragBuf = false, nil
-				return 0, nil, c.finish(fmt.Errorf("%w: %w", errProtocol, errMessageTooBig))
-			}
-			c.fragBuf = append(c.fragBuf, f.payload...)
-			if f.fin {
-				op, buf := c.fragOp, c.fragBuf
-				c.inFrag, c.fragBuf = false, nil
-				return op, buf, nil
-			}
+
+			return msgOp, payload, nil
 		default:
-			return 0, nil, c.finish(fmt.Errorf("%w: unknown opcode %d", errProtocol, f.opcode))
+			return 0, nil, c.finish(
+				fmt.Errorf("%w: unknown opcode %d", errProtocol, frm.opcode))
 		}
 	}
+}
+
+// keepaliveTimeout processes a read error against the keepalive clock. It
+// returns retry=true when a probe ping was sent and the read loop should
+// continue; otherwise it returns the connection error (transport error, or
+// the silence timeout that killed the connection).
+func (c *Conn) keepaliveTimeout(err error) (bool, error) {
+	if !isReadTimeout(err) {
+		return false, err
+	}
+	if probeDecision(c.probedSinceLastActivity) == probeKill {
+		return false, err
+	}
+	c.probedSinceLastActivity = true
+	c.probeAt = time.Now()
+	// The write is bounded by the write timeout, so a blackholed
+	// transport cannot wedge the read loop here.
+	pingErr := c.writeFrame(OpPing, nil)
+	if pingErr != nil {
+		return false, pingErr
+	}
+
+	return true, nil // armIdle re-arms with the grace window (probeAt + idle)
 }
 
 // peerClose handles a close frame received from the peer: reply with the same
 // code, tear down, and report the outcome.
 func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
 	code, reason := StatusNoStatusReceived, ""
-	if len(payload) >= 2 {
-		code = int(binary.BigEndian.Uint16(payload[:2]))
-		reason = string(payload[2:])
+	if len(payload) >= closeCodeBytes {
+		code = int(binary.BigEndian.Uint16(payload[:closeCodeBytes]))
+		reason = string(payload[closeCodeBytes:])
 	}
 	_ = c.Close(code, reason)
+
 	return 0, nil, c.finish(closeErrFor(code, reason))
+}
+
+// handleData processes one data or continuation frame. It returns complete
+// when the message is finished — a single-frame message, or the final
+// fragment — and holds the partial message in the connection otherwise.
+func (c *Conn) handleData(frm frame) (int, []byte, bool, error) {
+	if frm.opcode == OpContinuation {
+		if !c.inFrag {
+			return 0, nil, false, fmt.Errorf("%w: continuation frame without start", errProtocol)
+		}
+		if int64(len(c.fragBuf)+len(frm.payload)) > c.fc.maxMsg {
+			c.inFrag, c.fragBuf = false, nil
+
+			return 0, nil, false, fmt.Errorf("%w: %w", errProtocol, errMessageTooBig)
+		}
+		c.fragBuf = append(c.fragBuf, frm.payload...)
+		if !frm.fin {
+			return 0, nil, false, nil
+		}
+
+		opcode, data := c.fragOp, c.fragBuf
+		c.inFrag, c.fragBuf = false, nil
+
+		return opcode, data, true, nil
+	}
+	// OpText or OpBinary.
+	if c.inFrag {
+		return 0, nil, false, fmt.Errorf("%w: data frame while message is in progress",
+			errProtocol)
+	}
+	if !frm.fin {
+		c.inFrag, c.fragOp, c.fragBuf = true, frm.opcode, frm.payload
+
+		return 0, nil, false, nil
+	}
+
+	return frm.opcode, frm.payload, true, nil
 }
 
 // armIdle arms the read deadline for the next blocking read: the point at
@@ -540,6 +698,7 @@ func (c *Conn) armIdle() error {
 	if c.probedSinceLastActivity {
 		deadline = c.probeAt.Add(c.idleTimeout)
 	}
+
 	return c.nc.SetReadDeadline(deadline)
 }
 
@@ -561,6 +720,7 @@ func probeDecision(probedOnce bool) probeAction {
 	if probedOnce {
 		return probeKill
 	}
+
 	return probePing
 }
 
@@ -568,25 +728,12 @@ func probeDecision(probedOnce bool) probeAction {
 // to a transport error or EOF.
 func isReadTimeout(err error) bool {
 	var nerr net.Error
+
 	return errors.As(err, &nerr) && nerr.Timeout()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 6 · Writing and closing
-
-// defaultWriteTimeout bounds how long a single [Conn.WriteMessage] may block
-// writing to the transport. Without it, a write to a blackhole (peer not
-// reading and not sending RST) blocks forever while holding the write mutex,
-// which wedges [Conn.Close] — the closer never reaches its own bound or
-// nc.Close. A long-running server must not be able to leak a goroutine this
-// way. Disable the bound per-connection with WithWriteTimeout(0).
-const defaultWriteTimeout = 30 * time.Second
-
-// closeWriteTimeout bounds how long the close-frame write in [Conn.Close]
-// may take. The peer of a closing connection is often silent by
-// definition; an unbounded write would hang the closing goroutine (and
-// every goroutine waiting on the close) forever.
-const closeWriteTimeout = 5 * time.Second
 
 // closedWriteErr is the error a write path returns for a closed
 // connection: the recorded close error when there is one, ErrClosed for a
@@ -595,19 +742,21 @@ func (c *Conn) closedWriteErr() error {
 	if c.closeErr != nil {
 		return c.closeErr
 	}
+
 	return ErrClosed
 }
 
 // writeFrame writes a frame, taking the write lock. Control frames are
 // rejected here; use [Close] to send a close frame. A closed connection
 // yields [Conn.closedWriteErr], never a silent success.
-func (c *Conn) writeFrame(op int, payload []byte) error {
+func (c *Conn) writeFrame(opcode int, payload []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if atomic.LoadInt32(&c.state) == stClosed {
+	if c.state.Load() == stClosed {
 		return c.closedWriteErr()
 	}
-	return c.fc.writeFrame(op, payload)
+
+	return c.fc.writeFrame(opcode, payload)
 }
 
 // WriteMessage writes a complete text or binary message. It is safe to call
@@ -617,16 +766,18 @@ func (c *Conn) writeFrame(op int, payload []byte) error {
 // On a closed connection WriteMessage always fails: with the recorded close
 // error, or [ErrClosed] after a normal closure (1000) — never a silent
 // success for a frame that will not be sent.
-func (c *Conn) WriteMessage(op int, data []byte) error {
-	if op != OpText && op != OpBinary {
+func (c *Conn) WriteMessage(opcode int, data []byte) error {
+	if opcode != OpText && opcode != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
 	}
 	if int64(len(data)) > c.fc.maxMsg {
-		return fmt.Errorf("%w: message of %d bytes exceeds the %d byte limit", errMessageTooBig, len(data), c.fc.maxMsg)
+		return fmt.Errorf("%w: message of %d bytes exceeds the %d byte limit",
+			errMessageTooBig, len(data), c.fc.maxMsg)
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if atomic.LoadInt32(&c.state) == stClosed {
+	if c.state.Load() == stClosed {
+		c.mu.Unlock()
+
 		return c.closedWriteErr()
 	}
 	if c.writeTimeout > 0 {
@@ -635,9 +786,12 @@ func (c *Conn) WriteMessage(op int, data []byte) error {
 		// [Conn.Close] can still tear the connection down. Cleared on return
 		// so the bound is per-write, not sticky.
 		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		defer c.nc.SetWriteDeadline(time.Time{})
 	}
-	return c.fc.writeFrame(op, data)
+	writeErr := c.fc.writeFrame(opcode, data)
+	_ = c.nc.SetWriteDeadline(time.Time{})
+	c.mu.Unlock()
+
+	return writeErr
 }
 
 // Close closes the connection, sending a close frame with the given code and
@@ -652,23 +806,25 @@ func (c *Conn) WriteMessage(op int, data []byte) error {
 // Concurrent Close callers all observe the same recorded error, from the
 // first one to close.
 func (c *Conn) Close(code int, reason string) error {
-	if code < 1000 || code > 4999 {
-		return fmt.Errorf("ws: invalid close code %d", code)
+	if code < closeCodeMin || code > closeCodeMax {
+		return fmt.Errorf("%w: %d", errBadCloseCode, code)
 	}
 	var payload []byte
 	if code != StatusNoStatusReceived && code != StatusAbnormalClosure {
-		reason = reason[:min(len(reason), 123)] // close frame payloads max out at 125 bytes
-		payload = make([]byte, 2+len(reason))
+		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
+		reason = reason[:min(len(reason), maxCloseReason)]
+		payload = make([]byte, closeCodeBytes+len(reason))
 		binary.BigEndian.PutUint16(payload, uint16(code))
-		copy(payload[2:], reason)
+		copy(payload[closeCodeBytes:], reason)
 	}
 	c.mu.Lock()
-	if atomic.LoadInt32(&c.state) == stClosed {
+	if c.state.Load() == stClosed {
 		err := c.closeErr
 		c.mu.Unlock()
+
 		return err
 	}
-	atomic.StoreInt32(&c.state, stClosed)
+	c.state.Store(stClosed)
 	c.closeErr = closeErrFor(code, reason)
 	// The close frame is sent best-effort: the kernel delivers queued data
 	// before the FIN, so it reaches the peer in order when the transport
@@ -679,6 +835,7 @@ func (c *Conn) Close(code int, reason string) error {
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
 	_ = c.nc.Close()
+
 	return c.closeErr
 }
 
@@ -687,7 +844,7 @@ func (c *Conn) Close(code int, reason string) error {
 // stop: it can check Closed() (or select on work and bail when true) instead
 // of waiting for its next WriteMessage to fail with ErrClosed.
 func (c *Conn) Closed() bool {
-	return atomic.LoadInt32(&c.state) == stClosed
+	return c.state.Load() == stClosed
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -753,14 +910,14 @@ type Config struct {
 // client requested, if any; the result is visible on both sides via
 // [Conn.Subprotocol].
 func WithSubprotocols(list ...string) Option {
-	return func(c *Config) { c.Subprotocols = list }
+	return func(cfg *Config) { cfg.Subprotocols = list }
 }
 
 // WithMaxMessageSize sets the maximum size of a single message (default
 // 16 MiB) on either side. Frames and fragmented messages beyond the limit
 // terminate the connection.
 func WithMaxMessageSize(n int64) Option {
-	return func(c *Config) { c.MaxMessageSize = n }
+	return func(cfg *Config) { cfg.MaxMessageSize = n }
 }
 
 // WithIdleTimeout sets the keepalive window on either side (default 60s).
@@ -772,7 +929,7 @@ func WithMaxMessageSize(n int64) Option {
 // roughly every window. Pass zero to disable keepalive and manage deadlines
 // via [Conn.SetReadDeadline].
 func WithIdleTimeout(d time.Duration) Option {
-	return func(c *Config) { c.IdleTimeout = d }
+	return func(cfg *Config) { cfg.IdleTimeout = d }
 }
 
 // WithWriteTimeout bounds how long a single [Conn.WriteMessage] may block
@@ -781,7 +938,7 @@ func WithIdleTimeout(d time.Duration) Option {
 // the bound (a write then blocks until the transport completes or the
 // connection is closed).
 func WithWriteTimeout(d time.Duration) Option {
-	return func(c *Config) { c.WriteTimeout = d }
+	return func(cfg *Config) { cfg.WriteTimeout = d }
 }
 
 // Server-only options.
@@ -789,8 +946,8 @@ func WithWriteTimeout(d time.Duration) Option {
 // WithCheckOrigin sets the origin policy. The default is strict same-origin:
 // the request's Origin header must equal the request's scheme and Host, and
 // requests without an Origin header are rejected.
-func WithCheckOrigin(f func(r *http.Request) bool) Option {
-	return func(c *Config) { c.CheckOrigin = f }
+func WithCheckOrigin(check func(r *http.Request) bool) Option {
+	return func(cfg *Config) { cfg.CheckOrigin = check }
 }
 
 // WithRequireClientCert requires the request to carry a client certificate
@@ -799,16 +956,16 @@ func WithCheckOrigin(f func(r *http.Request) bool) Option {
 // RequireAndVerifyClientCert). Requests without a verified certificate are
 // rejected with 403 before the protocol switch.
 func WithRequireClientCert() Option {
-	return func(c *Config) { c.RequireClientCert = true }
+	return func(cfg *Config) { cfg.RequireClientCert = true }
 }
 
-// WithPreHandshake runs f on the request after protocol and origin checks,
-// before the protocol switch. Return an error to reject the upgrade with
-// 403, or a [*UpgradeError] to control the status code. Use it for policy
-// checks that need the full request (rate limiting, per-path checks,
+// WithPreHandshake runs check on the request after protocol and origin
+// checks, before the protocol switch. Return an error to reject the upgrade
+// with 403, or a [*UpgradeError] to control the status code. Use it for
+// policy checks that need the full request (rate limiting, per-path checks,
 // logging).
-func WithPreHandshake(f func(r *http.Request) error) Option {
-	return func(c *Config) { c.PreHandshake = append(c.PreHandshake, f) }
+func WithPreHandshake(check func(r *http.Request) error) Option {
+	return func(cfg *Config) { cfg.PreHandshake = append(cfg.PreHandshake, check) }
 }
 
 // Client-only options.
@@ -817,18 +974,18 @@ func WithPreHandshake(f func(r *http.Request) error) Option {
 // do this (they can only pass subprotocols and URLs), but programmatic
 // clients use it for bearer tokens and the like.
 func WithHeader(key, value string) Option {
-	return func(c *Config) {
-		if c.Headers == nil {
-			c.Headers = make(http.Header)
+	return func(cfg *Config) {
+		if cfg.Headers == nil {
+			cfg.Headers = make(http.Header)
 		}
-		c.Headers.Set(key, value)
+		cfg.Headers.Set(key, value)
 	}
 }
 
 // WithTLS provides a complete TLS configuration for wss:// connections.
-func WithTLS(cfg *tls.Config) Option {
-	return func(c *Config) {
-		c.tlsConfigClient = cfg
+func WithTLS(tlsConfig *tls.Config) Option {
+	return func(cfg *Config) {
+		cfg.tlsConfigClient = tlsConfig
 	}
 }
 
@@ -837,20 +994,22 @@ func WithTLS(cfg *tls.Config) Option {
 // (or cfg.InsecureSkipVerify if you say so via [WithTLS]). For custom root
 // stores or SNI control, use [WithTLS] directly.
 func WithTLSClientCert(cert *x509.Certificate, key any) Option {
-	return func(c *Config) {
-		cfg := c.tlsConfigClient
-		if cfg == nil {
-			cfg = &tls.Config{}
+	return func(cfg *Config) {
+		clientTLS := cfg.tlsConfigClient
+		if clientTLS == nil {
+			clientTLS = &tls.Config{}
 		}
-		cfg.Certificates = []tls.Certificate{{Certificate: [][]byte{cert.Raw}, PrivateKey: key}}
-		c.tlsConfigClient = cfg
+		clientTLS.Certificates = []tls.Certificate{
+			{Certificate: [][]byte{cert.Raw}, PrivateKey: key},
+		}
+		cfg.tlsConfigClient = clientTLS
 	}
 }
 
 // WithDialTimeout bounds the connect + handshake time (default: the context
 // deadline, if any).
 func WithDialTimeout(d time.Duration) Option {
-	return func(c *Config) { c.dialTimeout = d }
+	return func(cfg *Config) { cfg.dialTimeout = d }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -873,23 +1032,24 @@ type Upgrader struct {
 // a connection silent for that long is probed with a ping, and is considered
 // dead if it is still silent after a second window.
 func NewUpgrader(opts ...Option) *Upgrader {
-	c := &Config{
+	cfg := &Config{
 		CheckOrigin:    defaultCheckOrigin,
-		MaxMessageSize: 16 << 20,
-		IdleTimeout:    60 * time.Second,
+		MaxMessageSize: defaultMaxMessageSize,
+		IdleTimeout:    defaultIdleTimeout,
 		WriteTimeout:   defaultWriteTimeout,
 	}
-	for _, o := range opts {
-		o(c)
+	for _, apply := range opts {
+		apply(cfg)
 	}
+
 	return &Upgrader{
-		checkOrigin:       c.CheckOrigin,
-		requireClientCert: c.RequireClientCert,
-		subprotocols:      c.Subprotocols,
-		maxMessageSize:    c.MaxMessageSize,
-		idleTimeout:       c.IdleTimeout,
-		writeTimeout:      c.WriteTimeout,
-		preHandshake:      c.PreHandshake,
+		checkOrigin:       cfg.CheckOrigin,
+		requireClientCert: cfg.RequireClientCert,
+		subprotocols:      cfg.Subprotocols,
+		maxMessageSize:    cfg.MaxMessageSize,
+		idleTimeout:       cfg.IdleTimeout,
+		writeTimeout:      cfg.WriteTimeout,
+		preHandshake:      cfg.PreHandshake,
 	}
 }
 
@@ -897,14 +1057,15 @@ func NewUpgrader(opts ...Option) *Upgrader {
 // mTLS-terminated request, or nil if no client certificate was presented.
 // Chain verification has already been performed by the TLS layer; this is a
 // convenience for reading identity out of the handshake.
-func ClientCert(r *http.Request) *x509.Certificate {
-	if r.TLS == nil {
+func ClientCert(request *http.Request) *x509.Certificate {
+	if request.TLS == nil {
 		return nil
 	}
-	if len(r.TLS.PeerCertificates) == 0 {
+	if len(request.TLS.PeerCertificates) == 0 {
 		return nil
 	}
-	return r.TLS.PeerCertificates[0]
+
+	return request.TLS.PeerCertificates[0]
 }
 
 // handshakeOpts carries the settings for a single upgrade.
@@ -920,7 +1081,7 @@ type HandshakeOption func(*handshakeOpts)
 // of pre-upgrade setup (an authenticated principal, a session) to the
 // message loop without globals.
 func WithHandshakeData(v any) HandshakeOption {
-	return func(o *handshakeOpts) { o.data = v }
+	return func(opts *handshakeOpts) { opts.data = v }
 }
 
 // UpgradeError is returned by [Upgrader.Upgrade] when the handshake is
@@ -935,9 +1096,80 @@ func (e *UpgradeError) Error() string {
 	return fmt.Sprintf("ws: upgrade rejected: %s (HTTP %d)", e.Msg, e.Status)
 }
 
-func reject(w http.ResponseWriter, status int, msg string) (*Conn, error) {
-	http.Error(w, msg, status)
-	return nil, &UpgradeError{Status: status, Msg: msg}
+func reject(writer http.ResponseWriter, status int, msg string) (*Conn, error) {
+	return nil, rejectStatus(writer, status, msg)
+}
+
+// rejectStatus writes the HTTP error response and returns the matching
+// [*UpgradeError] for the caller to log.
+func rejectStatus(writer http.ResponseWriter, status int, msg string) *UpgradeError {
+	http.Error(writer, msg, status)
+
+	return &UpgradeError{Status: status, Msg: msg}
+}
+
+// checkHandshakeHeaders validates the websocket protocol headers on the
+// request and returns its Sec-WebSocket-Key. Rejections write the HTTP
+// error response themselves.
+func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
+	if !headerContainsToken(request.Header, "Connection", "Upgrade") {
+		return "", rejectStatus(writer, http.StatusBadRequest, "missing Connection: Upgrade header")
+	}
+	if !headerContainsToken(request.Header, "Upgrade", "websocket") {
+		return "", rejectStatus(writer, http.StatusBadRequest, "missing Upgrade: websocket header")
+	}
+	if request.Header.Get("Sec-WebSocket-Version") != websocketVer {
+		return "", rejectStatus(writer, http.StatusUpgradeRequired, "unsupported websocket version")
+	}
+	key := request.Header.Get("Sec-WebSocket-Key")
+	if key == "" {
+		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Key header")
+	}
+
+	return key, nil
+}
+
+// checkPolicy runs the upgrader's authentication and policy gates in order
+// — origin, client certificate, then each PreHandshake hook. Rejections
+// write the HTTP error response themselves.
+func (u *Upgrader) checkPolicy(writer http.ResponseWriter, request *http.Request) *UpgradeError {
+	if !u.checkOrigin(request) {
+		return rejectStatus(writer, http.StatusForbidden, "origin not allowed")
+	}
+	if u.requireClientCert && ClientCert(request) == nil {
+		return rejectStatus(writer, http.StatusForbidden, "client certificate required")
+	}
+	for _, check := range u.preHandshake {
+		err := check(request)
+		if err != nil {
+			if ue, ok := errors.AsType[*UpgradeError](err); ok {
+				return rejectStatus(writer, ue.Status, ue.Msg)
+			}
+
+			return rejectStatus(writer, http.StatusForbidden, err.Error())
+		}
+	}
+
+	return nil
+}
+
+// writeSwitchingProtocols writes the 101 handshake response.
+func writeSwitchingProtocols(conn net.Conn, protocol, accept string) error {
+	var resp bytes.Buffer
+	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	resp.WriteString("Upgrade: websocket\r\n")
+	resp.WriteString("Connection: Upgrade\r\n")
+	fmt.Fprintf(&resp, "Sec-WebSocket-Accept: %s\r\n", accept)
+	if protocol != "" {
+		fmt.Fprintf(&resp, "Sec-WebSocket-Protocol: %s\r\n", protocol)
+	}
+	resp.WriteString("\r\n")
+	_, err := conn.Write(resp.Bytes())
+	if err != nil {
+		return fmt.Errorf("ws: write 101 response: %w", err)
+	}
+
+	return nil
 }
 
 // Upgrade validates the WebSocket handshake on r and switches the connection
@@ -949,50 +1181,34 @@ func reject(w http.ResponseWriter, status int, msg string) (*Conn, error) {
 //
 // Origin checking, client certificate requirements, and PreHandshake hooks
 // are applied in that order.
-func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, opts ...HandshakeOption) (*Conn, error) {
-	var ho handshakeOpts
+func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
+	opts ...HandshakeOption,
+) (*Conn, error) {
+	var sessionOpts handshakeOpts
 	for _, o := range opts {
-		o(&ho)
+		o(&sessionOpts)
 	}
 
-	if r.Method != http.MethodGet {
-		return reject(w, http.StatusMethodNotAllowed, "method not allowed")
+	if request.Method != http.MethodGet {
+		return reject(writer, http.StatusMethodNotAllowed, "method not allowed")
 	}
 	// Authentication and policy checks run before protocol validation, so a
 	// request that is not authorized is rejected before the server reveals
 	// anything about the websocket handshake (and, for mTLS, before the
 	// protocol headers are even inspected).
-	if !u.checkOrigin(r) {
-		return reject(w, http.StatusForbidden, "origin not allowed")
+	rejection := u.checkPolicy(writer, request)
+	if rejection != nil {
+		return nil, rejection
 	}
-	if u.requireClientCert && ClientCert(r) == nil {
-		return reject(w, http.StatusForbidden, "client certificate required")
-	}
-	for _, f := range u.preHandshake {
-		if err := f(r); err != nil {
-			if ue, ok := err.(*UpgradeError); ok {
-				return reject(w, ue.Status, ue.Msg)
-			}
-			return reject(w, http.StatusForbidden, err.Error())
-		}
-	}
-	if !headerContainsToken(r.Header, "Connection", "Upgrade") {
-		return reject(w, http.StatusBadRequest, "missing Connection: Upgrade header")
-	}
-	if !headerContainsToken(r.Header, "Upgrade", "websocket") {
-		return reject(w, http.StatusBadRequest, "missing Upgrade: websocket header")
-	}
-	if r.Header.Get("Sec-WebSocket-Version") != "13" {
-		return reject(w, http.StatusUpgradeRequired, "unsupported websocket version")
-	}
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return reject(w, http.StatusBadRequest, "missing Sec-WebSocket-Key header")
+	key, rejection := checkHandshakeHeaders(writer, request)
+	if rejection != nil {
+		return nil, rejection
 	}
 
-	hj, ok := w.(http.Hijacker)
+	hj, ok := writer.(http.Hijacker)
 	if !ok {
-		return reject(w, http.StatusInternalServerError, "response writer does not support hijacking")
+		return reject(writer, http.StatusInternalServerError,
+			"response writer does not support hijacking")
 	}
 	raw, buf, err := hj.Hijack()
 	if err != nil {
@@ -1002,94 +1218,93 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, opts ...Hands
 	// its bytes are still sitting in buf; switching protocols now would
 	// corrupt the stream. (A fully flushed response cannot be detected
 	// after the fact; return before calling Upgrade when the request is
-	// rejected, and never write to w after calling it.)
+	// rejected, and never write to writer after calling it.)
 	if buf.Reader.Buffered() > 0 {
 		_ = raw.Close()
-		return nil, &UpgradeError{Status: 500, Msg: "response already started"}
+
+		return nil, &UpgradeError{
+			Status: http.StatusInternalServerError, Msg: "response already started"}
 	}
 
-	protocol := negotiateProtocol(u.subprotocols, r.Header.Get("Sec-WebSocket-Protocol"))
-	accept := acceptKey(key)
-
-	var resp bytes.Buffer
-	fmt.Fprintf(&resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", accept)
-	if protocol != "" {
-		fmt.Fprintf(&resp, "Sec-WebSocket-Protocol: %s\r\n", protocol)
-	}
-	resp.WriteString("\r\n")
-	if _, err := raw.Write(resp.Bytes()); err != nil {
+	protocol := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
+	writeErr := writeSwitchingProtocols(raw, protocol, acceptKey(key))
+	if writeErr != nil {
 		_ = raw.Close()
-		return nil, fmt.Errorf("ws: write handshake response: %w", err)
+
+		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
 
-	c := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
-	c.subprotocol = protocol
-	c.handshakeData = ho.data
-	return c, nil
+	conn := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
+	conn.subprotocol = protocol
+	conn.handshakeData = sessionOpts.data
+
+	return conn, nil
 }
 
 // Handle returns an [http.Handler] that upgrades the request with u and then
-// invokes fn, running the session for as long as the connection lives. When
-// fn returns, the connection is closed: with the code carried by a returned
-// [*CloseError], if any, or 1000 otherwise.
+// invokes handler, running the session for as long as the connection lives.
+// When handler returns, the connection is closed: with the code carried by a
+// returned [*CloseError], if any, or 1000 otherwise.
 //
 // The returned handler is ordinary: wrap it in further middleware as needed.
-func (u *Upgrader) Handle(fn func(r *http.Request, c *Conn) error) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := u.Upgrade(w, r)
+func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+		conn, err := u.Upgrade(writer, r)
 		if err != nil {
 			return
 		}
-		err = fn(r, c)
-		var ce *CloseError
-		if errors.As(err, &ce) {
-			_ = c.Close(ce.Code, ce.Reason)
+		err = handler(r, conn)
+		if closeErr, ok := errors.AsType[*CloseError](err); ok {
+			_ = conn.Close(closeErr.Code, closeErr.Reason)
+
 			return
 		}
-		_ = c.Close(StatusNormalClosure, "")
+		_ = conn.Close(StatusNormalClosure, "")
 	})
 }
 
 // Handle is [NewUpgrader].Handle with the default upgrader, for the simple
 // cases where no upgrader configuration is needed.
-func Handle(fn func(r *http.Request, c *Conn) error) http.Handler {
-	return NewUpgrader().Handle(fn)
+func Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
+	return NewUpgrader().Handle(handler)
 }
 
 // Handshake helpers, shared by [Upgrader.Upgrade] and [Dial].
 
-func defaultCheckOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
+func defaultCheckOrigin(request *http.Request) bool {
+	origin := request.Header.Get("Origin")
 	if origin == "" {
 		return false
 	}
 	scheme := "http"
-	if r.TLS != nil {
+	if request.TLS != nil {
 		scheme = "https"
 	}
-	return origin == scheme+"://"+r.Host
+
+	return origin == scheme+"://"+request.Host
 }
 
 func headerContainsToken(h http.Header, key, token string) bool {
-	for _, v := range h[key] {
-		for _, part := range strings.Split(v, ",") {
+	for _, value := range h[key] {
+		for part := range strings.SplitSeq(value, ",") {
 			if strings.EqualFold(strings.TrimSpace(part), token) {
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
 func negotiateProtocol(server []string, clientHeader string) string {
-	clientList := strings.Split(clientHeader, ",")
-	for _, s := range server {
-		for _, c := range clientList {
-			if strings.TrimSpace(c) == s {
-				return s
+	for _, advertised := range server {
+		for requested := range strings.SplitSeq(clientHeader, ",") {
+			if strings.TrimSpace(requested) == advertised {
+				return advertised
 			}
 		}
 	}
+
 	return ""
 }
 
@@ -1098,135 +1313,169 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 func acceptKey(key string) string {
 	sum := sha1.Sum([]byte(key + wsGUID)) //nolint:gosec
+
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 10 · Client: dialing
 
-// dialConfig is the client-only slice of [Config], extracted in [Dial].
-type dialConfig struct {
-	headers   http.Header
-	tlsConfig *tls.Config
-	timeout   time.Duration
+// dialTransport connects to host, performs the TLS handshake when isTLS, and
+// bounds the connection with the context deadline so the handshake and the
+// opening request cannot outlive the caller's cancellation.
+func dialTransport(ctx context.Context, host string, isTLS bool, tlsConfig *tls.Config) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, fmt.Errorf("ws: dial %s: %w", host, err)
+	}
+	if isTLS {
+		tconn := tls.Client(conn, tlsConfig)
+		handshakeErr := tconn.HandshakeContext(ctx)
+		if handshakeErr != nil {
+			_ = conn.Close()
+
+			return nil, fmt.Errorf("ws: tls handshake: %w", handshakeErr)
+		}
+		conn = tconn
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	return conn, nil
 }
 
 // Dial opens a WebSocket client connection to rawurl (ws:// or wss://).
 // It performs the handshake and returns an open [Conn] whose read state is
 // owned by the calling goroutine.
 func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
-	u, err := url.Parse(rawurl)
+	parsed, err := url.Parse(rawurl)
 	if err != nil {
 		return nil, fmt.Errorf("ws: bad url %q: %w", rawurl, err)
 	}
-	switch u.Scheme {
-	case "ws", "wss":
-	default:
-		return nil, fmt.Errorf("ws: unsupported scheme %q", u.Scheme)
+	isTLS := parsed.Scheme == wssScheme
+	if parsed.Scheme != wsScheme && parsed.Scheme != wssScheme {
+		return nil, fmt.Errorf("%w: %q", errBadScheme, parsed.Scheme)
 	}
-	host := u.Host
+	host := parsed.Host
 	if !strings.Contains(host, ":") {
-		if u.Scheme == "wss" {
-			host += ":443"
+		if isTLS {
+			host += wssDefaultPort
 		} else {
-			host += ":80"
+			host += wsDefaultPort
 		}
 	}
 
 	cfg := &Config{
-		// Defaults are applied before the options run so an explicit
-		// WithXxx(0) — WithIdleTimeout(0) to disable keepalive, or
-		// WithWriteTimeout(0) to remove the write bound — is preserved
-		// instead of clobbered by a post-hoc "zero means unset" default.
+		// Defaults run before the options so an explicit WithXxx(0) is
+		// preserved: WithIdleTimeout(0) disables keepalive, and
+		// WithWriteTimeout(0) removes the write bound.
 		Headers:        make(http.Header),
-		MaxMessageSize: 16 << 20,
-		IdleTimeout:    60 * time.Second,
+		MaxMessageSize: defaultMaxMessageSize,
+		IdleTimeout:    defaultIdleTimeout,
 		WriteTimeout:   defaultWriteTimeout,
 	}
-	for _, o := range opts {
-		o(cfg)
+	for _, apply := range opts {
+		apply(cfg)
 	}
-	dialCfg := &dialConfig{headers: cfg.Headers, tlsConfig: cfg.tlsConfigClient, timeout: cfg.dialTimeout}
-	if d := dialCfg.timeout; d > 0 {
+	if d := cfg.dialTimeout; d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
 
-	dialer := &net.Dialer{}
-	var nc net.Conn
-	var plain net.Conn
-	plain, err = dialer.DialContext(ctx, "tcp", host)
+	conn, err := dialTransport(ctx, host, isTLS, cfg.tlsConfigClient)
 	if err != nil {
-		return nil, fmt.Errorf("ws: dial %s: %w", host, err)
-	}
-	if u.Scheme == "wss" {
-		tconn := tls.Client(plain, dialCfg.tlsConfig)
-		if err := tconn.HandshakeContext(ctx); err != nil {
-			plain.Close()
-			return nil, fmt.Errorf("ws: tls handshake: %w", err)
-		}
-		nc = tconn
-	} else {
-		nc = plain
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		nc.SetDeadline(deadline)
+		return nil, err
 	}
 
-	keyBytes := make([]byte, 16)
-	if _, err := rand.Read(keyBytes); err != nil {
-		nc.Close()
-		return nil, err
+	reader := bufio.NewReaderSize(conn, bufSize)
+	key, reqErr := writeHandshakeRequest(conn, parsed.RequestURI(), parsed.Host,
+		cfg.Subprotocols, cfg.Headers)
+	if reqErr != nil {
+		_ = conn.Close()
+
+		return nil, reqErr
+	}
+	subprotocol, respErr := readHandshakeResponse(reader, key)
+	if respErr != nil {
+		_ = conn.Close()
+
+		return nil, respErr
+	}
+
+	// The handshake is done; clear the connect deadline so the session is
+	// governed by its own read/write deadlines and keepalive from here on.
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	c := newConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
+	c.subprotocol = subprotocol
+
+	return c, nil
+}
+
+// writeHandshakeRequest writes the client's opening HTTP request to conn and
+// returns the Sec-WebSocket-Key it used, for verifying the server's
+// response later.
+func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []string,
+	headers http.Header,
+) (string, error) {
+	keyBytes := make([]byte, wsKeyBytes)
+	_, randErr := rand.Read(keyBytes)
+	if randErr != nil {
+		return "", fmt.Errorf("ws: generate key: %w", randErr)
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
 
 	var req bytes.Buffer
-	fmt.Fprintf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n", u.RequestURI(), u.Host, key)
-	if len(cfg.Subprotocols) > 0 {
-		fmt.Fprintf(&req, "Sec-WebSocket-Protocol: %s\r\n", strings.Join(cfg.Subprotocols, ", "))
+	fmt.Fprintf(&req, "GET %s HTTP/1.1\r\nHost: %s\r\n", path, host)
+	req.WriteString("Upgrade: websocket\r\n")
+	req.WriteString("Connection: Upgrade\r\n")
+	fmt.Fprintf(&req, "Sec-WebSocket-Key: %s\r\n", key)
+	fmt.Fprintf(&req, "Sec-WebSocket-Version: %s\r\n", websocketVer)
+	if len(subprotocols) > 0 {
+		fmt.Fprintf(&req, "Sec-WebSocket-Protocol: %s\r\n", strings.Join(subprotocols, ", "))
 	}
-	for k, vs := range dialCfg.headers {
+	for headerKey, values := range headers {
 		switch {
-		case strings.EqualFold(k, "Host"), strings.EqualFold(k, "Upgrade"),
-			strings.EqualFold(k, "Connection"), strings.EqualFold(k, "Sec-WebSocket-Key"),
-			strings.EqualFold(k, "Sec-WebSocket-Version"), strings.EqualFold(k, "Sec-WebSocket-Protocol"):
+		case strings.EqualFold(headerKey, "Host"), strings.EqualFold(headerKey, "Upgrade"),
+			strings.EqualFold(headerKey, "Connection"),
+			strings.EqualFold(headerKey, "Sec-WebSocket-Key"),
+			strings.EqualFold(headerKey, "Sec-WebSocket-Version"),
+			strings.EqualFold(headerKey, "Sec-WebSocket-Protocol"):
 			continue
 		}
-		for _, v := range vs {
-			fmt.Fprintf(&req, "%s: %s\r\n", k, v)
+		for _, value := range values {
+			fmt.Fprintf(&req, "%s: %s\r\n", headerKey, value)
 		}
 	}
 	req.WriteString("\r\n")
-	if _, err := nc.Write(req.Bytes()); err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("ws: write handshake: %w", err)
+	_, writeErr := conn.Write(req.Bytes())
+	if writeErr != nil {
+		return "", fmt.Errorf("ws: write handshake: %w", writeErr)
 	}
 
-	br := bufio.NewReaderSize(nc, 16<<10)
-	resp, err := http.ReadResponse(br, nil)
+	return key, nil
+}
+
+// readHandshakeResponse reads and verifies the server's 101 response,
+// returning the negotiated subprotocol.
+func readHandshakeResponse(reader *bufio.Reader, key string) (string, error) {
+	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("ws: read handshake response: %w", err)
+		return "", fmt.Errorf("ws: read handshake response: %w", err)
 	}
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		nc.Close()
-		return nil, fmt.Errorf("ws: handshake failed: server replied %s", resp.Status)
+		return "", fmt.Errorf("%w: server replied %s", errHandshakeFailed, resp.Status)
 	}
 	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		nc.Close()
-		return nil, fmt.Errorf("ws: handshake failed: invalid Sec-WebSocket-Accept %q", got)
+		return "", fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, got)
 	}
 
-	// The handshake is done; clear the connect deadline so the session is
-	// governed by its own read/write deadlines and keepalive from here on.
-	nc.SetReadDeadline(time.Time{})
-	nc.SetWriteDeadline(time.Time{})
-
-	c := newConn(nc, br, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
-	c.subprotocol = resp.Header.Get("Sec-WebSocket-Protocol")
-	return c, nil
+	return resp.Header.Get("Sec-WebSocket-Protocol"), nil
 }

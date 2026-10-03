@@ -72,21 +72,19 @@ func stressIters(t *testing.T) int {
 // TestConcurrentClose: N goroutines call Close with different codes at once.
 // Exactly one wins; every caller must observe the winner's recorded error.
 func TestConcurrentClose(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		drain(t, s)
 		drain(t, c)
 		const n = 16
 		errs := make([]error, n)
 		var wg sync.WaitGroup
-		for g := 0; g < n; g++ {
-			wg.Add(1)
-			go func(g int) {
-				defer wg.Done()
+		for g := range n {
+			wg.Go(func() {
 				// Distinct, valid, non-normal codes so the winner is
 				// identifiable.
 				errs[g] = c.Close(2000+g, "closer")
-			}(g)
+			})
 		}
 		wg.Wait()
 		_ = s.Close(StatusNormalClosure, "") // release the s-side drain
@@ -94,7 +92,7 @@ func TestConcurrentClose(t *testing.T) {
 			if g == 0 {
 				continue
 			}
-			if e != errs[0] {
+			if !errors.Is(e, errs[0]) {
 				t.Fatalf("iteration %d: goroutine %d saw %v, goroutine 0 saw %v", i, g, e, errs[0])
 			}
 		}
@@ -113,15 +111,16 @@ func TestConcurrentClose(t *testing.T) {
 // closeErr. Previously closeErr was written after the state transition
 // without a lock, racing exactly this path.
 func TestReadAfterClose(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		// The drain may consume the close frame first and win the close
 		// race; either winner records the same code and reason, so the
 		// assertions below hold in both cases.
 		drain(t, s)
-		if err := c.Close(StatusMessageTooBig, "too big"); err != nil {
-			var ce *CloseError
-			if !errors.As(err, &ce) {
+		err := c.Close(StatusMessageTooBig, "too big")
+		if err != nil {
+			ce, ok := errors.AsType[*CloseError](err)
+			if !ok || ce.Code != StatusMessageTooBig || ce.Reason != "too big" {
 				t.Fatalf("iteration %d: Close: %v", i, err)
 			}
 		}
@@ -140,7 +139,7 @@ func TestReadAfterClose(t *testing.T) {
 // writers must terminate with either nil or the recorded close error, never
 // panic, and never observe a torn state.
 func TestWriteWhileClosing(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		drain(t, s)
 		drain(t, c)
@@ -149,10 +148,8 @@ func TestWriteWhileClosing(t *testing.T) {
 		errs := make([]error, n)
 		var wg sync.WaitGroup
 		stop := make(chan struct{})
-		for g := 0; g < n; g++ {
-			wg.Add(1)
-			go func(g int) {
-				defer wg.Done()
+		for g := range n {
+			wg.Go(func() {
 				for {
 					select {
 					case <-stop:
@@ -160,12 +157,13 @@ func TestWriteWhileClosing(t *testing.T) {
 						return
 					default:
 					}
-					if err := c.WriteMessage(OpText, msg); err != nil {
-						errs[g] = err
+					writeErr := c.WriteMessage(OpText, msg)
+					if writeErr != nil {
+						errs[g] = writeErr
 						return
 					}
 				}
-			}(g)
+			})
 		}
 		time.Sleep(time.Millisecond) // let the writers start
 		_ = c.Close(StatusGoingAway, "closing")
@@ -190,7 +188,7 @@ func TestWriteWhileClosing(t *testing.T) {
 // the same connection. Whichever wins, the read must terminate with a
 // consistent terminal error — and the race detector must stay quiet.
 func TestReadWhileClosing(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		drain(t, c) // so s's close-frame write has a reader
 		type outcome struct {
@@ -226,7 +224,7 @@ func TestReadWhileClosing(t *testing.T) {
 // close. The point is to make the write mutex and the state machine do a
 // lot of interleaving in a small, repeatable way.
 func TestConcurrentWriteAndReadExercisesLocks(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		// Drains on both ends: on a synchronous pipe every close needs the
 		// other side to keep reading until teardown, so neither drain may
@@ -235,16 +233,15 @@ func TestConcurrentWriteAndReadExercisesLocks(t *testing.T) {
 		doneC := drain(t, c)
 		const writers = 4
 		var wg sync.WaitGroup
-		for g := 0; g < writers; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range writers {
+			wg.Go(func() {
 				for {
-					if werr := c.WriteMessage(OpText, []byte("abcdefgh")); werr != nil {
+					writeErr := c.WriteMessage(OpText, []byte("abcdefgh"))
+					if writeErr != nil {
 						return
 					}
 				}
-			}()
+			})
 		}
 		time.Sleep(100 * time.Millisecond) // let the writers interleave
 		_ = c.Close(StatusNormalClosure, "")
@@ -268,11 +265,12 @@ func TestConcurrentWriteAndReadExercisesLocks(t *testing.T) {
 // ErrClosed, because a normal closure records a nil terminal error and
 // silent success for an unsent frame would spin a writer goroutine forever.
 func TestWriteAfterCloseErrors(t *testing.T) {
-	for i := 0; i < stressIters(t); i++ {
+	for i := range stressIters(t) {
 		s, c := pipeConnPair()
 		drain(t, s) // reads c's close frame so the close completes
 		_ = c.Close(StatusPolicyViolation, "gone")
-		if err := c.WriteMessage(OpText, []byte("x")); err == nil {
+		err := c.WriteMessage(OpText, []byte("x"))
+		if err == nil {
 			t.Fatalf("iteration %d: write after non-normal close returned nil", i)
 		} else {
 			code, _, ok := CloseCode(err)
@@ -284,7 +282,8 @@ func TestWriteAfterCloseErrors(t *testing.T) {
 		s2, c2 := pipeConnPair()
 		drain(t, s2)
 		_ = c2.Close(StatusNormalClosure, "")
-		if err := c2.WriteMessage(OpText, []byte("x")); !errors.Is(err, ErrClosed) {
+		err = c2.WriteMessage(OpText, []byte("x"))
+		if !errors.Is(err, ErrClosed) {
 			t.Fatalf("iteration %d: write after normal close = %v, want ErrClosed", i, err)
 		}
 	}

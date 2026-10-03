@@ -30,7 +30,7 @@ func FuzzReadFrame(f *testing.F) {
 	for _, s := range seed {
 		f.Add(s)
 	}
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(_ *testing.T, data []byte) {
 		// Exercise both sides of the masking rule on the same input. The
 		// codec is a pure function of its stream: no connection state,
 		// so this targets exactly the byte-level decoding logic.

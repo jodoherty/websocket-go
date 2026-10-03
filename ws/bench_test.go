@@ -19,8 +19,9 @@ func encodeOneFrame(b *testing.B, isClient bool, payload []byte) []byte {
 	b.Helper()
 	var buf bytes.Buffer
 	fc := &frameCodec{bw: bufio.NewWriterSize(&buf, 16<<10), isClient: isClient, maxMsg: 1 << 20}
-	if err := fc.writeFrame(OpText, payload); err != nil {
-		b.Fatalf("encodeOneFrame: %v", err)
+	writeErr := fc.writeFrame(OpText, payload)
+	if writeErr != nil {
+		b.Fatalf("encodeOneFrame: %v", writeErr)
 	}
 	return buf.Bytes()
 }
@@ -41,9 +42,10 @@ func BenchmarkFrameCodecWrite(b *testing.B) {
 			fc := &frameCodec{bw: bufio.NewWriterSize(discardW{}, 16<<10), isClient: isClient, maxMsg: 1 << 20}
 			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				if err := fc.writeFrame(OpText, payload); err != nil {
-					b.Fatal(err)
+			for range b.N {
+				writeErr := fc.writeFrame(OpText, payload)
+				if writeErr != nil {
+					b.Fatal(writeErr)
 				}
 			}
 		})
@@ -66,7 +68,7 @@ func BenchmarkFrameCodecRead(b *testing.B) {
 			br := bufio.NewReaderSize(bytes.NewReader(encoded), 16<<10)
 			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				fc := &frameCodec{br: br, isClient: isClient, maxMsg: 1 << 20}
 				f, err := fc.readFrame()
 				if err != nil {
@@ -98,19 +100,20 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 	defer server.Close(StatusNormalClosure, "")
 
 	go func() {
-		for i := 0; i < b.N; i++ {
+		for range b.N {
 			op, data, err := server.ReadMessage()
 			if err != nil || op != OpText || !bytes.Equal(data, payload) {
-				b.Errorf("server read %d: op=%d err=%v", i, op, err)
+				b.Errorf("server read: op=%d err=%v", op, err)
 				return
 			}
 		}
 	}()
 	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := client.WriteMessage(OpText, payload); err != nil {
-			b.Fatalf("client write %d: %v", i, err)
+	for range b.N {
+		writeErr := client.WriteMessage(OpText, payload)
+		if writeErr != nil {
+			b.Fatalf("client write: %v", writeErr)
 		}
 	}
 	b.StopTimer()
@@ -124,7 +127,7 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 func BenchmarkAcceptKey(b *testing.B) {
 	key := "dGhlIHNhbXBsZSBub25jZQ=="
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = acceptKey(key)
 	}
 }

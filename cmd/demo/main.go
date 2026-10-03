@@ -19,7 +19,8 @@ import (
 	"github.com/jodoherty/websocket/ws"
 )
 
-const page = `<!doctype html>
+const (
+	page = `<!doctype html>
 <html>
 <head><title>ws demo</title></head>
 <body>
@@ -39,6 +40,16 @@ const page = `<!doctype html>
 </body>
 </html>`
 
+	// demoMaxMessageSize caps each message at 1 MiB.
+	demoMaxMessageSize = 1 << 20
+	// readHeaderTimeout bounds the TLS server's header read;
+	// healthReadHeaderTimeout does the same for the health endpoint.
+	readHeaderTimeout       = 10 * time.Second
+	healthReadHeaderTimeout = 5 * time.Second
+	// goodbyeDelay spaces the "hello" and the close on /ws/goodbye.
+	goodbyeDelay = 50 * time.Millisecond
+)
+
 func main() {
 	addr := flag.String("addr", ":8443", "TLS listen address")
 	certs := flag.String("certs", "e2e/certs", "directory containing ca.pem, server.pem, server.key")
@@ -47,120 +58,149 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           BuildMux(),
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig:         TLSConfig(*certs),
+		Handler:           buildMux(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		TLSConfig:         tlsConfig(*certs),
 	}
 	log.Printf("demo server on %s (bearer token via DEMO_TOKEN, default %q)", *addr, token())
 	health := &http.Server{
 		Addr:              *healthAddr,
-		ReadHeaderTimeout: 5 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" {
-				w.WriteHeader(http.StatusOK)
+		ReadHeaderTimeout: healthReadHeaderTimeout,
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.URL.Path == "/health" {
+				writer.WriteHeader(http.StatusOK)
+
 				return
 			}
-			http.NotFound(w, r)
+			http.NotFound(writer, request)
 		}),
 	}
 	go func() {
 		log.Printf("health check on %s", *healthAddr)
 		_ = health.ListenAndServe()
 	}()
-	if err := srv.ListenAndServeTLS(*certs+"/server.pem", *certs+"/server.key"); err != nil {
-		log.Fatal(err)
+	listenErr := srv.ListenAndServeTLS(*certs+"/server.pem", *certs+"/server.key")
+	if listenErr != nil {
+		log.Fatal(listenErr)
 	}
 }
 
-// BuildMux assembles the demo's routes: echo (plain upgrader sugar),
+// buildMux assembles the demo's routes: echo (plain upgrader sugar),
 // bearer-gated echo (self-upgrading handler), mTLS-gated echo, and a
 // controlled-close endpoint.
-func BuildMux() http.Handler {
+func buildMux() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/certinfo", certinfoHandler)
+	mux.HandleFunc("/", rootHandler)
+
 	echoUp := ws.NewUpgrader(
 		ws.WithSubprotocols("vnc1", "binary"),
-		ws.WithMaxMessageSize(1<<20),
+		ws.WithMaxMessageSize(demoMaxMessageSize),
 	)
 	mtlsUp := ws.NewUpgrader(
 		ws.WithRequireClientCert(),
 		ws.WithSubprotocols("vnc1"),
 	)
 
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/certinfo", func(w http.ResponseWriter, r *http.Request) {
-		if c := ws.ClientCert(r); c != nil {
-			_, _ = w.Write([]byte(c.Subject.CommonName))
-			return
-		}
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("no client certificate"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = w.Write([]byte(page))
-	})
-
 	// Plain upgrader sugar: the handler itself is the session.
-	mux.Handle("/ws/echo", echoUp.Handle(func(r *http.Request, c *ws.Conn) error {
-		log.Printf("echo session %d from %s (subprotocol %q)", c.ID(), c.RemoteAddr(), c.Subprotocol())
-		return echo(c)
+	mux.Handle("/ws/echo", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+		log.Printf("echo session %d from %s (subprotocol %q)", conn.ID(), conn.RemoteAddr(), conn.Subprotocol())
+
+		return echo(conn)
 	}))
 
 	// Self-upgrading handler: ordinary HTTP auth first, then the upgrade.
-	mux.Handle("/ws/bearer", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !validToken(r, token()) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		c, err := echoUp.Upgrade(w, r, ws.WithHandshakeData("bearer-user"))
-		if err != nil {
-			return // response already written
-		}
-		defer c.Close(ws.StatusNormalClosure, "")
-		log.Printf("bearer session %d from %s", c.ID(), c.RemoteAddr())
-		if err := echo(c); err != nil {
-			log.Printf("bearer session %d ended: %v", c.ID(), err)
-		}
-	}))
+	mux.Handle("/ws/bearer", bearerHandler(echoUp))
 
 	// mTLS: the TLS layer verifies the client cert; RequireClientCert
 	// rejects any request that arrived without one.
-	mux.Handle("/ws/mtls", mtlsUp.Handle(func(r *http.Request, c *ws.Conn) error {
-		if cert := ws.ClientCert(r); cert != nil {
+	mux.Handle("/ws/mtls", mtlsUp.Handle(func(request *http.Request, conn *ws.Conn) error {
+		if cert := ws.ClientCert(request); cert != nil {
 			greeting := "hello, " + cert.Subject.CommonName
-			_ = c.WriteMessage(ws.OpText, []byte(greeting))
+			_ = conn.WriteMessage(ws.OpText, []byte(greeting))
 		}
-		return echo(c)
+
+		return echo(conn)
 	}))
 
 	// Controlled close: one message, then 1001 "going away".
-	mux.Handle("/ws/goodbye", echoUp.Handle(func(r *http.Request, c *ws.Conn) error {
-		_ = c.WriteMessage(ws.OpText, []byte("hello"))
-		time.Sleep(50 * time.Millisecond)
-		_ = c.Close(ws.StatusGoingAway, "going away")
+	mux.Handle("/ws/goodbye", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+		_ = conn.WriteMessage(ws.OpText, []byte("hello"))
+		time.Sleep(goodbyeDelay)
+		_ = conn.Close(ws.StatusGoingAway, "going away")
+
 		return nil
 	}))
 
 	return mux
 }
 
-// TLSConfig builds the server's TLS configuration: server verification
+// certinfoHandler echoes the client certificate's common name, if the
+// request was presented with one.
+func certinfoHandler(writer http.ResponseWriter, request *http.Request) {
+	//nolint:gosec // demo: the cert CN is echoed back verbatim; the demo is
+	// not a production endpoint.
+	if cert := ws.ClientCert(request); cert != nil {
+		_, _ = writer.Write([]byte(cert.Subject.CommonName))
+
+		return
+	}
+	writer.WriteHeader(http.StatusForbidden)
+	_, _ = writer.Write([]byte("no client certificate"))
+}
+
+func rootHandler(writer http.ResponseWriter, request *http.Request) {
+	if request.URL.Path != "/" {
+		http.NotFound(writer, request)
+
+		return
+	}
+	writer.Header().Set("Content-Type", "text/html")
+	_, _ = writer.Write([]byte(page))
+}
+
+// bearerHandler returns the /ws/bearer self-upgrading handler: it runs
+// ordinary HTTP bearer-token auth before switching protocols.
+func bearerHandler(upgrader *ws.Upgrader) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if !validToken(request, token()) {
+			http.Error(writer, "unauthorized", http.StatusUnauthorized)
+
+			return
+		}
+		conn, err := upgrader.Upgrade(writer, request, ws.WithHandshakeData("bearer-user"))
+		if err != nil {
+			return // response already written
+		}
+		defer func() {
+			_ = conn.Close(ws.StatusNormalClosure, "")
+		}()
+		//nolint:gosec // demo logging: address comes from the peer's socket.
+		log.Printf("bearer session %d from %s", conn.ID(), conn.RemoteAddr())
+		echoErr := echo(conn)
+		if echoErr != nil {
+			//nolint:gosec // demo logging: error text is ours, not the peer's.
+			log.Printf("bearer session %d ended: %v", conn.ID(), echoErr)
+		}
+	}
+}
+
+// tlsConfig builds the server's TLS configuration: server verification
 // against the e2e CA and optional client-cert verification (the mTLS
 // gate itself is per-endpoint, via ws.WithRequireClientCert).
-func TLSConfig(certsDir string) *tls.Config {
+func tlsConfig(certsDir string) *tls.Config {
+	//nolint:gosec // certsDir is an operator-supplied flag, not peer input.
 	caPEM, err := os.ReadFile(certsDir + "/ca.pem")
 	if err != nil {
 		panic(fmt.Sprintf("read ca: %v (run go run ./cmd/certgen first)", err))
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
+
 	return &tls.Config{
 		ClientCAs:  pool,
 		ClientAuth: tls.VerifyClientCertIfGiven,
@@ -169,33 +209,38 @@ func TLSConfig(certsDir string) *tls.Config {
 }
 
 func token() string {
-	if t := os.Getenv("DEMO_TOKEN"); t != "" {
-		return t
+	if envToken := os.Getenv("DEMO_TOKEN"); envToken != "" {
+		return envToken
 	}
+
 	return "demo-secret"
 }
 
 // validToken accepts the bearer token in the Authorization header or, for
 // browser clients (which cannot set headers), the ?token= query parameter.
-func validToken(r *http.Request, token string) bool {
-	t, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+func validToken(request *http.Request, token string) bool {
+	tokenValue, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if !ok {
-		t = r.URL.Query().Get("token")
+		tokenValue = request.URL.Query().Get("token")
 	}
-	return t != "" && subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1
+
+	return tokenValue != "" && subtle.ConstantTimeCompare([]byte(tokenValue), []byte(token)) == 1
 }
 
-func echo(c *ws.Conn) error {
+// echo runs the read loop: every message is written back until the
+// connection closes (a 1000 close yields a nil error).
+func echo(conn *ws.Conn) error {
 	for {
-		op, data, err := c.ReadMessage()
+		opcode, data, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return fmt.Errorf("demo: read: %w", err)
 		}
-		if op == 0 {
+		if opcode == 0 {
 			return nil
 		}
-		if err := c.WriteMessage(op, data); err != nil {
-			return err
+		writeErr := conn.WriteMessage(opcode, data)
+		if writeErr != nil {
+			return fmt.Errorf("demo: write: %w", writeErr)
 		}
 	}
 }

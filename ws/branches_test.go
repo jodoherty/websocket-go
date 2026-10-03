@@ -138,8 +138,9 @@ func TestArmIdleDisabled(t *testing.T) {
 	defer sr.Close()
 	c := newConn(cr, cr, true, 1<<20, 0, 0)
 	c.lastActivity = time.Time{} // arbitrarily stale
-	if err := c.armIdle(); err != nil {
-		t.Fatalf("armIdle with idleTimeout 0: %v", err)
+	armErr := c.armIdle()
+	if armErr != nil {
+		t.Fatalf("armIdle with idleTimeout 0: %v", armErr)
 	}
 
 	// No deadline may be armed: a read of the silent pipe must still be
@@ -186,19 +187,22 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	})
 	t.Run("continuation without start", func(t *testing.T) {
 		c := newTestConn([]byte{0x80, 0x02, 'c', 'd'}, true)
-		if _, _, err := c.ReadMessage(); err == nil || !strings.Contains(err.Error(), "continuation frame without start") {
-			t.Fatalf("err = %v", err)
+		_, _, readErr := c.ReadMessage()
+		if readErr == nil || !strings.Contains(readErr.Error(), "continuation frame without start") {
+			t.Fatalf("err = %v", readErr)
 		}
 	})
 	t.Run("data frame mid-fragment", func(t *testing.T) {
 		c := newTestConn([]byte{0x01, 0x01, 'a', 0x81, 0x00}, true)
-		if _, _, err := c.ReadMessage(); err == nil || !strings.Contains(err.Error(), "in progress") {
-			t.Fatalf("err = %v", err)
+		_, _, readErr := c.ReadMessage()
+		if readErr == nil || !strings.Contains(readErr.Error(), "in progress") {
+			t.Fatalf("err = %v", readErr)
 		}
 	})
 	t.Run("unknown opcode", func(t *testing.T) {
 		c := newTestConn([]byte{0x83, 0x00}, true)
-		if _, _, err := c.ReadMessage(); err == nil || !strings.Contains(err.Error(), "unknown opcode") {
+		_, _, err := c.ReadMessage()
+		if err == nil || !strings.Contains(err.Error(), "unknown opcode") {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -212,7 +216,8 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	t.Run("fragment overflow", func(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x01, 0x02, 'a', 'b', 0x80, 0x02, 'c', 'd'}}
 		c := newConn(fc, fc, true, 3, 0, 0) // maxMsg 3 < 2+2 total
-		if _, _, err := c.ReadMessage(); err == nil || !errors.Is(err, errMessageTooBig) {
+		_, _, err := c.ReadMessage()
+		if err == nil || !errors.Is(err, errMessageTooBig) {
 			t.Fatalf("err = %v, want errMessageTooBig", err)
 		}
 	})
@@ -225,7 +230,7 @@ func TestWriteErrorPaths(t *testing.T) {
 	c := newConn(cr, cr, true, 1<<20, 0, 0)
 	// Closing the peer's end breaks our writes: a synchronous pipe fails
 	// in-flight writes once the other end goes away.
-	sr.Close()
+	_ = sr.Close() // intentional: break the peer's writes
 	select {
 	case <-time.After(2 * time.Second):
 		// A blocked write to a half-closed synchronous pipe can linger;
@@ -246,7 +251,8 @@ func TestWriteErrorPaths(t *testing.T) {
 	// The codec itself must surface a failing underlying writer.
 	fw := &failWriter{}
 	fc := frameCodec{bw: bufio.NewWriter(fw), isClient: false, maxMsg: 1 << 20}
-	if err := fc.writeFrame(OpText, []byte("x")); err == nil {
+	err := fc.writeFrame(OpText, []byte("x"))
+	if err == nil {
 		t.Fatal("writeFrame over a failing writer returned nil")
 	}
 }

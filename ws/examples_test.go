@@ -45,7 +45,7 @@ func Example() {
 	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(r *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
 		for {
 			op, data, err := c.ReadMessage()
 			if err != nil {
@@ -55,7 +55,8 @@ func Example() {
 				return nil
 			}
 			fmt.Println("server:", string(data))
-			if err := c.WriteMessage(op, data); err != nil {
+			err = c.WriteMessage(op, data)
+			if err != nil {
 				return err
 			}
 		}
@@ -69,7 +70,8 @@ func Example() {
 	}
 	defer c.Close(StatusNormalClosure, "")
 
-	if err := c.WriteMessage(OpText, []byte("hello")); err != nil {
+	err = c.WriteMessage(OpText, []byte("hello"))
+	if err != nil {
 		panic(err)
 	}
 	op, data, err := c.ReadMessage()
@@ -122,7 +124,8 @@ func ExampleUpgrader() {
 	}
 	defer c.Close(StatusNormalClosure, "")
 
-	if err := c.WriteMessage(OpText, []byte("hi")); err != nil {
+	err = c.WriteMessage(OpText, []byte("hi"))
+	if err != nil {
 		panic(err)
 	}
 	op, data, err := c.ReadMessage()
@@ -151,7 +154,7 @@ func ExampleDial() {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(r *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
 		op, data, err := c.ReadMessage()
 		if err != nil || op == 0 {
 			return err
@@ -168,7 +171,8 @@ func ExampleDial() {
 	}
 	defer c.Close(StatusNormalClosure, "")
 
-	if err := c.WriteMessage(OpText, []byte("hi")); err != nil {
+	err = c.WriteMessage(OpText, []byte("hi"))
+	if err != nil {
 		panic(err)
 	}
 	op, _, err := c.ReadMessage()
@@ -191,7 +195,7 @@ func ExampleCloseCode() {
 	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(r *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
 		_, _, _ = c.ReadMessage() // consume the client's message
 		return &CloseError{Code: StatusPolicyViolation, Reason: "token expired"}
 	}))
@@ -204,7 +208,8 @@ func ExampleCloseCode() {
 	}
 	defer c.Close(StatusNormalClosure, "")
 
-	if err := c.WriteMessage(OpText, []byte("hi")); err != nil {
+	err = c.WriteMessage(OpText, []byte("hi"))
+	if err != nil {
 		panic(err)
 	}
 	_, _, err = c.ReadMessage()

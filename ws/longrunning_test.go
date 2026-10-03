@@ -38,7 +38,7 @@ type deadlineConn struct {
 	closed     chan struct{} // closed when Close is called
 }
 
-func (d *deadlineConn) Read(p []byte) (int, error) { return 0, io.EOF }
+func (d *deadlineConn) Read(_ []byte) (int, error) { return 0, io.EOF }
 
 func (d *deadlineConn) Write(p []byte) (int, error) {
 	d.mu.Lock()
@@ -145,7 +145,7 @@ type immediateConn struct {
 	dl time.Time
 }
 
-func (i *immediateConn) Read(p []byte) (int, error)  { return 0, io.EOF }
+func (i *immediateConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
 func (i *immediateConn) Write(p []byte) (int, error) { return len(p), nil }
 func (i *immediateConn) Close() error                { return nil }
 func (i *immediateConn) LocalAddr() net.Addr         { return fakeAddr{} }
@@ -173,13 +173,16 @@ func TestWriteDeadlineClearedAfterSuccess(t *testing.T) {
 	nc := &immediateConn{}
 	c := newConn(nc, nc, true, 1<<20, 0, 50*time.Millisecond)
 
-	if err := c.WriteMessage(OpText, []byte("one")); err != nil {
+	err := c.WriteMessage(OpText, []byte("one"))
+	if err != nil {
 		t.Fatalf("first write: %v", err)
 	}
-	if dl := nc.lastDeadline(); !dl.IsZero() {
+	dl := nc.lastDeadline()
+	if !dl.IsZero() {
 		t.Fatalf("write deadline not cleared after a successful write: %v", dl)
 	}
-	if err := c.WriteMessage(OpText, []byte("two")); err != nil {
+	err = c.WriteMessage(OpText, []byte("two"))
+	if err != nil {
 		t.Fatalf("second write: %v", err)
 	}
 }
@@ -196,14 +199,12 @@ func TestClosedSignal(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 1000; j++ {
+	for range 8 {
+		wg.Go(func() {
+			for range 1000 {
 				_ = c.Closed()
 			}
-		}()
+		})
 	}
 	_ = c.Close(StatusNormalClosure, "")
 	wg.Wait()

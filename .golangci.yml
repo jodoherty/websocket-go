@@ -1,0 +1,88 @@
+version: "2"
+# Strictest standard lint configuration: every linter enabled, with a short,
+# documented list of exclusions for linters that conflict with deliberate
+# design or with idiomatic Go. Each exclusion below is a judgment call —
+# the comment says why.
+linters:
+  default: all
+  enable:
+    # gomodguard was deprecated in v2.12 in favor of the _v2 linter; enable
+    # the replacement so module-guarding is retained without the warning.
+    - gomodguard_v2
+  disable:
+    # Deprecated predecessor of gomodguard_v2 (pulled in by default: all).
+    - gomodguard
+    # Whitespace-cuddle rules. Not part of any mainstream strict config;
+    # gofmt remains the formatter, and "fixing" cuddles would insert blank
+    # lines that hurt readability more than the violations annoy.
+    - wsl
+    - wsl_v5
+    # Forces every struct literal to set all fields, including explicit zero
+    # values. Pure noise for option-heavy structs (tls.Config, net.Dialer,
+    # Config, Conn), and anti-clarity: a reader cannot tell the meaningful
+    # fields from the spelled-out zeros.
+    - exhaustruct
+    - exhaustruct_v5
+    # Wants all unexported methods after all exported ones. Conflicts with
+    # this file's deliberate section structure, which groups each method
+    # with the behavior it belongs to (e.g. peerClose in the reading
+    # section, writeFrame in the writing section).
+    - funcorder
+  settings:
+    depguard:
+      rules:
+        all:
+          files: ["**"]
+          allow:
+            - $gostd
+            - github.com/jodoherty/websocket
+    wrapcheck:
+      # net.Conn deadline setters are transport pass-throughs; wrapping
+      # their errors adds noise without context.
+      ignore-interface-regexps:
+        - "^net\\.Conn$"
+      extra-ignore-sigs:
+        - fmt.Errorf(
+        - SetReadDeadline
+        - SetWriteDeadline
+        - SetDeadline
+    cyclop:
+      # After the helper extractions, the two remaining functions over the
+      # default threshold (ReadMessage, Dial) are the protocol entry points:
+      # every remaining branch is a required protocol behavior, and further
+      # splitting would add indirection without clarity.
+      max-complexity: 15
+  exclusions:
+    generated: lax
+    rules:
+      # Test scaffolding, not the drop-in artifact: short names, table-driven
+      # test breadth, and stateful tests (shared ports, synctest) make a
+      # blanket-enable-all run there noise. The implementation file carries
+      # the strict set.
+      - linters:
+          - cyclop
+          - funlen
+          - gocognit
+          - mnd
+          - nlreturn
+          - nonamedreturns
+          - paralleltest # tests share global state (ports, synctest); blind t.Parallel() is unsafe
+          - prealloc
+          - testpackage # internal tests are deliberate: the frame codec is unexported
+          - varnamelen
+          - wrapcheck
+        path: _test\.go
+      - linters:
+          - errcheck # teardown Close() calls are best-effort; a test failure is
+            # surfaced by the test itself, not by a discarded close error
+          - noctx # tests have no cancellation scope to thread; they run under
+            # context.Background() by construction
+          - err113 # test sentinel errors are fixtures for assertions, not
+            # production error values to match
+          - goconst # table-driven test literals are data, not code
+          - unparam # test helpers keep symmetric signatures for readability
+        path: _test\.go
+formatters:
+  enable:
+    - gofmt
+    - goimports

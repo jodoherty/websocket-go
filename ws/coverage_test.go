@@ -29,15 +29,18 @@ import (
 // TestErrorStrings pins the error formats (stable, grep-able in logs).
 func TestErrorStrings(t *testing.T) {
 	ce := &ws.CloseError{Code: 1001, Reason: "going away"}
-	if got := ce.Error(); got != `ws: closed with code 1001 "going away"` {
+	got := ce.Error()
+	if got != `ws: closed with code 1001 "going away"` {
 		t.Fatalf("CloseError.Error() = %q", got)
 	}
-	if code, reason, ok := ws.CloseCode(ce); !ok || code != 1001 || reason != "going away" {
+	code, reason, ok := ws.CloseCode(ce)
+	if !ok || code != 1001 || reason != "going away" {
 		t.Fatalf("CloseCode = (%d, %q, %v)", code, reason, ok)
 	}
 
 	ue := ws.UpgradeError{Status: http.StatusForbidden, Msg: "no client cert"}
-	if got := ue.Error(); got != "ws: upgrade rejected: no client cert (HTTP 403)" {
+	got = ue.Error()
+	if got != "ws: upgrade rejected: no client cert (HTTP 403)" {
 		t.Fatalf("UpgradeError.Error() = %q", got)
 	}
 }
@@ -61,16 +64,20 @@ func TestConnAccessorsAndDeadlines(t *testing.T) {
 
 	// SetReadDeadline/SetWriteDeadline must pass through to the transport
 	// without error, including while the connection is in use.
-	if err := c.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+	err := c.SetReadDeadline(time.Now().Add(time.Hour))
+	if err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
-	if err := c.SetReadDeadline(time.Time{}); err != nil { // clear
+	err = c.SetReadDeadline(time.Time{}) // clear
+	if err != nil {
 		t.Fatalf("clearing SetReadDeadline: %v", err)
 	}
-	if err := c.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+	err = c.SetWriteDeadline(time.Now().Add(time.Hour))
+	if err != nil {
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
-	if err := c.SetWriteDeadline(time.Time{}); err != nil { // clear
+	err = c.SetWriteDeadline(time.Time{}) // clear
+	if err != nil {
 		t.Fatalf("clearing SetWriteDeadline: %v", err)
 	}
 }
@@ -84,18 +91,21 @@ func TestClientCert(t *testing.T) {
 	}
 	withCert := httptest.NewRequest(http.MethodGet, "/ws", nil)
 	withCert.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
-	if got := ws.ClientCert(withCert); got != cert {
+	got := ws.ClientCert(withCert)
+	if got != cert {
 		t.Fatalf("ClientCert with cert = %v, want the cert", got)
 	}
 
 	noCert := httptest.NewRequest(http.MethodGet, "/ws", nil)
 	noCert.TLS = &tls.ConnectionState{}
-	if got := ws.ClientCert(noCert); got != nil {
+	got = ws.ClientCert(noCert)
+	if got != nil {
 		t.Fatalf("ClientCert without cert = %v, want nil", got)
 	}
 
 	plain := httptest.NewRequest(http.MethodGet, "/ws", nil)
-	if got := ws.ClientCert(plain); got != nil {
+	got = ws.ClientCert(plain)
+	if got != nil {
 		t.Fatalf("ClientCert without TLS = %v, want nil", got)
 	}
 }
@@ -126,7 +136,7 @@ func selfSignedCert(cn string) (*x509.Certificate, error) {
 func TestOptionEffects(t *testing.T) {
 	cfg := &ws.Config{}
 
-	ws.WithCheckOrigin(func(r *http.Request) bool { return true })(cfg)
+	ws.WithCheckOrigin(func(_ *http.Request) bool { return true })(cfg)
 	if cfg.CheckOrigin == nil || !cfg.CheckOrigin(nil) {
 		t.Error("WithCheckOrigin not applied")
 	}
@@ -154,17 +164,19 @@ func TestOptionEffects(t *testing.T) {
 	if len(cfg.PreHandshake) != 1 {
 		t.Fatalf("WithPreHandshake: %d hooks", len(cfg.PreHandshake))
 	}
-	if err := cfg.PreHandshake[0](nil); err != nil || !called {
+	err := cfg.PreHandshake[0](nil)
+	if err != nil || !called {
 		t.Error("PreHandshake hook not the one registered")
 	}
 
 	// Client-only options: no observable Config field, but each body must
 	// run; a broken closure would panic here or at Dial time.
 	ws.WithHeader("Authorization", "Bearer x")(cfg)
-	if got := cfg.Headers.Get("Authorization"); got != "Bearer x" {
+	got := cfg.Headers.Get("Authorization")
+	if got != "Bearer x" {
 		t.Errorf("WithHeader = %q", got)
 	}
-	ws.WithTLS(&tls.Config{InsecureSkipVerify: true})(cfg)
+	ws.WithTLS(&tls.Config{InsecureSkipVerify: true})(cfg) //nolint:gosec // test: no real server to verify
 	cert, err := selfSignedCert("client")
 	if err != nil {
 		t.Fatal(err)
@@ -179,8 +191,9 @@ func TestOptionEffects(t *testing.T) {
 // matching Origin header — which is exactly what a browser would do.
 func TestPackageHandle(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("/pkg", ws.Handle(func(r *http.Request, c *ws.Conn) error {
-		if err := c.WriteMessage(ws.OpText, []byte("from ws.Handle")); err != nil {
+	mux.Handle("/pkg", ws.Handle(func(_ *http.Request, c *ws.Conn) error {
+		err := c.WriteMessage(ws.OpText, []byte("from ws.Handle"))
+		if err != nil {
 			return err
 		}
 		return c.Close(ws.StatusNormalClosure, "")
@@ -197,7 +210,8 @@ func TestPackageHandle(t *testing.T) {
 		t.Fatalf("ReadMessage = (%d, %q, %v)", op, data, err)
 	}
 	// The handler closed normally; the next read reports the clean close.
-	if op, _, err := c.ReadMessage(); op != 0 || err != nil {
+	op, _, err = c.ReadMessage()
+	if op != 0 || err != nil {
 		t.Fatalf("after close: op=%d err=%v, want (0, nil)", op, err)
 	}
 }
@@ -230,13 +244,14 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	// requires a real hijackable connection — a ResponseRecorder cannot.
 	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(hook))
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *ws.Conn) error {
 		return c.Close(ws.StatusNormalClosure, "")
 	}))
 	s := httptest.NewServer(mux)
 	defer s.Close()
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/ws")
-	if op, _, err := c.ReadMessage(); op != 0 || err != nil {
+	op, _, err := c.ReadMessage()
+	if op != 0 || err != nil {
 		t.Fatalf("pre-handshake pass: ReadMessage = (%d, %v), want clean close", op, err)
 	}
 
@@ -301,7 +316,7 @@ func TestUpgradeRejectBranches(t *testing.T) {
 func TestHandleCloseErrorBranch(t *testing.T) {
 	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
 	mux := http.NewServeMux()
-	mux.Handle("/custom", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/custom", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
 		return &ws.CloseError{Code: 4001, Reason: "policy"}
 	}))
 	s := httptest.NewServer(mux)
@@ -337,13 +352,14 @@ func TestOriginCheckOnTLS(t *testing.T) {
 	}
 
 	// Wrong scheme (http origin against a TLS request) → 403.
-	if _, err := ws.NewUpgrader().Upgrade(httptest.NewRecorder(), mk("http://example.com")); err == nil {
+	_, err := ws.NewUpgrader().Upgrade(httptest.NewRecorder(), mk("http://example.com"))
+	if err == nil {
 		t.Fatal("http origin on a TLS request accepted")
 	}
 
 	// Correct https origin → origin check passes, so the failure (if any)
 	// is the later, un-hijackable response writer, not the origin.
-	_, err := ws.NewUpgrader().Upgrade(httptest.NewRecorder(), mk("https://example.com"))
+	_, err = ws.NewUpgrader().Upgrade(httptest.NewRecorder(), mk("https://example.com"))
 	if err == nil || strings.Contains(err.Error(), "origin not allowed") {
 		t.Fatalf("https origin on a TLS request: %v", err)
 	}
@@ -351,12 +367,14 @@ func TestOriginCheckOnTLS(t *testing.T) {
 
 // TestSmallGaps: CloseCode on a code-less error, and Dial's scheme check.
 func TestSmallGaps(t *testing.T) {
-	if _, _, ok := ws.CloseCode(errors.New("plain")); ok {
+	_, _, ok := ws.CloseCode(errors.New("plain"))
+	if ok {
 		t.Fatal("CloseCode reported a code on a plain error")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if _, err := ws.Dial(ctx, "http://example.com/ws"); err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
+	_, err := ws.Dial(ctx, "http://example.com/ws")
+	if err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
 		t.Fatalf("Dial with http scheme: %v, want unsupported scheme", err)
 	}
 
@@ -374,7 +392,8 @@ func TestSmallGaps(t *testing.T) {
 func TestDialCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := ws.Dial(ctx, "ws://127.0.0.1:1/ws"); !errors.Is(err, context.Canceled) {
+	_, err := ws.Dial(ctx, "ws://127.0.0.1:1/ws")
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Dial with canceled context: %v, want context.Canceled", err)
 	}
 }
@@ -388,7 +407,7 @@ func TestDialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := l.Addr().String()
-	l.Close()
+	_ = l.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

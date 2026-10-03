@@ -24,7 +24,8 @@ func echo(c *ws.Conn) error {
 		if op == 0 { // clean close
 			return nil
 		}
-		if err := c.WriteMessage(op, data); err != nil {
+		err = c.WriteMessage(op, data)
+		if err != nil {
 			return err
 		}
 	}
@@ -39,21 +40,21 @@ func startServer(t *testing.T) *httptest.Server {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/echo", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/echo", up.Handle(func(_ *http.Request, c *ws.Conn) error {
 		return echo(c)
 	}))
-	mux.Handle("/bye", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/bye", up.Handle(func(_ *http.Request, c *ws.Conn) error {
 		_ = c.WriteMessage(ws.OpText, []byte("farewell"))
 		_ = c.Close(ws.StatusGoingAway, "later")
 		return nil
 	}))
-	mux.Handle("/data", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/data", up.Handle(func(_ *http.Request, c *ws.Conn) error {
 		if c.HandshakeData() != "principal" {
 			return errors.New("handshake data missing")
 		}
 		return echo(c)
 	}))
-	mux.Handle("/strict", ws.NewUpgrader().Handle(func(r *http.Request, c *ws.Conn) error { // default origin policy
+	mux.Handle("/strict", ws.NewUpgrader().Handle(func(_ *http.Request, c *ws.Conn) error { // default origin policy
 		return echo(c)
 	}))
 	mux.Handle("/auth", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -67,11 +68,12 @@ func startServer(t *testing.T) *httptest.Server {
 			return
 		}
 		defer c.Close(ws.StatusNormalClosure, "")
-		if err := echo(c); err != nil {
+		err = echo(c)
+		if err != nil {
 			t.Logf("auth echo ended: %v", err)
 		}
 	}))
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	return httptest.NewServer(mux)
@@ -92,11 +94,13 @@ func TestEchoTextAndBinary(t *testing.T) {
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo", ws.WithSubprotocols("binary"))
 	defer c.Close(ws.StatusNormalClosure, "")
-	if got := c.Subprotocol(); got != "binary" {
+	got := c.Subprotocol()
+	if got != "binary" {
 		t.Fatalf("negotiated subprotocol = %q, want %q", got, "binary")
 	}
 
-	if err := c.WriteMessage(ws.OpText, []byte("hello")); err != nil {
+	err := c.WriteMessage(ws.OpText, []byte("hello"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	op, data, err := c.ReadMessage()
@@ -105,7 +109,8 @@ func TestEchoTextAndBinary(t *testing.T) {
 	}
 
 	bin := []byte{0x00, 0x01, 0xfe, 0xff, 0x7f}
-	if err := c.WriteMessage(ws.OpBinary, bin); err != nil {
+	err = c.WriteMessage(ws.OpBinary, bin)
+	if err != nil {
 		t.Fatal(err)
 	}
 	op, data, err = c.ReadMessage()
@@ -125,7 +130,8 @@ func TestLargeMessage(t *testing.T) {
 	for i := range big {
 		big[i] = byte(i * 7)
 	}
-	if err := c.WriteMessage(ws.OpBinary, big); err != nil {
+	err := c.WriteMessage(ws.OpBinary, big)
+	if err != nil {
 		t.Fatal(err)
 	}
 	_, data, err := c.ReadMessage()
@@ -141,10 +147,11 @@ func TestServerInitiatedClose(t *testing.T) {
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/bye")
 	defer c.Close(ws.StatusNormalClosure, "")
 
-	if _, data, err := c.ReadMessage(); err != nil || string(data) != "farewell" {
+	_, data, err := c.ReadMessage()
+	if err != nil || string(data) != "farewell" {
 		t.Fatalf("got (%q, %v), want (farewell, nil)", data, err)
 	}
-	_, _, err := c.ReadMessage()
+	_, _, err = c.ReadMessage()
 	code, reason, ok := ws.CloseCode(err)
 	if !ok || code != ws.StatusGoingAway || reason != "later" {
 		t.Fatalf("close = (code=%d reason=%q ok=%v err=%v), want 1001/later", code, reason, ok, err)
@@ -157,7 +164,8 @@ func TestCleanCloseIsNil(t *testing.T) {
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo")
 	_ = c.Close(ws.StatusNormalClosure, "done")
-	if _, _, err := c.ReadMessage(); err != nil {
+	_, _, err := c.ReadMessage()
+	if err != nil {
 		t.Fatalf("clean close should yield nil error, got %v", err)
 	}
 }
@@ -168,10 +176,12 @@ func TestHandshakeData(t *testing.T) {
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/data")
 	defer c.Close(ws.StatusNormalClosure, "")
-	if err := c.WriteMessage(ws.OpText, []byte("x")); err != nil {
+	err := c.WriteMessage(ws.OpText, []byte("x"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.ReadMessage(); err != nil {
+	_, _, err = c.ReadMessage()
+	if err != nil {
 		t.Fatalf("data handler failed: %v", err)
 	}
 }
@@ -181,17 +191,20 @@ func TestOriginEnforced(t *testing.T) {
 	defer s.Close()
 
 	// No Origin at all: default policy rejects.
-	if _, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict"); err == nil {
+	_, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict")
+	if err == nil {
 		t.Fatal("dial without Origin succeeded, want 403 rejection")
 	}
 	// Wrong origin.
-	if _, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict",
-		ws.WithHeader("Origin", "https://evil.example")); err == nil {
+	_, err = ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict",
+		ws.WithHeader("Origin", "https://evil.example"))
+	if err == nil {
 		t.Fatal("dial with foreign Origin succeeded, want 403 rejection")
 	}
 	// Correct same-origin (httptest is plain http).
-	if _, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict",
-		ws.WithHeader("Origin", s.URL)); err != nil {
+	_, err = ws.Dial(context.Background(), "ws"+strings.TrimPrefix(s.URL, "http")+"/strict",
+		ws.WithHeader("Origin", s.URL))
+	if err != nil {
 		t.Fatalf("dial with matching Origin failed: %v", err)
 	}
 }
@@ -206,7 +219,7 @@ func TestAuthBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -217,7 +230,7 @@ func TestAuthBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
 	}
@@ -227,10 +240,12 @@ func TestAuthBearer(t *testing.T) {
 		t.Fatalf("dial with bearer: %v", err)
 	}
 	defer c.Close(ws.StatusNormalClosure, "")
-	if err := c.WriteMessage(ws.OpText, []byte("hi")); err != nil {
+	err = c.WriteMessage(ws.OpText, []byte("hi"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := c.ReadMessage(); err != nil {
+	_, _, err = c.ReadMessage()
+	if err != nil {
 		t.Fatal(err)
 	}
 }
@@ -244,7 +259,7 @@ func TestUpgradeRequiredHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		t.Fatal("plain GET upgraded, want rejection")
 	}
@@ -263,7 +278,7 @@ func TestKeepaliveDetectsDeadPeer(t *testing.T) {
 		ws.WithIdleTimeout(300*time.Millisecond),
 	)
 	mux := http.NewServeMux()
-	mux.Handle("/quiet", up.Handle(func(r *http.Request, c *ws.Conn) error {
+	mux.Handle("/quiet", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
 		time.Sleep(30 * time.Second) // never read, never write
 		return nil
 	}))

@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -35,10 +36,9 @@ const (
 	healthURL = "http://127.0.0.1:18444/health"
 )
 
-var demoCmd *exec.Cmd
-
 func TestMain(m *testing.M) {
-	if err := setup(); err != nil {
+	demoCmd, err := setup()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "e2e setup failed:", err)
 		os.Exit(1)
 	}
@@ -50,42 +50,48 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func setup() error {
+func setup() (*exec.Cmd, error) {
 	root, err := filepath.Abs("..")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := run(root, "run", "./cmd/certgen", "-dir", filepath.Join(root, "e2e/certs")); err != nil {
-		return fmt.Errorf("certgen: %w", err)
+	certgenErr := run(root, "run", "./cmd/certgen", "-dir", filepath.Join(root, "e2e/certs"))
+	if certgenErr != nil {
+		return nil, fmt.Errorf("certgen: %w", certgenErr)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "e2e/.bin"), 0o755); err != nil {
-		return err
+	mkdirErr := os.MkdirAll(filepath.Join(root, "e2e/.bin"), 0o750)
+	if mkdirErr != nil {
+		return nil, mkdirErr
 	}
-	if err := run(root, "build", "-o", filepath.Join(root, "e2e/.bin/demo.e2e"), "./cmd/demo"); err != nil {
-		return fmt.Errorf("build demo: %w", err)
+	buildErr := run(root, "build", "-o", filepath.Join(root, "e2e/.bin/demo.e2e"), "./cmd/demo")
+	if buildErr != nil {
+		return nil, fmt.Errorf("build demo: %w", buildErr)
 	}
-	demoCmd = exec.Command(filepath.Join(root, "e2e/.bin/demo.e2e"),
+	//nolint:gosec // the binary path is built from the repo root, not peer input.
+	demoCmd := exec.Command(filepath.Join(root, "e2e/.bin/demo.e2e"),
 		"-addr", wsAddr, "-certs", filepath.Join(root, "e2e/certs"), "-health-addr", "127.0.0.1:18444")
 	demoCmd.Stdout = os.Stderr
 	demoCmd.Stderr = os.Stderr
-	if err := demoCmd.Start(); err != nil {
-		return err
+	startErr := demoCmd.Start()
+	if startErr != nil {
+		return nil, startErr
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(healthURL)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return nil
+				return demoCmd, nil
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("demo server did not become ready")
+	return nil, errors.New("demo server did not become ready")
 }
 
 func run(dir string, args ...string) error {
+	//nolint:gosec // "go" is a fixed binary; args are literal test commands.
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stderr
@@ -115,6 +121,7 @@ func tlsConfigWithClientCert(t *testing.T, root string) *tls.Config {
 
 func read(t *testing.T, path string) []byte {
 	t.Helper()
+	//nolint:gosec // paths are literal e2e/certs locations, not peer input.
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -141,8 +148,9 @@ func TestMTLSClientCertOpensSession(t *testing.T) {
 	}
 
 	// And the session behaves like any other websocket session.
-	if err := c.WriteMessage(ws.OpBinary, []byte("through the gate")); err != nil {
-		t.Fatal(err)
+	writeErr := c.WriteMessage(ws.OpBinary, []byte("through the gate"))
+	if writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	op, data, err = c.ReadMessage()
 	if err != nil || op != ws.OpBinary || string(data) != "through the gate" {
@@ -192,8 +200,9 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start node server: %v", err)
+	startErr := cmd.Start()
+	if startErr != nil {
+		t.Fatalf("start node server: %v", startErr)
 	}
 	defer func() {
 		_ = cmd.Process.Kill()
@@ -210,13 +219,14 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	if !scanner.Scan() || scanner.Text() != "ready" {
 		t.Fatalf("node server did not report ready (stderr: %s)", serverOut.String())
 	}
-	for i := 0; ; i++ {
+	const maxAttempts = 50
+	for attempt := 0; ; attempt++ {
 		nc, err := net.DialTimeout("tcp", nodeAddr, time.Second)
 		if err == nil {
-			nc.Close()
+			_ = nc.Close()
 			break
 		}
-		if i == 50 {
+		if attempt == maxAttempts {
 			t.Fatalf("node server port never became reachable: %v (stderr: %s)", err, serverOut.String())
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -231,16 +241,18 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	defer c.Close(ws.StatusNormalClosure, "")
 
 	// Text and binary round-trips through the Node server.
-	if err := c.WriteMessage(ws.OpText, []byte("hello from go")); err != nil {
-		t.Fatal(err)
+	writeErr := c.WriteMessage(ws.OpText, []byte("hello from go"))
+	if writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	op, data, err := c.ReadMessage()
 	if err != nil || op != ws.OpText || string(data) != "hello from go" {
 		t.Fatalf("text echo via node = (%d, %q, %v)", op, data, err)
 	}
 	bin := []byte{0x00, 0x01, 0xfe, 0xff}
-	if err := c.WriteMessage(ws.OpBinary, bin); err != nil {
-		t.Fatal(err)
+	writeErr = c.WriteMessage(ws.OpBinary, bin)
+	if writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	op, data, err = c.ReadMessage()
 	if err != nil || op != ws.OpBinary || string(data) != string(bin) {
@@ -248,8 +260,9 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	}
 
 	// Node closes with a custom code; the Go client must report it.
-	if err := c.WriteMessage(ws.OpText, []byte("close-me")); err != nil {
-		t.Fatal(err)
+	writeErr = c.WriteMessage(ws.OpText, []byte("close-me"))
+	if writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	_, _, err = c.ReadMessage()
 	code, reason, ok := ws.CloseCode(err)

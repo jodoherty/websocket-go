@@ -154,15 +154,18 @@ func TestKeepaliveProbesThenKillsDeadPeer(t *testing.T) {
 
 		synctest.Sleep(idle - 100*time.Millisecond) // t = idle-100ms
 		synctest.Wait()
-		if n := nc.pingCount(); n != 0 {
+		n := nc.pingCount()
+		if n != 0 {
 			t.Fatalf("%d pings before the idle window elapsed, want 0", n)
 		}
 		synctest.Sleep(100 * time.Millisecond) // t = idle
 		synctest.Wait()                        // the reader has probed (ping #1) and re-blocked at 2*idle
-		if n := nc.pingCount(); n != 1 {
+		n = nc.pingCount()
+		if n != 1 {
 			t.Fatalf("%d pings at the idle boundary, want 1", n)
 		}
-		if at := nc.pingTimes()[0]; !at.Equal(probeAt) {
+		at := nc.pingTimes()[0]
+		if !at.Equal(probeAt) {
 			t.Fatalf("probe ping at %v, want exactly %v", at, probeAt)
 		}
 		synctest.Sleep(idle) // t = 2*idle: the grace window expires
@@ -184,7 +187,8 @@ func TestKeepaliveAlivePeerSurvives(t *testing.T) {
 
 		synctest.Sleep(idle) // t = idle: probe #1
 		synctest.Wait()      // the reader has probed and re-blocked at 2*idle
-		if n := nc.pingCount(); n != 1 {
+		n := nc.pingCount()
+		if n != 1 {
 			t.Fatalf("%d pings at the idle boundary, want 1", n)
 		}
 		nc.push([]byte{0x8a, 0x00}) // the peer answers the probe
@@ -195,7 +199,8 @@ func TestKeepaliveAlivePeerSurvives(t *testing.T) {
 		// dead peer would be killed.
 		synctest.Sleep(idle) // t = 2*idle: probe #2
 		synctest.Wait()
-		if n := nc.pingCount(); n != 2 {
+		n = nc.pingCount()
+		if n != 2 {
 			t.Fatalf("%d pings by t=2*idle, want 2 (a dead peer would be killed, not probed)", n)
 		}
 		nc.push([]byte{0x8a, 0x00}) // the peer answers again
@@ -231,7 +236,8 @@ func TestKeepaliveActivityResetsClock(t *testing.T) {
 		synctest.Wait()
 		// Without the reset, the first probe would fire at t=idle; with it,
 		// the clock restarted at 0.5*idle, so no ping yet.
-		if n := nc.pingCount(); n != 0 {
+		n := nc.pingCount()
+		if n != 0 {
 			t.Fatalf("%d pings at t=idle after activity reset, want 0", n)
 		}
 		select {

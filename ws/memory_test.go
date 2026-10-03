@@ -19,7 +19,8 @@ func encodeFrameForBudget(t *testing.T, isClient bool, payload []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	fc := frameCodec{bw: bufio.NewWriter(&buf), isClient: isClient, maxMsg: 1 << 20}
-	if err := fc.writeFrame(OpText, payload); err != nil {
+	err := fc.writeFrame(OpText, payload)
+	if err != nil {
 		t.Fatalf("encodeFrameForBudget: %v", err)
 	}
 	return buf.Bytes()
@@ -39,11 +40,13 @@ func TestWriteFrameAllocationBudget(t *testing.T) {
 			fc := frameCodec{bw: bufio.NewWriter(&buf), isClient: isClient, maxMsg: 1 << 20}
 			// Warm up so the masked-write scratch is already sized; the
 			// budget is the steady-state per-frame cost.
-			if err := fc.writeFrame(OpText, payload); err != nil {
+			err := fc.writeFrame(OpText, payload)
+			if err != nil {
 				t.Fatal(err)
 			}
 			if n := testing.AllocsPerRun(100, func() {
-				if err := fc.writeFrame(OpText, payload); err != nil {
+				err := fc.writeFrame(OpText, payload)
+				if err != nil {
 					t.Fatal(err)
 				}
 			}); n != 0 {
