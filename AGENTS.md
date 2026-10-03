@@ -2,6 +2,20 @@
 
 Instructions for AI coding agents (and humans) working in this repository.
 
+## README.md is owner-maintained
+
+`README.md` is reserved for the project owner's hand-written editing. Do
+not create, edit, or reformat it — not for "improvements", not for sync
+with the code, not ever. User-facing documentation lives in `doc/`
+instead; when the README's former content changes, update the `doc/`
+files, never the README:
+
+- `doc/USAGE.md` — design, API, running the gates and the demo, the
+  VNC-shaped example
+- `doc/CONFIDENCE.md` — the layers of test evidence and the
+  security-relevant invariants
+- `doc/LINTING.md` — the lint gate, its exclusions, and why each exists
+
 ## The drop-in invariant (most important)
 
 This library is a **single implementation file** — `ws/ws.go` — with
@@ -98,7 +112,8 @@ exclusion list; each exclusion carries a "why". Do not:
 
 The test-file exclusions in `.golangci.yml` are intentionally broad
 (short names, table breadth, shared state); keep the implementation file
-at the strict set.
+at the strict set. The full rationale, including the whole-repo linter
+disables and their why-each, is in `doc/LINTING.md`.
 
 ## RFC 6455 conformance
 
@@ -110,6 +125,63 @@ at the strict set.
   handshake headers, request bodies on the GET) terminate the connection
   or the handshake with the RFC-mandated status/code. Invalid close
   codes are failed with 1002 and never echoed back.
+
+## Repo layout
+
+```
+ws/ws.go            the entire library in one file — copy it into an
+                    existing project (package ws, stdlib only). Organized
+                    in 10 numbered sections, dependency-ordered, with a
+                    file map in the package doc.
+ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
+                    origin policy, bearer auth, upgrade validation
+ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)
+ws/fuzz_test.go     FuzzReadFrame — codec safety fuzz target
+ws/keepalive_test.go keepalive probe state machine + timeout classification
+ws/keepalive_synctest_test.go keepalive read loop on a fake clock
+                    (testing/synctest): exact probe/kill/refresh timelines,
+                    plus the stalled-write bounded-write regression
+ws/longrunning_test.go write-deadline wedge regression + Closed() signal
+ws/concurrency_test.go close state machine under concurrent stress (-race)
+ws/bench_test.go    codec + round-trip benchmarks
+ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
+ws/branches_test.go error-branch coverage: malformed frames, control/fragment
+                    paths, armIdle ping, write failure paths
+ws/branchgaps_test.go pins the individually hard-to-reach error branches
+                    (write validation, close-code range, truncated 64-bit
+                    length, 3-frame fragment chains, keepalive write paths)
+ws/coverage_test.go closes out accessors, option functions, and rejection
+                    branches the other suites don't touch (Dial handshake
+                    failures, reserved headers, the upgrade guards)
+ws/mcdc_test.go     MC/DC test matrix: one subtest per required
+                    independence pair, asserting the observable outcome
+                    only that decision flip produces
+ws/examples_test.go executable documentation: Example functions, compiled
+                    and run on every go test with pinned output; also
+                    integration tests of Handle, Upgrade, Dial, CloseCode
+cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
+cmd/certgen/    generates the throwaway CA / server / client certificates
+cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
+                count-mode coverage profile (the stdlib has no branch mode)
+cmd/mcdc/       MC/DC audit: enumerates every compound decision, computes
+                the required independence pairs from the boolean structure,
+                and verifies each is traced to an existing test subtest
+doc/USAGE.md      user-facing guide: design, API, running, VNC example
+doc/CONFIDENCE.md the layers of test evidence and security invariants
+doc/LINTING.md    the lint gate and its documented exclusions
+doc/rfc6455.txt   the RFC 6455 reference
+e2e/            e2e suites:
+                ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
+                                 binary, bearer accept/reject, mTLS rejection, close codes
+                e2e_test.go      Go: mTLS positive path, and cross-implementation
+                                 interop both directions (Node ws client -> Go server,
+                                 Go client -> Node ws server)
+                interop-node-{client,server}.mjs
+.golangci.yml   strictest standard lint config: default: all, documented exclusions
+Makefile        the repeatable gate: make lint / staticcheck / all / e2e / fuzz
+.github/workflows/ci.yml runs the gate on every push: lint, staticcheck, race tests,
+                    fuzz, statement + branch coverage, MC/DC audit, browser e2e
+```
 
 ## Workflow
 
