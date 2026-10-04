@@ -307,7 +307,8 @@ var (
 	// match the base.
 	errBadExtension = errors.New("ws: invalid permessage-deflate parameter")
 	// errCompressTail marks an internal invariant breach in the compressor:
-	// the flushed stream did not end with the expected empty-block octets.
+	// the flushed stream did not end with the expected empty-block octets,
+	// or was shorter than the tail itself.
 	errCompressTail = errors.New("ws: internal error: unexpected flate stream tail")
 	// errNoResetter marks an internal invariant breach: the stdlib decompressor
 	// no longer supports Reset, so per-message reuse is impossible.
@@ -706,25 +707,44 @@ func (c *Conn) compress(data []byte) error {
 	}
 	// The RFC wire payload is the flushed stream minus its final four octets
 	// (the empty block's length and its complement). Flush guarantees those
-	// four are present; guard against an unexpected encoder change.
-	b := c.compressBuf.Bytes()
-	if !bytes.Equal(b[len(b)-truncateOctets:], deflateTailBytes[:truncateOctets]) {
-		return fmt.Errorf("%w: % x", errCompressTail, b[len(b)-truncateOctets:])
+	// four are present; compressTailCheck guards against an unexpected
+	// encoder change without panicking on an undersized stream.
+	out, tailErr := compressTailCheck(c.compressBuf.Bytes())
+	if tailErr != nil {
+		return tailErr
 	}
-	c.compressBuf.Truncate(len(b) - truncateOctets)
+	c.compressBuf.Truncate(len(out))
 
 	return nil
+}
+
+// compressTailCheck validates the tail of a flushed flate stream and returns
+// the stream minus its final four octets. A stream shorter than the tail, or
+// one that does not end with the empty stored block's length and complement
+// (RFC 7692 §7.2.1), is an internal invariant breach (errCompressTail): the
+// standard library encoder changed in an unexpected way. Both branches are
+// length-guarded, so a mismatched encoder is reported as an error, never an
+// index panic.
+func compressTailCheck(stream []byte) ([]byte, error) {
+	if len(stream) < truncateOctets {
+		return nil, fmt.Errorf("%w: stream of %d bytes is shorter than the %d-byte empty block tail",
+			errCompressTail, len(stream), truncateOctets)
+	}
+	if !bytes.Equal(stream[len(stream)-truncateOctets:], deflateTailBytes[:truncateOctets]) {
+		return nil, fmt.Errorf("%w: % x", errCompressTail, stream[len(stream)-truncateOctets:])
+	}
+
+	return stream[:len(stream)-truncateOctets], nil
 }
 
 // decompress expands a compressed message payload. The received data is a
 // truncated raw DEFLATE stream; appending deflateTailBytes completes the
 // trailing empty block the compressor cut off and adds a BFINAL terminator
 // so Go's strict decoder ends cleanly instead of reporting "unexpected EOF"
-// (see that variable's comment). The result must be
-// at least one byte (a message whose payload compresses to nothing is
-// invalid), and at most maxMessageSize — the bound is enforced while
-// decompressing so a high-ratio payload cannot inflate unboundedly before
-// being rejected. The returned slice is fresh: the caller owns it and may
+// (see that variable's comment). An empty compressed payload is legal and
+// decompresses to an empty message. The result is at most maxMessageSize —
+// the bound is enforced while decompressing so a high-ratio payload cannot
+// inflate unboundedly before being rejected. The returned slice is fresh: the caller owns it and may
 // retain it, while every decompressor buffer is per-connection scratch reused
 // on the next message — one heap allocation per compressed message.
 func (c *Conn) decompress(src []byte) ([]byte, error) {

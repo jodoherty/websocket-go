@@ -1,5 +1,6 @@
 // Cross-implementation interop: Node's `ws` library as the SERVER, our Go
-// client as the peer. Prints "ready" once the listener is up.
+// client as the peer. Prints "ready" exactly once, from the "listening"
+// event, so the word is true when it appears.
 import { WebSocketServer } from "ws";
 
 const port = Number(process.argv[2] ?? 18543);
@@ -23,5 +24,3 @@ wss.on("connection", (sock) => {
     sock.send(data, { binary: isBinary });
   });
 });
-
-console.log("ready");

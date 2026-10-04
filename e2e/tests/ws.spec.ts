@@ -129,9 +129,9 @@ test("bearer: plain HTTP without token gets 401", async ({ request }) => {
   expect(resp.status()).toBe(401);
 });
 
-test("bearer: valid token over plain HTTP is refused (403, origin/upgrade required)", async ({ request }) => {
+test("bearer: valid token over plain HTTP is refused (400, upgrade headers required)", async ({ request }) => {
   const resp = await request.get(`/ws/bearer?token=${TOKEN}`);
-  expect(resp.status()).toBe(403);
+  expect(resp.status()).toBe(400);
 });
 
 /**

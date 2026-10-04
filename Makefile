@@ -53,10 +53,13 @@ mcdc:
 	go run ./cmd/mcdc ws
 
 # Full end-to-end: Go mTLS/interop test plus the Playwright suite
-# (Firefox + Chromium) against the real demo binary.
+# (Firefox + Chromium) against the real demo binary. npm test runs the
+# setup pretest (certgen + demo build, which playwright.config.ts's
+# webServer expects at ./.bin/demo) before the browser suite; npm ci is
+# idempotent and cheap when node_modules is current.
 e2e:
 	go test -race ./e2e/
-	cd e2e && npx playwright test
+	cd e2e && npm ci && npm test
 
 certgen:
 	go run ./cmd/certgen -dir e2e/certs

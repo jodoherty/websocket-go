@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +130,29 @@ func read(t *testing.T, path string) []byte {
 	return b
 }
 
+// lockedBuffer is a bytes.Buffer guarded by a mutex. os/exec fills it from a
+// copier goroutine, and the test may read it at any point — including on
+// failure paths that fire before cmd.Wait() stops the copier — so
+// unsynchronized access would be a data race under -race.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.buf.String()
+}
+
 func TestMTLSClientCertOpensSession(t *testing.T) {
 	root, _ := filepath.Abs("..")
 	cfg := tlsConfigWithClientCert(t, root)
@@ -194,7 +218,7 @@ func TestInteropNodeClientAgainstGoServer(t *testing.T) {
 func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	const nodeAddr = "127.0.0.1:18543"
 	cmd := exec.Command("node", "interop-node-server.mjs", "18543")
-	var serverOut bytes.Buffer
+	var serverOut lockedBuffer
 	cmd.Stderr = &serverOut
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -207,8 +231,8 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	defer func() {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
-		if serverOut.Len() > 0 {
-			t.Logf("node server stderr:\n%s", serverOut.String())
+		if stderr := serverOut.String(); stderr != "" {
+			t.Logf("node server stderr:\n%s", stderr)
 		}
 	}()
 

@@ -680,3 +680,74 @@ func TestCompressedAllocationBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestCompressTailCheck pins the compressor's tail validation: the flushed
+// stream must end with the RFC 7692 §7.2.1 empty-block octets, and an
+// undersized or mismatched stream — a stdlib encoder regression — is
+// reported as errCompressTail, never an index panic. The undersized inputs
+// are the regression: the pre-guard code sliced b[len(b)-4:] without a
+// length check, which panics for len(b) < 4.
+func TestCompressTailCheck(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("compressTailCheck panicked: %v", r)
+		}
+	}()
+
+	// The wire form compress() actually emits, restored to the full flushed
+	// stream: the body plus the trailing four octets it trims off.
+	c := newTestConn(nil, false)
+	err := c.compress([]byte("hello, world"))
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	full := append(append([]byte{}, c.compressBuf.Bytes()...), deflateTailBytes[:truncateOctets]...)
+
+	cases := []struct {
+		name    string
+		in      []byte
+		wantErr bool
+		wantOut []byte
+	}{
+		{
+			name:    "real flushed stream trims the RFC tail",
+			in:      full,
+			wantOut: c.compressBuf.Bytes(),
+		},
+		{
+			name:    "exactly the tail yields an empty payload",
+			in:      append([]byte(nil), deflateTailBytes[:truncateOctets]...),
+			wantOut: nil,
+		},
+		{name: "empty stream is too short", in: nil, wantErr: true},
+		{name: "one byte is too short", in: []byte{0x00}, wantErr: true},
+		{
+			name:    "three bytes are too short",
+			in:      deflateTailBytes[:truncateOctets-1],
+			wantErr: true,
+		},
+		{
+			name:    "wrong tail octets are rejected",
+			in:      append([]byte{0x00, 0x01}, 0x00, 0x00, 0xfe, 0xff),
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := compressTailCheck(tc.in)
+			if tc.wantErr {
+				if !errors.Is(err, errCompressTail) {
+					t.Fatalf("compressTailCheck = (%q, %v), want errCompressTail", out, err)
+				}
+
+				return
+			}
+			if err != nil {
+				t.Fatalf("compressTailCheck: %v", err)
+			}
+			if !bytes.Equal(out, tc.wantOut) {
+				t.Fatalf("compressTailCheck = % x, want % x", out, tc.wantOut)
+			}
+		})
+	}
+}
