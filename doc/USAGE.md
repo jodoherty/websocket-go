@@ -364,7 +364,38 @@ below are where they live.
   default; `WithDialer` replaces the transport entirely when you need
   custom roots, client certificates, or a proxy tunnel (the dialer owns
   the transport, and the library applies no TLS of its own when one is
-  set). Serve behind TLS; never put `ws://` in production.
+  set). Serve behind TLS; never put `ws://` in production. The
+  standard-library shape is: dial TCP, wrap it in `tls.Client` with the
+  app's `RootCAs` and client `Certificates`, run `Handshake()`, and hand
+  the ready connection to the library:
+
+  ```go
+  ws.WithDialer(func(_ context.Context, u *url.URL) (net.Conn, error) {
+      conn, err := net.Dial("tcp", u.Host)
+      if err != nil {
+          return nil, err
+      }
+      tconn := tls.Client(conn, &tls.Config{
+          ServerName:   u.Hostname(),
+          RootCAs:      appRoots, // the app's CA pool, not the system store
+          Certificates: []tls.Certificate{clientCert}, // mTLS
+      })
+      if err := tconn.Handshake(); err != nil {
+          _ = conn.Close()
+          return nil, err
+      }
+      return tconn, nil
+  })
+  ```
+
+  The server side is ordinary TLS plus middleware: the listener verifies
+  a presented chain (`ClientCAs` and `tls.VerifyClientCertIfGiven`), an
+  `http.Handler` in front of the upgrader refuses requests that arrived
+  without a verified certificate, and the handler reads the client
+  identity off `r.TLS.PeerCertificates`. Executable: `ws`
+  `ExampleWithDialer_mtls`; the full mTLS path is covered in `e2e/`.
+  `ExampleWithDialer` shows the seam itself: a `wss://` URL over raw TCP
+  because the dialer's policy says no TLS.
 - **RFC 6455 core, plus permessage-deflate (RFC 7692).** Version 13 only;
   the only reserved (RSV) bit used is RSV1, and only when permessage-deflate
   is negotiated. Compression is on by default (matching browsers and the

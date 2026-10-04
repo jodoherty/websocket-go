@@ -11,6 +11,10 @@ package ws
 //   - ExampleUpgrader:  auth middleware + the request context + Upgrade
 //   - ExampleDial:      programmatic client, bearer token via WithHeader
 //   - ExampleWithDialer: the custom-transport seam (WithDialer)
+//   - ExampleWithDialer_mtls:    the standard-library mTLS dial — WithDialer with
+//                         a custom root store and a client certificate,
+//                         against a server whose mTLS gate is ordinary
+//                         middleware
 //   - ExampleDialRaw:   the raw face — events, answering pings, a two-frame
 //                       write, and the peer's close as an OpClose event
 //   - ExampleCloseCode: application close codes, end to end
@@ -26,13 +30,21 @@ package ws
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"time"
 )
 
 // wsURL converts an httptest http:// URL to its ws:// equivalent.
@@ -245,6 +257,163 @@ func ExampleWithDialer() {
 	fmt.Println("client: closed normally")
 	// Output:
 	// server: hi
+	// client: closed normally
+}
+
+// mTLS fixture: a throwaway CA and the two certificates it signs, so the
+// example is self-contained (nothing trusted by the system, nothing on
+// disk). The server certificate is valid for localhost and the loopback
+// address; the client certificate carries the CN the server's handler
+// will read back.
+func mtlsExampleCerts() (caPool *x509.CertPool, server, client tls.Certificate) {
+	caKey, caTmpl := exampleKey(), &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ws-example CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caKey.Public(), caKey)
+	if err != nil {
+		panic(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		panic(err)
+	}
+
+	leaf := func(serial int64, commonName string, extKeyUsage x509.ExtKeyUsage) tls.Certificate {
+		key := exampleKey()
+		tmpl := &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: commonName},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsage:  []x509.ExtKeyUsage{extKeyUsage},
+		}
+		if extKeyUsage == x509.ExtKeyUsageServerAuth {
+			// The example dials the httptest listener's own address.
+			tmpl.DNSNames = []string{"localhost"}
+			tmpl.IPAddresses = []net.IP{net.IPv4(127, 0, 0, 1)}
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, key.Public(), caKey)
+		if err != nil {
+			panic(err)
+		}
+		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+	}
+
+	caPool = x509.NewCertPool()
+	caPool.AddCert(ca)
+	return caPool, leaf(2, "ws.example", x509.ExtKeyUsageServerAuth),
+		leaf(3, "mtls-client", x509.ExtKeyUsageClientAuth)
+}
+
+// exampleKey is a throwaway P-256 key for the certificate fixtures above.
+func exampleKey() *ecdsa.PrivateKey {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	return key
+}
+
+// ExampleWithDialer_mtls is the standard-library way to dial a wss:// endpoint
+// with application-owned TLS policy: WithDialer replaces the transport, so
+// the app builds the TLS connection itself — here with a custom root
+// store that trusts a specific CA (RootCAs) and a client certificate the
+// server verifies (mTLS) — and hands the library the ready connection,
+// over which only the WebSocket handshake runs.
+//
+// The server runs the mTLS gate the same way the demo's /ws/mtls does:
+// the TLS layer verifies any presented chain (VerifyClientCertIfGiven),
+// ordinary middleware refuses requests that arrived without a verified
+// certificate, and the handler reads the client identity off
+// r.TLS.PeerCertificates.
+func ExampleWithDialer_mtls() {
+	caPool, serverCert, clientCert := mtlsExampleCerts()
+
+	// The mTLS gate as ordinary middleware, in front of the upgrader.
+	mtlsGate := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				http.Error(w, "client certificate required", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+
+	up := NewUpgrader()
+	mux := http.NewServeMux()
+	mux.Handle("/ws", mtlsGate(up.Handle(func(r *http.Request, c *Session) error {
+		identity := r.TLS.PeerCertificates[0].Subject.CommonName
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+		fmt.Println("server:", identity, "sent", string(data))
+		return c.WriteMessage(OpText, data) // echo; the handler returns after
+	})))
+
+	// VerifyClientCertIfGiven: the TLS layer verifies a presented chain
+	// against caPool; the middleware above decides that one was required.
+	srv := httptest.NewUnstartedServer(mux)
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.VerifyClientCertIfGiven,
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// The app's transport: plain TCP, then TLS with the app's policy —
+	// the custom root store and the client certificate — then the
+	// handshake, then the ready connection to the library.
+	c, err := Dial(context.Background(), "wss://"+srv.Listener.Addr().String()+"/ws",
+		WithDialer(func(_ context.Context, u *url.URL) (net.Conn, error) {
+			conn, err := net.Dial("tcp", u.Host)
+			if err != nil {
+				return nil, err
+			}
+			tconn := tls.Client(conn, &tls.Config{
+				ServerName:   u.Hostname(),
+				RootCAs:      caPool,
+				Certificates: []tls.Certificate{clientCert},
+			})
+			handshakeErr := tconn.Handshake()
+			if handshakeErr != nil {
+				_ = conn.Close()
+
+				return nil, handshakeErr
+			}
+			return tconn, nil
+		}))
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+
+	err = c.WriteMessage(OpText, []byte("hi"))
+	if err != nil {
+		panic(err)
+	}
+	op, data, err := c.ReadMessage() // the echo
+	if err != nil || op != OpText {
+		panic(err)
+	}
+	fmt.Println("client:", string(data))
+	_, _, err = c.ReadMessage() // the server's 1000 close, as EOF
+	if !errors.Is(err, io.EOF) {
+		panic(err)
+	}
+	fmt.Println("client: closed normally")
+	// Output:
+	// server: mtls-client sent hi
+	// client: hi
 	// client: closed normally
 }
 
