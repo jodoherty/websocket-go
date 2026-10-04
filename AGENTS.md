@@ -100,7 +100,9 @@ make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
-make multiver    # build + vet + unit tests on go1.25.0 / go1.26.0 / go1.27.1
+make multiver    # build + vet + ws unit + Go e2e, all under -race, on
+                # go1.25.0 / go1.26.0 / go1.27.1 (browsers only on the
+                # default toolchain, via e2e)
 make e2e         # Go mTLS + Node `ws` interop both directions + Playwright
 ```
 

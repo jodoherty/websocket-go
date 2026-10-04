@@ -57,17 +57,22 @@ branchcov:
 mcdc:
 	go run ./cmd/mcdc ws
 
-# Multi-toolchain floor check: the library must build and pass its unit
-# suite on the oldest supported Go (go.mod's floor; ws.go is vendored by
-# copying, so the floor is the oldest Go a vendoring project may run) and
-# on each newer release we test with. Toolchains download on first use.
+# Multi-toolchain check: on the oldest supported Go (go.mod's floor; ws.go is
+# vendored by copying, so the floor is the oldest Go a vendoring project may
+# run) and on each newer release we test with, the whole module must build,
+# vet, and pass the ws unit suite AND the Go e2e suite (mTLS + Node interop)
+# under the race detector. The Playwright browser half is deliberately not
+# repeated per toolchain — browsers exercise the protocol, not the Go
+# runtime, so it runs once on the default toolchain via the e2e target.
+# Toolchains download on first use.
 TOOLCHAINS ?= go1.25.0 go1.26.0 go1.27.1
 multiver:
 	@for tc in $(TOOLCHAINS); do \
 		echo "multiver: $$tc"; \
 		GOTOOLCHAIN=$$tc go build ./... && \
 		GOTOOLCHAIN=$$tc go vet ./ws ./e2e ./cmd/... && \
-		GOTOOLCHAIN=$$tc go test -count=1 ./ws || exit 1; \
+		GOTOOLCHAIN=$$tc go test -race -count=1 ./ws && \
+		GOTOOLCHAIN=$$tc go test -race -count=1 ./e2e || exit 1; \
 	done
 
 # Full end-to-end: Go mTLS/interop test plus the Playwright suite
