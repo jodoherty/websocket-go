@@ -119,6 +119,21 @@ func TestEchoTextAndBinary(t *testing.T) {
 	}
 }
 
+func TestSubprotocolNotAdvertised(t *testing.T) {
+	s := startServer(t) // advertises "vnc1" and "binary"
+	defer s.Close()
+
+	// The client offers only a subprotocol the server does not advertise:
+	// the handshake succeeds and selects none (the server is lenient by
+	// design — requiring a subprotocol is an application decision), and the
+	// client's §1.9 check accepts the empty selection.
+	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo", ws.WithSubprotocols("nope"))
+	defer c.Close(ws.StatusNormalClosure, "")
+	if got := c.Subprotocol(); got != "" {
+		t.Fatalf("negotiated subprotocol = %q, want empty", got)
+	}
+}
+
 func TestLargeMessage(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()
@@ -174,6 +189,10 @@ func TestHandshakeData(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()
 
+	// /data requires the HandshakeData that only the /auth upgrade sets.
+	// Dialing it directly leaves the data nil, so the handler's policy
+	// failure reaches the peer as a 1011 close — not a misreported normal
+	// closure.
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/data")
 	defer c.Close(ws.StatusNormalClosure, "")
 	err := c.WriteMessage(ws.OpText, []byte("x"))
@@ -181,8 +200,9 @@ func TestHandshakeData(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = c.ReadMessage()
-	if err != nil {
-		t.Fatalf("data handler failed: %v", err)
+	code, reason, ok := ws.CloseCode(err)
+	if !ok || code != ws.StatusUnexpectedCondition || reason != "handler failure" {
+		t.Fatalf("close = (code=%d reason=%q ok=%v err=%v), want 1011/handler failure", code, reason, ok, err)
 	}
 }
 

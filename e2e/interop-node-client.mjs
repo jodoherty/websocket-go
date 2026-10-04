@@ -41,6 +41,28 @@ if (String(r.data) !== "hello from node" || r.isBinary) {
   fails.push(`text echo: ${String(r.data)}`);
 }
 
+// 2. permessage-deflate: the Go server must negotiate it (the Node ws
+//    library offers it by default) and the echo must survive compression
+//    in both directions. 512 KiB of repetitive data compresses well.
+const compMsg = Buffer.alloc(1 << 19);
+for (let i = 0; i < compMsg.length; i++) compMsg[i] = (i * 13) & 0xff;
+const compWs = await open(BASE + "/ws/echo", { perMessageDeflate: true });
+if (!String(compWs.extensions).includes("permessage-deflate")) {
+  fails.push(`permessage-deflate not negotiated: ${compWs.extensions}`);
+}
+const compReply = await new Promise((resolve, reject) => {
+  compWs.on("message", (d) => {
+    compWs.close();
+    resolve(d);
+  });
+  compWs.on("error", (e) => reject(e));
+  compWs.send(compMsg, { binary: true });
+});
+if (!Buffer.from(compReply).equals(compMsg)) {
+  fails.push("compressed binary echo mismatch");
+}
+compWs.terminate();
+
 // 2. binary echo, 1 MiB
 const big = Buffer.alloc(1 << 20);
 for (let i = 0; i < big.length; i++) big[i] = (i * 7) & 0xff;

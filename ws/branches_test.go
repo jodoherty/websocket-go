@@ -21,10 +21,28 @@ func TestReadFrameRejectsMalformed(t *testing.T) {
 		wantSub  string
 	}{
 		{
-			name:     "reserved bits set",
+			name:     "RSV1 set without deflate negotiated",
 			isClient: true,
-			data:     []byte{0x91, 0x00}, // RSV1 on a text frame
-			wantSub:  "reserved bits",
+			data:     []byte{0xC1, 0x00}, // RSV1 on a text frame
+			wantSub:  "RSV1 set without permessage-deflate",
+		},
+		{
+			name:     "RSV2 set",
+			isClient: true,
+			data:     []byte{0xA1, 0x00}, // RSV2 on a text frame
+			wantSub:  "reserved bits 2 or 3 set",
+		},
+		{
+			name:     "RSV3 set",
+			isClient: true,
+			data:     []byte{0x91, 0x00}, // RSV3 on a text frame
+			wantSub:  "reserved bits 2 or 3 set",
+		},
+		{
+			name:     "RSV1 with RSV2 set",
+			isClient: true,
+			data:     []byte{0xE1, 0x00}, // RSV1+RSV2 on a text frame
+			wantSub:  "reserved bits 2 or 3 set",
 		},
 		{
 			name:     "client received masked frame",
@@ -251,7 +269,7 @@ func TestWriteErrorPaths(t *testing.T) {
 	// The codec itself must surface a failing underlying writer.
 	fw := &failWriter{}
 	fc := frameCodec{bw: bufio.NewWriter(fw), isClient: false, maxMsg: 1 << 20}
-	err := fc.writeFrame(OpText, []byte("x"))
+	err := fc.writeFrame(OpText, []byte("x"), false)
 	if err == nil {
 		t.Fatal("writeFrame over a failing writer returned nil")
 	}

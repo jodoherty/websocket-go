@@ -331,6 +331,28 @@ func TestHandleCloseErrorBranch(t *testing.T) {
 	}
 }
 
+// TestHandleErrorBranch covers Upgrader.Handle's branch where the handler
+// returns a plain (non-*CloseError) error while the connection is still
+// open: the close the peer sees must be 1011 (unexpected condition), not a
+// misreported normal closure.
+func TestHandleErrorBranch(t *testing.T) {
+	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
+	mux := http.NewServeMux()
+	mux.Handle("/boom", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
+		return errors.New("policy failure")
+	}))
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/boom")
+	defer c.Close(ws.StatusNormalClosure, "")
+	_, _, err := c.ReadMessage()
+	code, reason, ok := ws.CloseCode(err)
+	if !ok || code != ws.StatusUnexpectedCondition || reason != "handler failure" {
+		t.Fatalf("close seen by client: %v (%d %q %v), want 1011 handler failure", err, code, reason, ok)
+	}
+}
+
 // TestOriginCheckOnTLS covers defaultCheckOrigin's https branch: a TLS
 // request must match an https:// origin, and a mismatched one must be
 // rejected before the protocol checks. A passed origin check is detected

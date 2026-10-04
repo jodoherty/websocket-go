@@ -264,6 +264,106 @@ func TestMCDCWebSocketKey(t *testing.T) {
 	})
 }
 
+// TestSubprotocolEcho pins the client-side rule from RFC 6455 §1.9: the
+// 101 response may select no subprotocol, or exactly one of the tokens the
+// client offered. A token the client never offered — or several at once —
+// fails the dial, because a server that chooses a protocol on its own
+// cannot be trusted with the negotiation.
+func TestSubprotocolEcho(t *testing.T) {
+	t.Parallel()
+
+	// dialEcho answers one handshake with a 101 that carries the given
+	// Sec-WebSocket-Protocol header ("" = no header) and reports the Dial
+	// outcome.
+	dialEcho := func(t *testing.T, offered []string, echo string) (*Conn, error) {
+		t.Helper()
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		go func() {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			req, err := http.ReadRequest(bufio.NewReader(conn))
+			if err != nil {
+				return
+			}
+			sum := sha1.Sum([]byte(req.Header.Get("Sec-WebSocket-Key") + wsGUID)) //nolint:gosec // RFC 6455 mandates SHA-1
+			accept := base64.StdEncoding.EncodeToString(sum[:])
+			var b strings.Builder
+			b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+			b.WriteString("Upgrade: websocket\r\n")
+			b.WriteString("Connection: Upgrade\r\n")
+			if echo != "" {
+				fmt.Fprintf(&b, "Sec-WebSocket-Protocol: %s\r\n", echo)
+			}
+			fmt.Fprintf(&b, "Sec-WebSocket-Accept: %s\r\n\r\n", accept)
+			_, _ = conn.Write([]byte(b.String()))
+			time.Sleep(time.Second) // hold the connection while the client verifies
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return Dial(ctx, "ws://"+l.Addr().String(), WithSubprotocols(offered...))
+	}
+
+	t.Run("none", func(t *testing.T) {
+		t.Parallel()
+		// No selection: the dial succeeds and Subprotocol() is empty.
+		c, err := dialEcho(t, []string{"chat.v1"}, "")
+		if err != nil {
+			t.Fatalf("no selection: %v, want success", err)
+		}
+		defer c.Close(StatusNormalClosure, "")
+		if got := c.Subprotocol(); got != "" {
+			t.Fatalf("Subprotocol() = %q, want empty", got)
+		}
+	})
+
+	t.Run("offered", func(t *testing.T) {
+		t.Parallel()
+		// The one token offered: the dial succeeds with it selected.
+		c, err := dialEcho(t, []string{"chat.v1", "chat.v2"}, "chat.v2")
+		if err != nil {
+			t.Fatalf("offered token: %v, want success", err)
+		}
+		defer c.Close(StatusNormalClosure, "")
+		if got := c.Subprotocol(); got != "chat.v2" {
+			t.Fatalf("Subprotocol() = %q, want chat.v2", got)
+		}
+	})
+
+	t.Run("unoffered", func(t *testing.T) {
+		t.Parallel()
+		// A token the client never offered: the dial fails.
+		_, err := dialEcho(t, []string{"chat.v1"}, "other")
+		if err == nil || !strings.Contains(err.Error(), "unoffered subprotocol") {
+			t.Fatalf("unoffered token: %v, want unoffered subprotocol rejection", err)
+		}
+	})
+
+	t.Run("neverOffered", func(t *testing.T) {
+		t.Parallel()
+		// The client offered nothing, so any selection is unoffered.
+		_, err := dialEcho(t, nil, "evil")
+		if err == nil || !strings.Contains(err.Error(), "unoffered subprotocol") {
+			t.Fatalf("no offer, server echo: %v, want unoffered subprotocol rejection", err)
+		}
+	})
+
+	t.Run("multiple", func(t *testing.T) {
+		t.Parallel()
+		// Several selections at once: the dial fails.
+		_, err := dialEcho(t, []string{"a", "b"}, "a, b")
+		if err == nil || !strings.Contains(err.Error(), "multiple subprotocols") {
+			t.Fatalf("multiple selections: %v, want multiple subprotocols rejection", err)
+		}
+	})
+}
+
 // TestRequestWithBodyRejected: RFC 6455 §4.1 — a GET with a body must be
 // rejected before the protocol switch.
 func TestRequestWithBodyRejected(t *testing.T) {

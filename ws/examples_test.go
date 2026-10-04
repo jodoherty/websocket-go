@@ -11,6 +11,8 @@ package ws
 //   - ExampleUpgrader:  auth middleware + WithHandshakeData + Upgrade
 //   - ExampleDial:      programmatic client, bearer token via WithHeader
 //   - ExampleCloseCode: application close codes, end to end
+//   - ExampleWithCheckOrigin: origin allowlist, per-endpoint size cap, and
+//                             per-action authorization (1008)
 //
 // Note the // Output: block sits inside each function body: since Go 1.27
 // the golden-output comment is only recognized there; in the old
@@ -187,6 +189,63 @@ func ExampleDial() {
 	// Output:
 	// server: hi
 	// client: closed normally
+}
+
+// ExampleWithCheckOrigin shows the application-side protections the OWASP
+// WebSocket Security Cheat Sheet assigns to the application, at the seams
+// this package provides: an explicit origin allowlist (the CSWSH defense;
+// browsers always send Origin, so the no-Origin branch decides only for
+// programmatic clients), a per-endpoint message-size cap, and per-action
+// authorization that ends the session with 1008.
+func ExampleWithCheckOrigin() {
+	up := NewUpgrader(
+		WithCheckOrigin(func(r *http.Request) bool {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				return origin == "https://app.example.com" // explicit allowlist
+			}
+			return r.Header.Get("Authorization") != "" // programmatic clients
+		}),
+		WithMaxMessageSize(64<<10), // the cheat sheet's guidance for chat traffic
+	)
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if string(data) == "delete_user" { // no admin session on this connection
+			return &CloseError{Code: StatusPolicyViolation, Reason: "forbidden"}
+		}
+		_ = c.WriteMessage(OpText, []byte("ok"))
+		return nil
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 1. A cross-site browser presents a non-allowlisted Origin and no
+	//    token: rejected with 403 before the protocol switch (CSWSH).
+	_, err := Dial(context.Background(), wsURL(srv.URL)+"/ws")
+	fmt.Println("no token:", err != nil)
+
+	// 2. A programmatic client with a token gets in; the unauthorized
+	//    action ends the session with 1008, not a silent drop.
+	c, err := Dial(context.Background(), wsURL(srv.URL)+"/ws",
+		WithHeader("Authorization", "Bearer t"))
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+	err = c.WriteMessage(OpText, []byte("delete_user"))
+	if err != nil {
+		panic(err)
+	}
+	_, _, err = c.ReadMessage()
+	code, reason, _ := CloseCode(err)
+	fmt.Println(code, reason)
+	// Output:
+	// no token: true
+	// 1008 forbidden
 }
 
 // ExampleCloseCode shows application-level close codes end to end: the

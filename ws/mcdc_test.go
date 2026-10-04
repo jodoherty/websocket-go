@@ -25,6 +25,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -437,6 +438,271 @@ func TestMCDCTruncateReason(t *testing.T) {
 		}
 		if got := truncateReason("short"); got != "short" {
 			t.Fatalf("under-limit reason altered: %q", got)
+		}
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// permessage-deflate (RFC 7692)
+
+// TestMCDCDeflateRSV traces "rsv1Set && !fc.deflate" in frameCodec.checkRSV:
+// RSV1 is a protocol error only when permessage-deflate was not negotiated.
+func TestMCDCDeflateRSV(t *testing.T) {
+	t.Parallel()
+	stream := deflateStream(t, []byte("x"))
+	rsv1Frame := append([]byte{0xC1, byte(len(stream))}, stream...) //nolint:gosec // tiny test stream, 7-bit length
+
+	t.Run("rsv1", func(t *testing.T) {
+		t.Parallel()
+		// (rsv1Set=T, !deflate=T) flips to (F, T): an RSV1 frame and a plain
+		// frame on a connection without the extension — only the former is a
+		// protocol error.
+		_, _, badErr := newTestConn(rsv1Frame, true).ReadMessage()
+		if badErr == nil || !strings.Contains(badErr.Error(), "RSV1 set without permessage-deflate") {
+			t.Fatalf("RSV1 frame: %v, want RSV1 protocol error", badErr)
+		}
+		good, _, goodErr := newTestConn([]byte{0x81, 0x01, 'x'}, true).ReadMessage()
+		if goodErr != nil || good != OpText {
+			t.Fatalf("plain frame: (%d, %v), want text", good, goodErr)
+		}
+	})
+
+	t.Run("deflate", func(t *testing.T) {
+		t.Parallel()
+		// (rsv1Set=T, !deflate=F) flips to (T, T): the same RSV1 frame passes
+		// when negotiated and fails when not.
+		_, _, err := deflateTestConn(rsv1Frame, true).ReadMessage()
+		if err != nil {
+			t.Fatalf("negotiated RSV1 frame: %v, want success", err)
+		}
+		_, _, err = newTestConn(rsv1Frame, true).ReadMessage()
+		if err == nil || !strings.Contains(err.Error(), "RSV1 set without permessage-deflate") {
+			t.Fatalf("unnegotiated RSV1 frame: %v, want RSV1 protocol error", err)
+		}
+	})
+}
+
+// TestMCDCDeflateControl traces "frm.compressed && frm.isControl()" in
+// ReadMessage: the compressed bit on a control frame is a protocol
+// violation even when the extension is negotiated.
+func TestMCDCDeflateControl(t *testing.T) {
+	t.Parallel()
+
+	t.Run("compressed", func(t *testing.T) {
+		t.Parallel()
+		// (compressed=T, isControl=T) flips to (F, T): an RSV1 ping is a
+		// protocol error, a plain ping is answered with a pong.
+		_, _, err := deflateTestConn([]byte{0xC9, 0x01, 'x'}, true).ReadMessage()
+		if err == nil || !strings.Contains(err.Error(), "control frame") {
+			t.Fatalf("RSV1 ping: %v, want control-frame protocol error", err)
+		}
+		_, _, err = deflateTestConn([]byte{0x89, 0x01, 'x'}, true).ReadMessage()
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatalf("plain ping: %v, want pong-then-EOF", err)
+		}
+	})
+
+	t.Run("isControl", func(t *testing.T) {
+		t.Parallel()
+		// (compressed=T, isControl=T) flips to (T, F): an RSV1 ping is a
+		// protocol error; an RSV1 data frame is a valid compressed message.
+		_, _, err := deflateTestConn([]byte{0xC9, 0x01, 'x'}, true).ReadMessage()
+		if err == nil || !strings.Contains(err.Error(), "control frame") {
+			t.Fatalf("RSV1 ping: %v, want control-frame protocol error", err)
+		}
+		stream := deflateStream(t, []byte("x"))
+		frm := append([]byte{0xC1, byte(len(stream))}, stream...) //nolint:gosec // tiny test stream, 7-bit length
+		_, _, err = deflateTestConn(frm, true).ReadMessage()
+		if err != nil {
+			t.Fatalf("RSV1 data frame: %v, want success", err)
+		}
+	})
+}
+
+// TestMCDCDeflateServerWindow traces "bits != 0 && bits < maxWindowBits" in
+// negotiateCompression: a server_max_window_bits demand below the full 15
+// bits is declined (no extension in the response), other offers are
+// accepted.
+func TestMCDCDeflateServerWindow(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bits", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=F, bits<15=T) flips to (T, T): no window demand is
+		// accepted; a 10-bit demand is declined.
+		ext, err := negotiateCompression(splitExtensionGroups(offerHeader("permessage-deflate")))
+		if err != nil || ext != deflateResponseHeader {
+			t.Fatalf("no window demand: (%q, %v), want the extension", ext, err)
+		}
+		ext, err = negotiateCompression(splitExtensionGroups(
+			offerHeader("permessage-deflate; server_max_window_bits=10")))
+		if err != nil || ext != "" {
+			t.Fatalf("10-bit demand: (%q, %v), want declined", ext, err)
+		}
+	})
+
+	t.Run("belowMax", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=T, bits<15=T) flips to (T, F): a 10-bit demand is
+		// declined; the full 15-bit demand is accepted.
+		ext, err := negotiateCompression(splitExtensionGroups(
+			offerHeader("permessage-deflate; server_max_window_bits=10")))
+		if err != nil || ext != "" {
+			t.Fatalf("10-bit demand: (%q, %v), want declined", ext, err)
+		}
+		ext, err = negotiateCompression(splitExtensionGroups(
+			offerHeader("permessage-deflate; server_max_window_bits=15")))
+		if err != nil || ext != deflateResponseHeader {
+			t.Fatalf("15-bit demand: (%q, %v), want the extension", ext, err)
+		}
+	})
+}
+
+// TestMCDCDeflateClientWindow traces "bits != 0 && bits < maxWindowBits" in
+// verifyCompressionResponse: a response that caps the client window below
+// the full 15 bits fails the dial; other responses are accepted.
+func TestMCDCDeflateClientWindow(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bits", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=F, bits<15=T) flips to (T, T): no window cap is
+		// accepted; a 10-bit cap fails the dial.
+		_, err := dialWithServerExtension(t, "permessage-deflate")
+		if err != nil {
+			t.Fatalf("no window cap: %v", err)
+		}
+		_, err = dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=10")
+		if err == nil {
+			t.Fatal("10-bit cap: dial succeeded, want failure")
+		}
+	})
+
+	t.Run("belowMax", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=T, bits<15=T) flips to (T, F): a 10-bit cap fails the
+		// dial; the full 15-bit cap is accepted.
+		_, err := dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=10")
+		if err == nil {
+			t.Fatal("10-bit cap: dial succeeded, want failure")
+		}
+		_, err = dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=15")
+		if err != nil {
+			t.Fatalf("15-bit cap: %v", err)
+		}
+	})
+}
+
+// TestMCDCDeflateOffered traces "!offered && len(groups) > 0" in
+// verifyCompressionResponse: an extension the client never offered fails
+// the dial, and only when the response actually carries one.
+func TestMCDCDeflateOffered(t *testing.T) {
+	t.Parallel()
+
+	t.Run("offered", func(t *testing.T) {
+		t.Parallel()
+		// (!offered=T, len>0=T) flips to (F, T): with compression disabled
+		// the extension is not offered, so a response carrying it fails the
+		// dial; with compression enabled the same response is accepted.
+		_, err := dialWithServerExtension(t, "permessage-deflate", WithCompression(false))
+		if err == nil {
+			t.Fatal("unoffered extension: dial succeeded, want failure")
+		}
+		_, err = dialWithServerExtension(t, "permessage-deflate")
+		if err != nil {
+			t.Fatalf("offered extension: %v", err)
+		}
+	})
+
+	t.Run("groups", func(t *testing.T) {
+		t.Parallel()
+		// (!offered=T, len>0=F) flips to (T, T): with compression disabled a
+		// response without the extension is accepted; one with it fails.
+		_, err := dialWithServerExtension(t, "", WithCompression(false))
+		if err != nil {
+			t.Fatalf("no extension, not offered: %v", err)
+		}
+		_, err = dialWithServerExtension(t, "permessage-deflate", WithCompression(false))
+		if err == nil {
+			t.Fatal("extension present, not offered: dial succeeded, want failure")
+		}
+	})
+}
+
+// TestMCDCDeflateWindowBits traces the two compound decisions in
+// parseWindowBits: "len(value) > 1 && value[0] == '0'" (leading zeros) and
+// "err != nil || bits < 8 || bits > maxWindowBits" (plus its nested OR)
+// (range and format validation of max_window_bits values).
+func TestMCDCDeflateWindowBits(t *testing.T) {
+	t.Parallel()
+
+	t.Run("leadingZeroLen", func(t *testing.T) {
+		t.Parallel()
+		// (len>1=T, [0]=='0'=T) flips to (F, T): "010" is a leading zero;
+		// "0" skips the check and fails the range check instead.
+		_, err := parseWindowBits("010")
+		if err == nil || !strings.Contains(err.Error(), "leading zero") {
+			t.Fatalf("010: %v, want leading-zero error", err)
+		}
+		_, err = parseWindowBits("0")
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Fatalf("0: %v, want out-of-range error", err)
+		}
+	})
+
+	t.Run("leadingZeroFirst", func(t *testing.T) {
+		t.Parallel()
+		// (len>1=T, [0]=='0'=T) flips to (T, F): "010" is a leading zero;
+		// "10" is a valid value.
+		_, err := parseWindowBits("010")
+		if err == nil {
+			t.Fatalf("010: %v, want leading-zero error", err)
+		}
+		bits, err := parseWindowBits("10")
+		if err != nil || bits != 10 {
+			t.Fatalf("10: (%d, %v), want 10", bits, err)
+		}
+	})
+
+	t.Run("decode", func(t *testing.T) {
+		t.Parallel()
+		// (decodeErr=T, ..) flips to (F, F, F): "abc" is not a number; "10"
+		// decodes in range.
+		_, err := parseWindowBits("abc")
+		if err == nil {
+			t.Fatalf("abc: %v, want out-of-range error", err)
+		}
+		bits, err := parseWindowBits("10")
+		if err != nil || bits != 10 {
+			t.Fatalf("10: (%d, %v), want 10", bits, err)
+		}
+	})
+
+	t.Run("below", func(t *testing.T) {
+		t.Parallel()
+		// (decodeErr=F, bits<8=T, ..) flips to (F, F, F): "7" is below the
+		// range floor; "10" is in range.
+		_, err := parseWindowBits("7")
+		if err == nil {
+			t.Fatalf("7: %v, want out-of-range error", err)
+		}
+		bits, err := parseWindowBits("10")
+		if err != nil || bits != 10 {
+			t.Fatalf("10: (%d, %v), want 10", bits, err)
+		}
+	})
+
+	t.Run("above", func(t *testing.T) {
+		t.Parallel()
+		// (decodeErr=F, bits<8=F, bits>15=T) flips to (F, F, F): "16" is
+		// above the range ceiling; "15" is in range.
+		_, err := parseWindowBits("16")
+		if err == nil {
+			t.Fatalf("16: %v, want out-of-range error", err)
+		}
+		bits, err := parseWindowBits("15")
+		if err != nil || bits != 15 {
+			t.Fatalf("15: (%d, %v), want 15", bits, err)
 		}
 	})
 }

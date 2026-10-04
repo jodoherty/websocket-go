@@ -49,6 +49,18 @@
 //     dead if it is still silent after a second window — all inline in the
 //     read path, no background goroutines), and a local [Conn.Close] call.
 //
+// # Extensions
+//
+// permessage-deflate (RFC 7692) is the one extension this package speaks.
+// The server answers it when the client offers it ([WithCompression] turns
+// the whole negotiation off), and the client offers it on [Dial]. Messages
+// compress per message — no context takeover — and the full 32 KiB window
+// is used, so offers or responses that cap the window below that are
+// declined (server) or fail the dial (client). [Conn.Compressed] reports
+// whether the extension was negotiated on a live connection. Every other
+// reserved bit on a frame — and RSV1 on a control or continuation frame —
+// is a protocol error.
+//
 // # Concurrency
 //
 //  1. [Conn.WriteMessage] and [Conn.Close] are safe to call from any
@@ -84,6 +96,7 @@ package ws
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/rand"
 	"crypto/sha1" //nolint:gosec // RFC 6455 mandates SHA-1 in the handshake
@@ -97,6 +110,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,7 +164,9 @@ const (
 // Wire format constants (RFC 6455 §5-§6).
 const (
 	finBit     = 0x80 // frame[0] high bit: final fragment
-	rsvMask    = 0x70 // frame[0] reserved bits, must be zero
+	rsvMask    = 0x70 // frame[0] reserved bits
+	rsv1Bit    = 0x40 // reserved bit 1: permessage-deflate "compressed" (RFC 7692)
+	rsv23Mask  = 0x30 // reserved bits 2 and 3, must always be zero
 	opcodeMask = 0x0f // frame[0] low 4 bits: opcode
 	maskBit    = 0x80 // frame[1] high bit: payload is masked
 	lenMask    = 0x7f // frame[1] low 7 bits: payload length
@@ -187,6 +204,53 @@ const (
 	wssScheme      = "wss"    // TLS scheme
 	wsDefaultPort  = ":80"    // appended when the URL has no port
 	wssDefaultPort = ":443"
+)
+
+// permessage-deflate (RFC 7692) negotiation constants.
+const (
+	// extPerMessageDeflate is the only extension this package negotiates.
+	extPerMessageDeflate = "permessage-deflate"
+	// maxWindowBits is the largest LZ77 window the stdlib flate compressor
+	// can honor: 2^15 = 32,768 bytes. Offers or responses that demand a
+	// smaller window than this cannot be accepted.
+	maxWindowBits = 15
+	// deflateResponseHeader is this package's fixed extension negotiation
+	// response and offer. Per-message (no context takeover) in both
+	// directions is enforced by construction — the compressor and the
+	// decompressor are per-message by design — so the response says so
+	// explicitly, and the offer asks for the same of the peer.
+	deflateResponseHeader = "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+)
+
+// WebSocket extension header spellings. RFC 6455 and RFC 7692 use the
+// plural "Sec-WebSocket-Extensions" throughout their examples, while the
+// IANA registration uses the singular "Sec-WebSocket-Extension"; both
+// forms circulate in real handshakes (browsers send the plural). This
+// package accepts both on input and sends the RFC example spelling
+// (plural) in both the offer and the 101 response.
+const (
+	extHeaderSingular = "Sec-Websocket-Extension"
+	extHeaderPlural   = "Sec-Websocket-Extensions"
+)
+
+// deflateTailBytes are the octets appended to a received compressed payload
+// before DEFLATE. The first four are the ones RFC 7692 §7.2.2 prescribes;
+// they complete the trailing empty block the compressor truncated. The final
+// four add a BFINAL=1 empty stored block: real permessage-deflate peers
+// (browsers, Node) end their stream with a BFINAL=0 empty block, so a
+// strict DEFLATE decoder (Go's compress/flate) would otherwise run past it
+// into EOF and report "unexpected EOF". See decompress and compress.
+var deflateTailBytes = [9]byte{ //nolint:gochecknoglobals // RFC 7692 §7.2 constant, never mutated
+	0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff,
+}
+
+const (
+	// truncateOctets is the length of the empty stored block's length and
+	// complement octets stripped from a compressed stream (see compress).
+	truncateOctets = 4
+	// inflateCopyScratch sizes the per-connection io.CopyBuffer scratch used
+	// to move decompressed bytes into the message payload.
+	inflateCopyScratch = 32 << 10
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +301,17 @@ var (
 	errHandshakeFailed = errors.New("ws: handshake failed")
 	errBadSubprotocol  = errors.New("ws: invalid subprotocol")
 	errBadHeader       = errors.New("ws: invalid request header")
+	// errBadExtension is the base for a malformed permessage-deflate offer
+	// or 101 response (RFC 7692 §7.1.2); the detail naming the offending
+	// parameter is wrapped on top so logs stay useful while callers can
+	// match the base.
+	errBadExtension = errors.New("ws: invalid permessage-deflate parameter")
+	// errCompressTail marks an internal invariant breach in the compressor:
+	// the flushed stream did not end with the expected empty-block octets.
+	errCompressTail = errors.New("ws: internal error: unexpected flate stream tail")
+	// errNoResetter marks an internal invariant breach: the stdlib decompressor
+	// no longer supports Reset, so per-message reuse is impossible.
+	errNoResetter = errors.New("ws: internal error: decompressor does not support reset")
 )
 
 // closeErrFor maps a close code to the terminal error recorded on the
@@ -258,9 +333,10 @@ func closeErrFor(code int, reason string) error {
 
 // frame is one decoded RFC 6455 frame.
 type frame struct {
-	fin     bool
-	opcode  int
-	payload []byte
+	fin        bool
+	opcode     int
+	payload    []byte
+	compressed bool // RSV1 set on the first frame of this data message
 }
 
 func (f frame) isControl() bool { return f.opcode >= OpClose }
@@ -275,6 +351,7 @@ type frameCodec struct {
 	bw       *bufio.Writer
 	isClient bool
 	maxMsg   int64
+	deflate  bool // permessage-deflate negotiated: RSV1 may carry compression
 
 	// Per-frame scratch, kept here instead of on each call's stack because
 	// the header/length/mask buffers otherwise escape to the heap through
@@ -307,8 +384,9 @@ func (fc *frameCodec) readFrame() (frame, error) {
 		return frame{}, fmt.Errorf("ws: read frame header: %w", err)
 	}
 	frm := frame{fin: fc.in[0]&finBit != 0, opcode: int(fc.in[0] & opcodeMask)}
-	if fc.in[0]&rsvMask != 0 {
-		return frame{}, fmt.Errorf("%w: reserved bits set", errProtocol)
+	rsvErr := fc.checkRSV()
+	if rsvErr != nil {
+		return frame{}, rsvErr
 	}
 	masked := fc.in[1]&maskBit != 0
 	if masked == fc.isClient {
@@ -331,8 +409,29 @@ func (fc *frameCodec) readFrame() (frame, error) {
 		return frame{}, err
 	}
 	frm.payload = payload
+	if fc.in[0]&rsv1Bit != 0 {
+		frm.compressed = true
+	}
 
 	return frm, nil
+}
+
+// checkRSV validates the reserved bits on the frame header (RFC 6455 §5.2,
+// RFC 7692 §6): RSV2 and RSV3 are always zero; RSV1 is the
+// permessage-deflate "compressed" bit and may be set only when the
+// extension was negotiated. RSV1 marks the first frame of a data message,
+// so its misuse on control frames and continuation frames is checked where
+// the message context is known: Conn.ReadMessage and handleData.
+func (fc *frameCodec) checkRSV() error {
+	rsv := fc.in[0] & rsvMask
+	if rsv&rsv23Mask != 0 {
+		return fmt.Errorf("%w: reserved bits 2 or 3 set", errProtocol)
+	}
+	if rsv1Set := rsv == rsv1Bit; rsv1Set && !fc.deflate {
+		return fmt.Errorf("%w: RSV1 set without permessage-deflate negotiated", errProtocol)
+	}
+
+	return nil
 }
 
 // readFramePayload reads the mask key (when masked) and the payload, then
@@ -408,12 +507,18 @@ func encodeFrameLen(hdr []byte, payloadLen int) int {
 	}
 }
 
-// writeFrame writes one complete (FIN set) frame. It does not take any
+// writeFrame writes one complete (FIN set) frame. compressed sets RSV1,
+// which is reserved for permessage-deflate and must only be set on data
+// frames carrying a compressed message (RFC 7692 §6). It does not take any
 // lock; a [Conn] serializes calls via its write mutex.
-func (fc *frameCodec) writeFrame(opcode int, payload []byte) error {
+func (fc *frameCodec) writeFrame(opcode int, payload []byte, compressed bool) error {
 	hdr := fc.hdr[:]
 	// opcode is a 4-bit value (0-15), so the conversion cannot overflow.
-	hdr[0] = finBit | byte(opcode) //nolint:gosec // 4-bit opcode
+	first := finBit | byte(opcode) //nolint:gosec // 4-bit opcode
+	if compressed {
+		first |= rsv1Bit
+	}
+	hdr[0] = first
 	hdrLen := encodeFrameLen(hdr, len(payload))
 	if fc.isClient {
 		_, randErr := rand.Read(fc.rand4[:])
@@ -499,9 +604,34 @@ type Conn struct {
 	probedSinceLastActivity bool
 	probeAt                 time.Time
 
-	inFrag  bool
-	fragOp  int
-	fragBuf []byte
+	inFrag         bool
+	fragOp         int
+	fragBuf        []byte
+	fragCompressed bool // assembled message is a compressed (RFC 7692) payload
+
+	// permessage-deflate (RFC 7692): deflateNegotiated is set once, after
+	// the handshake, by both sides; the compressor is write-path state
+	// (owned by c.mu) and the decompressor is read-path state (owned by the
+	// pumping goroutine), so each direction's scratch is exactly as isolated
+	// as the frame codec's read/write scratch.
+	deflateNegotiated bool
+	compressLevel     int // flate level, as configured; defaults come from Config
+
+	// Write-side scratch, touched under c.mu only: the deflate writer and
+	// the buffer it fills, lazily created on the first compressed message.
+	deflater    *flate.Writer
+	compressBuf *bytes.Buffer
+
+	// Read-side scratch, touched by the pumping goroutine only: the
+	// re-used decompressor ([flate.Resetter]) and its output, lazily
+	// created on the first compressed message.
+	inflateSrc   *bytes.Reader
+	inflater     io.ReadCloser  // flate.NewReader result, read and closed
+	inflaterRst  flate.Resetter // the same object, used to reset per message
+	inflateBuf   *bytes.Buffer
+	inflateLimit inflateGuard // bounds the decompressed output at maxMessageSize
+	inflateCopy  []byte       // io.CopyBuffer scratch, sized once
+	inflateWire  []byte       // payload + the four RFC bytes, grown to the largest message
 }
 
 func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int64,
@@ -527,6 +657,149 @@ func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int6
 		writeTimeout: writeTimeout,
 		lastActivity: time.Now(),
 	}
+}
+
+// applyCompression records a successful permessage-deflate negotiation on
+// the connection: the RSV1 bit becomes the "compressed" marker on the read
+// side, and the write side starts compressing data messages.
+func (c *Conn) applyCompression() {
+	c.fc.deflate = true
+	c.deflateNegotiated = true
+}
+
+// Compressed reports whether permessage-deflate was negotiated, i.e. whether
+// data messages on this connection travel compressed and carry RSV1.
+func (c *Conn) Compressed() bool { return c.deflateNegotiated }
+
+// compress deflates data into the write scratch. The output is a truncated
+// raw DEFLATE stream: after writing the payload we Flush (not Close), which
+// finishes the current block and appends a BFINAL=0 empty stored block
+// instead of terminating the stream, then we drop that block's final four
+// octets (0x00 0x00 0xff 0xff). That is exactly the wire encoding RFC 7692
+// §7.2.1 prescribes and that every peer's decompressor expects (see
+// decompress and deflateTailBytes). A fresh writer context per message
+// implements the per-message (no context takeover) mode. The scratch
+// outlives the frame write: bufio consumes it synchronously before
+// writeFrame returns, and the next compress resets it under the same write
+// lock.
+func (c *Conn) compress(data []byte) error {
+	if c.deflater == nil {
+		c.compressBuf = &bytes.Buffer{}
+		writer, err := flate.NewWriter(c.compressBuf, c.compressLevel)
+		if err != nil {
+			return fmt.Errorf("ws: create compressor: %w", err)
+		}
+		c.deflater = writer
+	}
+	c.compressBuf.Reset()
+	c.deflater.Reset(c.compressBuf)
+	_, err := c.deflater.Write(data)
+	if err != nil {
+		return fmt.Errorf("ws: compress message: %w", err)
+	}
+	// Flush finishes the block and appends the BFINAL=0 empty stored block
+	// without terminating the stream (Close would emit a BFINAL=1 Huffman
+	// block, which is not the RFC wire encoding).
+	flushErr := c.deflater.Flush()
+	if flushErr != nil {
+		return fmt.Errorf("ws: finish compressed message: %w", flushErr)
+	}
+	// The RFC wire payload is the flushed stream minus its final four octets
+	// (the empty block's length and its complement). Flush guarantees those
+	// four are present; guard against an unexpected encoder change.
+	b := c.compressBuf.Bytes()
+	if !bytes.Equal(b[len(b)-truncateOctets:], deflateTailBytes[:truncateOctets]) {
+		return fmt.Errorf("%w: % x", errCompressTail, b[len(b)-truncateOctets:])
+	}
+	c.compressBuf.Truncate(len(b) - truncateOctets)
+
+	return nil
+}
+
+// decompress expands a compressed message payload. The received data is a
+// truncated raw DEFLATE stream; appending deflateTailBytes completes the
+// trailing empty block the compressor cut off and adds a BFINAL terminator
+// so Go's strict decoder ends cleanly instead of reporting "unexpected EOF"
+// (see that variable's comment). The result must be
+// at least one byte (a message whose payload compresses to nothing is
+// invalid), and at most maxMessageSize — the bound is enforced while
+// decompressing so a high-ratio payload cannot inflate unboundedly before
+// being rejected. The returned slice is fresh: the caller owns it and may
+// retain it, while every decompressor buffer is per-connection scratch reused
+// on the next message — one heap allocation per compressed message.
+func (c *Conn) decompress(src []byte) ([]byte, error) {
+	if c.inflater == nil {
+		c.inflateSrc = &bytes.Reader{}
+		reader := flate.NewReader(c.inflateSrc)
+		resetter, ok := reader.(flate.Resetter)
+		if !ok {
+			// flate.NewReader always implements Resetter; a mismatch means the
+			// standard library changed. Fail closed instead of panicking on a
+			// per-message assertion.
+			_ = reader.Close()
+
+			return nil, errNoResetter
+		}
+		c.inflater = reader
+		c.inflaterRst = resetter
+		c.inflateBuf = &bytes.Buffer{}
+		c.inflateLimit.buf = c.inflateBuf
+		if c.inflateCopy == nil {
+			c.inflateCopy = make([]byte, inflateCopyScratch)
+		}
+	}
+	// Lay the payload out next to the decompression tail in per-connection
+	// scratch, so the steady-state decompression allocates only the
+	// returned payload.
+	need := len(src) + len(deflateTailBytes)
+	if len(c.inflateWire) < need {
+		c.inflateWire = make([]byte, need)
+	}
+	copy(c.inflateWire, src)
+	copy(c.inflateWire[len(src):], deflateTailBytes[:])
+	c.inflateSrc.Reset(c.inflateWire[:need])
+	resetErr := c.inflaterRst.Reset(c.inflateSrc, nil)
+	if resetErr != nil {
+		return nil, fmt.Errorf("ws: reset decompressor: %w", resetErr)
+	}
+	c.inflateBuf.Reset()
+	c.inflateLimit.limit = int(c.fc.maxMsg)
+	_, err := io.CopyBuffer(&c.inflateLimit, c.inflater, c.inflateCopy)
+	if err != nil {
+		if errors.Is(err, errMessageTooBig) {
+			return nil, fmt.Errorf("%w: decompressed message exceeds the %d byte limit",
+				errMessageTooBig, c.fc.maxMsg)
+		}
+
+		return nil, fmt.Errorf("%w: invalid compressed payload: %w", errProtocol, err)
+	}
+	payload := make([]byte, c.inflateBuf.Len())
+	copy(payload, c.inflateBuf.Bytes())
+
+	return payload, nil
+}
+
+// inflateGuard bounds how many bytes the decompressor may produce, so a
+// small high-ratio payload cannot inflate past maxMessageSize before being
+// rejected. It is a per-connection field, not a fresh struct per call:
+// a struct value passed as an io.Writer would escape to the heap and cost
+// an allocation per message.
+type inflateGuard struct {
+	buf   *bytes.Buffer
+	limit int
+}
+
+func (g *inflateGuard) Write(p []byte) (int, error) {
+	if g.buf.Len()+len(p) > g.limit {
+		return 0, errMessageTooBig
+	}
+
+	n, err := g.buf.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("ws: decompress output buffer: %w", err)
+	}
+
+	return n, nil
 }
 
 // finish records a terminal state. It is safe to call concurrently: the
@@ -596,9 +869,16 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 		c.lastActivity = time.Now()
 		c.probedSinceLastActivity = false
 
+		// RFC 7692 §6: the "compressed" bit is reserved for data messages —
+		// a control frame that carries it is a protocol violation.
+		ctrlErr := c.checkCompressedControl(frm)
+		if ctrlErr != nil {
+			return 0, nil, ctrlErr
+		}
+
 		switch frm.opcode {
 		case OpPing:
-			pingErr := c.writeFrame(OpPong, frm.payload)
+			pingErr := c.writeFrame(OpPong, frm.payload, false)
 			if pingErr != nil {
 				return 0, nil, c.finish(pingErr)
 			}
@@ -610,9 +890,9 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 		case OpClose:
 			return c.peerClose(frm.payload)
 		case OpText, OpBinary, OpContinuation:
-			msgOp, payload, complete, msgErr := c.handleData(frm)
-			if msgErr != nil {
-				return 0, nil, c.finish(msgErr)
+			msgOp, payload, complete, dataErr := c.readData(frm)
+			if dataErr != nil {
+				return 0, nil, c.finish(dataErr)
 			}
 			if !complete {
 				continue
@@ -624,6 +904,42 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 				fmt.Errorf("%w: unknown opcode %d", errProtocol, frm.opcode))
 		}
 	}
+}
+
+// checkCompressedControl enforces RFC 7692 §6: the compressed (RSV1) bit is
+// reserved for data messages, so a control frame that carries it is a
+// protocol violation that terminates the connection.
+func (c *Conn) checkCompressedControl(frm frame) error {
+	if frm.compressed && frm.isControl() {
+		return c.failProtocol("permessage-deflate bit set on a control frame")
+	}
+
+	return nil
+}
+
+// readData assembles one data message from a frame and, when the message is
+// compressed, expands it. It returns the message opcode and payload; complete
+// reports whether a possibly fragmented message has ended. A decompression
+// failure (a corrupt or oversized payload) is returned as the error.
+func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
+	msgOp, payload, complete, compressed, msgErr := c.handleData(frm)
+	if msgErr != nil {
+		return 0, nil, false, msgErr
+	}
+	if !complete {
+		return 0, nil, false, nil
+	}
+	if compressed {
+		c.fragCompressed = false
+		expanded, err := c.decompress(payload)
+		if err != nil {
+			return 0, nil, false, err
+		}
+
+		return msgOp, expanded, true, nil
+	}
+
+	return msgOp, payload, true, nil
 }
 
 // keepaliveTimeout processes a read error against the keepalive clock. It
@@ -641,7 +957,7 @@ func (c *Conn) keepaliveTimeout(err error) (bool, error) {
 	c.probeAt = time.Now()
 	// The ping write carries the write-timeout bound (see Conn.writeFrame),
 	// so a blackholed transport cannot wedge the read loop here.
-	pingErr := c.writeFrame(OpPing, nil)
+	pingErr := c.writeFrame(OpPing, nil, false)
 	if pingErr != nil {
 		return false, pingErr
 	}
@@ -722,39 +1038,44 @@ func truncateReason(reason string) string {
 
 // handleData processes one data or continuation frame. It returns complete
 // when the message is finished — a single-frame message, or the final
-// fragment — and holds the partial message in the connection otherwise.
-func (c *Conn) handleData(frm frame) (int, []byte, bool, error) {
+// fragment — and compressed when that finished message arrived as a
+// compressed (RFC 7692) payload (RSV1 on the first frame only); it holds
+// the partial message in the connection otherwise.
+func (c *Conn) handleData(frm frame) (int, []byte, bool, bool, error) {
 	if frm.opcode == OpContinuation {
+		if frm.compressed {
+			return 0, nil, false, false, fmt.Errorf("%w: permessage-deflate bit set on a continuation frame", errProtocol)
+		}
 		if !c.inFrag {
-			return 0, nil, false, fmt.Errorf("%w: continuation frame without start", errProtocol)
+			return 0, nil, false, false, fmt.Errorf("%w: continuation frame without start", errProtocol)
 		}
 		if int64(len(c.fragBuf)+len(frm.payload)) > c.fc.maxMsg {
-			c.inFrag, c.fragBuf = false, nil
+			c.inFrag, c.fragBuf, c.fragCompressed = false, nil, false
 
-			return 0, nil, false, fmt.Errorf("%w: %w", errProtocol, errMessageTooBig)
+			return 0, nil, false, false, fmt.Errorf("%w: %w", errProtocol, errMessageTooBig)
 		}
 		c.fragBuf = append(c.fragBuf, frm.payload...)
 		if !frm.fin {
-			return 0, nil, false, nil
+			return 0, nil, false, false, nil
 		}
 
-		opcode, data := c.fragOp, c.fragBuf
-		c.inFrag, c.fragBuf = false, nil
+		opcode, data, compressed := c.fragOp, c.fragBuf, c.fragCompressed
+		c.inFrag, c.fragBuf, c.fragCompressed = false, nil, false
 
-		return opcode, data, true, nil
+		return opcode, data, true, compressed, nil
 	}
 	// OpText or OpBinary.
 	if c.inFrag {
-		return 0, nil, false, fmt.Errorf("%w: data frame while message is in progress",
+		return 0, nil, false, false, fmt.Errorf("%w: data frame while message is in progress",
 			errProtocol)
 	}
 	if !frm.fin {
-		c.inFrag, c.fragOp, c.fragBuf = true, frm.opcode, frm.payload
+		c.inFrag, c.fragOp, c.fragBuf, c.fragCompressed = true, frm.opcode, frm.payload, frm.compressed
 
-		return 0, nil, false, nil
+		return 0, nil, false, false, nil
 	}
 
-	return frm.opcode, frm.payload, true, nil
+	return frm.opcode, frm.payload, true, frm.compressed, nil
 }
 
 // armIdle arms the read deadline for the next blocking read: the point at
@@ -824,7 +1145,7 @@ func (c *Conn) closedWriteErr() error {
 // automatic pong and keepalive ping, and the close frame ([Conn.Close]) —
 // each of which validates its own use. A closed connection yields
 // [Conn.closedWriteErr], never a silent success.
-func (c *Conn) writeFrame(opcode int, payload []byte) error {
+func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state.Load() == stClosed {
@@ -839,7 +1160,7 @@ func (c *Conn) writeFrame(opcode int, payload []byte) error {
 		defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
 	}
 
-	return c.fc.writeFrame(opcode, payload)
+	return c.fc.writeFrame(opcode, payload, compressed)
 }
 
 // WriteMessage writes a complete text or binary message. It is safe to call
@@ -876,7 +1197,23 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 		// so the bound is per-write, not sticky.
 		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
-	writeErr := c.fc.writeFrame(opcode, data)
+	// permessage-deflate (RFC 7692 §6.1): the whole message is one raw
+	// DEFLATE stream and RSV1 marks the single frame as compressed. The
+	// compressed bytes are strictly no larger than the bound above plus a
+	// fixed block overhead, so no second size check is needed. Compressing
+	// happens under the write lock, with the compressor's scratch therefore
+	// owned by exactly one writer at a time.
+	frame, compressed := data, false
+	if c.deflateNegotiated {
+		compressErr := c.compress(data)
+		if compressErr != nil {
+			c.mu.Unlock()
+
+			return compressErr
+		}
+		frame, compressed = c.compressBuf.Bytes(), true
+	}
+	writeErr := c.fc.writeFrame(opcode, frame, compressed)
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
 
@@ -921,7 +1258,7 @@ func (c *Conn) Close(code int, reason string) error {
 	// allows. The write is bounded — a silent or half-dead peer must not be
 	// able to hold the close open forever.
 	_ = c.nc.SetWriteDeadline(time.Now().Add(closeWriteTimeout))
-	_ = c.fc.writeFrame(OpClose, payload)
+	_ = c.fc.writeFrame(OpClose, payload, false)
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
 	_ = c.nc.Close()
@@ -985,6 +1322,12 @@ type Config struct {
 	WriteTimeout      time.Duration
 	PreHandshake      []func(r *http.Request) error
 
+	// Compression enables permessage-deflate (RFC 7692) on both sides
+	// (default: true); CompressionLevel is the flate level used to
+	// compress (default: flate.DefaultCompression).
+	Compression      bool
+	CompressionLevel int
+
 	// Client-only fields, settable through the corresponding Options.
 	Headers http.Header
 
@@ -997,15 +1340,45 @@ type Config struct {
 
 // WithSubprotocols advertises (server) or requests (client) the given
 // subprotocols. The server selects the first one it advertises that the
-// client requested, if any; the result is visible on both sides via
-// [Conn.Subprotocol].
+// client requested, if any, and echoes it on the 101; when none match it
+// selects none and the handshake still succeeds — an application that
+// requires a subprotocol must reject the request itself, in
+// [WithPreHandshake] or its own code, before the switch. The client
+// verifies the server's choice: the echoed token must be one of the ones
+// it offered (RFC 6455 §1.9), or the dial fails. The result is visible on
+// both sides via [Conn.Subprotocol].
 func WithSubprotocols(list ...string) Option {
 	return func(cfg *Config) { cfg.Subprotocols = list }
 }
 
+// WithCompression enables or disables permessage-deflate (RFC 7692) on
+// either side; it is enabled by default. Disabling it makes the endpoint
+// ignore the client's extension offer (server: the response carries no
+// extension, the connection runs uncompressed) or never offer it (client).
+//
+// Compressed traffic is exactly as size-bounded as uncompressed traffic:
+// the decompressed payload must fit [WithMaxMessageSize], and the bound is
+// enforced while decompressing, not after.
+func WithCompression(enabled bool) Option {
+	return func(cfg *Config) { cfg.Compression = enabled }
+}
+
+// WithCompressionLevel sets the compression level used by permessage-deflate:
+// any compress/flate level (flate.NoCompression, flate.BestSpeed, the
+// intermediate tiers, flate.BestCompression; the default is
+// flate.DefaultCompression). It only has an effect when [WithCompression] is
+// enabled. Compressed messages trade CPU for bandwidth; on high-throughput
+// byte tunnels (the VNC-shaped example in doc/USAGE.md) flate.BestSpeed or
+// [WithCompression] is usually the right call.
+func WithCompressionLevel(level int) Option {
+	return func(cfg *Config) { cfg.CompressionLevel = level }
+}
+
 // WithMaxMessageSize sets the maximum size of a single message (default
 // 16 MiB) on either side. Frames and fragmented messages beyond the limit
-// terminate the connection.
+// terminate the connection. For chat-style traffic the OWASP WebSocket
+// guidance is far lower — 64 KiB is a sane cap; set it per endpoint.
+// A non-positive limit is not meaningful and is replaced by the default.
 func WithMaxMessageSize(n int64) Option {
 	return func(cfg *Config) { cfg.MaxMessageSize = n }
 }
@@ -1020,7 +1393,8 @@ func WithMaxMessageSize(n int64) Option {
 // frame that takes longer than the window to arrive — a large message on a
 // slow link — triggers the probe and, if it is still incomplete after a
 // second window, the kill. Pass zero to disable keepalive and manage
-// deadlines via [Conn.SetReadDeadline].
+// deadlines via [Conn.SetReadDeadline]. A negative window is invalid and is
+// replaced by the default, never by "disabled".
 func WithIdleTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.IdleTimeout = d }
 }
@@ -1029,9 +1403,27 @@ func WithIdleTimeout(d time.Duration) Option {
 // writing to the transport, so a blackholed peer cannot wedge the write
 // mutex and, with it, [Conn.Close]. The default is 30 s; pass 0 to remove
 // the bound (a write then blocks until the transport completes or the
-// connection is closed).
+// connection is closed). A negative bound is invalid and is replaced by
+// the default, never by "unbounded".
 func WithWriteTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.WriteTimeout = d }
+}
+
+// sanitizeLimits repairs non-sensical limits so a misconfiguration can
+// never silently disable a protection: a non-positive message size, a
+// negative idle window, or a negative write bound falls back to the
+// library default. Zero keeps its documented meanings (disabled keepalive,
+// unbounded writes).
+func sanitizeLimits(cfg *Config) {
+	if cfg.MaxMessageSize <= 0 {
+		cfg.MaxMessageSize = defaultMaxMessageSize
+	}
+	if cfg.IdleTimeout < 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
+	}
+	if cfg.WriteTimeout < 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
+	}
 }
 
 // Server-only options.
@@ -1124,6 +1516,8 @@ type Upgrader struct {
 	idleTimeout       time.Duration
 	writeTimeout      time.Duration
 	preHandshake      []func(r *http.Request) error
+	compressEnabled   bool
+	compressLevel     int // flate level, as configured
 }
 
 // NewUpgrader creates an Upgrader with sensible defaults: strict same-origin
@@ -1135,14 +1529,17 @@ type Upgrader struct {
 // a second window.
 func NewUpgrader(opts ...Option) *Upgrader {
 	cfg := &Config{
-		CheckOrigin:    defaultCheckOrigin,
-		MaxMessageSize: defaultMaxMessageSize,
-		IdleTimeout:    defaultIdleTimeout,
-		WriteTimeout:   defaultWriteTimeout,
+		CheckOrigin:      defaultCheckOrigin,
+		MaxMessageSize:   defaultMaxMessageSize,
+		IdleTimeout:      defaultIdleTimeout,
+		WriteTimeout:     defaultWriteTimeout,
+		Compression:      true,
+		CompressionLevel: flate.DefaultCompression,
 	}
 	for _, apply := range opts {
 		apply(cfg)
 	}
+	sanitizeLimits(cfg)
 
 	return &Upgrader{
 		checkOrigin:       cfg.CheckOrigin,
@@ -1152,6 +1549,8 @@ func NewUpgrader(opts ...Option) *Upgrader {
 		idleTimeout:       cfg.IdleTimeout,
 		writeTimeout:      cfg.WriteTimeout,
 		preHandshake:      cfg.PreHandshake,
+		compressEnabled:   cfg.Compression,
+		compressLevel:     cfg.CompressionLevel,
 	}
 }
 
@@ -1261,7 +1660,7 @@ func (u *Upgrader) checkPolicy(writer http.ResponseWriter, request *http.Request
 }
 
 // writeSwitchingProtocols writes the 101 handshake response.
-func writeSwitchingProtocols(conn net.Conn, protocol, accept string) error {
+func writeSwitchingProtocols(conn net.Conn, protocol, accept, extension string) error {
 	var resp bytes.Buffer
 	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	resp.WriteString("Upgrade: websocket\r\n")
@@ -1269,6 +1668,9 @@ func writeSwitchingProtocols(conn net.Conn, protocol, accept string) error {
 	fmt.Fprintf(&resp, "Sec-WebSocket-Accept: %s\r\n", accept)
 	if protocol != "" {
 		fmt.Fprintf(&resp, "Sec-WebSocket-Protocol: %s\r\n", protocol)
+	}
+	if extension != "" {
+		fmt.Fprintf(&resp, "Sec-WebSocket-Extensions: %s\r\n", extension)
 	}
 	resp.WriteString("\r\n")
 	_, err := conn.Write(resp.Bytes())
@@ -1343,7 +1745,11 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	}
 
 	protocol := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
-	writeErr := writeSwitchingProtocols(raw, protocol, acceptKey(key))
+	extension, extErr := u.negotiateExtensions(request)
+	if extErr != nil {
+		return reject(writer, http.StatusBadRequest, extErr.Error())
+	}
+	writeErr := writeSwitchingProtocols(raw, protocol, acceptKey(key), extension)
 	if writeErr != nil {
 		_ = raw.Close()
 
@@ -1353,16 +1759,36 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	conn := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
 	conn.handshakeData = sessionOpts.data
+	if extension != "" {
+		conn.applyCompression()
+		conn.compressLevel = u.compressLevel
+	}
 
 	return conn, nil
 }
 
+// negotiateExtensions runs permessage-deflate negotiation when compression is
+// enabled, returning the extension header value for the 101 response ("" when
+// compression is off or declined) and an error if the offer is malformed.
+func (u *Upgrader) negotiateExtensions(request *http.Request) (string, error) {
+	if !u.compressEnabled {
+		return "", nil
+	}
+
+	return negotiateCompression(splitExtensionGroups(request.Header))
+}
+
 // Handle returns an [http.Handler] that upgrades the request with u and then
 // invokes handler, running the session for as long as the connection lives.
-// When handler returns, the connection is closed: with the code carried by a
-// returned [*CloseError], if any, or 1000 otherwise. An out-of-range code on
-// a returned *CloseError is remapped to 1002 so the connection is always
-// torn down.
+// When handler returns, the connection is closed with the code the return
+// value says: a returned [*CloseError] closes with its code, nil closes
+// normally (1000), and any other error — a policy failure, a transport
+// error, a keepalive timeout — closes with 1011 (unexpected condition),
+// because the session did not end normally. An out-of-range code on a
+// returned *CloseError is remapped to 1002 so the connection is always torn
+// down. When the handler's error already tore the connection down (the
+// common case for transport errors: ReadMessage fails and records the
+// error), the recorded close wins and nothing more goes on the wire.
 //
 // The returned handler is ordinary: wrap it in further middleware as needed.
 func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
@@ -1385,7 +1811,12 @@ func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Han
 
 			return
 		}
-		_ = conn.Close(StatusNormalClosure, "")
+		if err == nil {
+			_ = conn.Close(StatusNormalClosure, "")
+
+			return
+		}
+		_ = conn.Close(StatusUnexpectedCondition, "handler failure")
 	})
 }
 
@@ -1441,6 +1872,193 @@ func negotiateProtocol(server []string, clientHeader string) string {
 	return ""
 }
 
+// Sec-WebSocket-Extension negotiation (RFC 6455 §9.1, RFC 7692 §7).
+
+// deflateParams is one parsed permessage-deflate token's parameters
+// (RFC 7692 §7.1), direction-neutral: each field records what the
+// counterparty asked for or granted.
+type deflateParams struct {
+	// clientWindowBits is the client_max_window_bits value: 0 for absent or
+	// value-less (no limit on the client's compressor), 8-15 when valued.
+	clientWindowBits int
+	// serverWindowBits is the server_max_window_bits value: 0 for absent,
+	// 8-15 when present (always valued per the ABNF).
+	serverWindowBits int
+	clientNoTakeover bool
+	serverNoTakeover bool
+}
+
+// splitExtensionGroups splits every extension header value into extension
+// groups (one per extension, comma-separated within a value), reading both
+// the RFC singular and the common plural header spellings (see
+// extHeaderSingular). Whitespace around a group is trimmed; empty groups
+// are dropped.
+func splitExtensionGroups(header http.Header) []string {
+	values := append(append([]string(nil),
+		header[http.CanonicalHeaderKey(extHeaderSingular)]...),
+		header[http.CanonicalHeaderKey(extHeaderPlural)]...)
+	groups := []string{}
+	for _, value := range values {
+		for group := range strings.SplitSeq(value, ",") {
+			if trimmed := strings.TrimSpace(group); trimmed != "" {
+				groups = append(groups, trimmed)
+			}
+		}
+	}
+
+	return groups
+}
+
+// parseCompressionParams validates the parameters of one permessage-deflate
+// group and returns their meaning. Any malformed or unknown parameter — a
+// value on a value-less parameter, a non-decimal or out-of-range window,
+// a leading zero, a duplicate — is a protocol error; callers map it to a
+// failed handshake.
+func parseCompressionParams(group string) (deflateParams, error) {
+	parts := strings.Split(group, ";")
+	var params deflateParams
+	seen := make(map[string]bool, truncateOctets)
+	for i, raw := range parts {
+		param := strings.TrimSpace(raw)
+		if param == "" {
+			return params, fmt.Errorf("%w: empty parameter in %q", errBadExtension, group)
+		}
+		if i == 0 {
+			continue // the extension name; validated by the caller
+		}
+		key, value, hasValue := strings.Cut(param, "=")
+		if seen[key] {
+			return params, fmt.Errorf("%w: duplicate parameter %q", errBadExtension, key)
+		}
+		seen[key] = true
+		switch key {
+		case "client_no_context_takeover", "server_no_context_takeover":
+			if hasValue {
+				return params, fmt.Errorf("%w: %q must have no value", errBadExtension, key)
+			}
+			if key == "client_no_context_takeover" {
+				params.clientNoTakeover = true
+			} else {
+				params.serverNoTakeover = true
+			}
+		case "client_max_window_bits":
+			if hasValue {
+				bits, err := parseWindowBits(value)
+				if err != nil {
+					return params, err
+				}
+				params.clientWindowBits = bits
+			}
+		case "server_max_window_bits":
+			if !hasValue {
+				return params, fmt.Errorf("%w: %q requires a value", errBadExtension, key)
+			}
+			bits, err := parseWindowBits(value)
+			if err != nil {
+				return params, err
+			}
+			params.serverWindowBits = bits
+		default:
+
+			return params, fmt.Errorf("%w: unknown parameter %q", errBadExtension, key)
+		}
+	}
+
+	return params, nil
+}
+
+// parseWindowBits validates a max_window_bits value: decimal, no leading
+// zeroes, 8-15 (RFC 7692 §7.1.2).
+func parseWindowBits(value string) (int, error) {
+	if len(value) > 1 && value[0] == '0' {
+		return 0, fmt.Errorf("%w: leading zero in window bits %q", errBadExtension, value)
+	}
+	bits, err := strconv.Atoi(value)
+	if err != nil || bits < 8 || bits > maxWindowBits {
+		return 0, fmt.Errorf("%w: window bits out of range in %q", errBadExtension, value)
+	}
+
+	return bits, nil
+}
+
+// negotiateCompression decides the server's response to a client's
+// Sec-WebSocket-Extension offer and returns the header value for the 101
+// response ("" = no extension: the connection runs uncompressed).
+//
+// A malformed offer — an unrecognized extension (RFC 6455 §9.1), permessage-
+// deflate offered twice, or an invalid parameter — fails the handshake. An
+// offer that is well-formed but demands a smaller compressor window than
+// this implementation can use (server_max_window_bits below the full 15
+// bits) is declined (RFC 7692 §7.1.2.1): the response carries no extension
+// and the connection proceeds uncompressed.
+func negotiateCompression(groups []string) (string, error) {
+	if len(groups) == 0 {
+		return "", nil // no extension offered; the connection runs uncompressed
+	}
+	declined := false
+	for idx, group := range groups {
+		name, _, _ := strings.Cut(group, ";")
+		name = strings.TrimSpace(name)
+		if !strings.EqualFold(name, extPerMessageDeflate) {
+			return "", fmt.Errorf("%w: unsupported extension %q", errBadExtension, name)
+		}
+		params, err := parseCompressionParams(group)
+		if err != nil {
+			return "", err
+		}
+		if idx > 0 {
+			return "", fmt.Errorf("%w: offered more than once", errBadExtension)
+		}
+		// Our compressor always uses the full 32 KiB window, so a limit
+		// below 15 bits cannot be honored: decline, per the doc comment.
+		if bits := params.serverWindowBits; bits != 0 && bits < maxWindowBits {
+			declined = true
+		}
+	}
+	if declined {
+		return "", nil
+	}
+
+	return deflateResponseHeader, nil
+}
+
+// verifyCompressionResponse validates the Sec-WebSocket-Extension header
+// of a 101 response against what this client offered (RFC 7692 §5.1): the
+// server must not select an extension the client never offered, must select
+// permessage-deflate at most once, and must not demand more of the client's
+// compressor than the client's capability — a response that caps the
+// client window below the full 15 bits fails the dial, because the stdlib
+// compressor cannot honor it. It reports whether compression was negotiated.
+func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
+	if !offered && len(groups) > 0 {
+		return false, fmt.Errorf("%w: 101 response selected the unoffered extension %q",
+			errHandshakeFailed, strings.Join(groups, ", "))
+	}
+	if len(groups) == 0 {
+		return false, nil // the server declined; the connection runs uncompressed
+	}
+	if len(groups) > 1 {
+		return false, fmt.Errorf("%w: 101 response selected multiple extensions %q",
+			errHandshakeFailed, strings.Join(groups, ", "))
+	}
+	params, err := parseCompressionParams(groups[0])
+	if err != nil {
+		return false, err
+	}
+	name, _, _ := strings.Cut(groups[0], ";")
+	name = strings.TrimSpace(name)
+	if !strings.EqualFold(name, extPerMessageDeflate) {
+		return false, fmt.Errorf("%w: 101 response selected the unoffered extension %q",
+			errHandshakeFailed, name)
+	}
+	if bits := params.clientWindowBits; bits != 0 && bits < maxWindowBits {
+		return false, fmt.Errorf("%w: 101 response caps the client window at %d bits",
+			errHandshakeFailed, bits)
+	}
+
+	return true, nil
+}
+
 // validSubprotocol reports whether s is a valid subprotocol token: printable
 // US-ASCII excluding space and double quote (RFC 6455 §1.9).
 func validSubprotocol(s string) bool {
@@ -1494,9 +2112,36 @@ func dialTransport(ctx context.Context, host string, isTLS bool, tlsConfig *tls.
 	return conn, nil
 }
 
+// defaultDialConfig is the Config a [Dial] starts from before the caller's
+// options are applied. Defaults run before the options so an explicit
+// WithXxx(0) is preserved: WithIdleTimeout(0) disables keepalive, and
+// WithWriteTimeout(0) removes the write bound. Compression is offered by
+// default, matching the browser and Node ws clients.
+func defaultDialConfig() *Config {
+	return &Config{
+		Headers:          make(http.Header),
+		MaxMessageSize:   defaultMaxMessageSize,
+		IdleTimeout:      defaultIdleTimeout,
+		WriteTimeout:     defaultWriteTimeout,
+		Compression:      true,
+		CompressionLevel: flate.DefaultCompression,
+	}
+}
+
 // Dial opens a WebSocket client connection to rawurl (ws:// or wss://).
 // It performs the handshake and returns an open [Conn] whose read state is
 // owned by the calling goroutine.
+//
+// The server's subprotocol selection is verified (RFC 6455 §1.9): the 101
+// response may select none, or exactly one of the subprotocols this client
+// offered. A selection the client never offered — or several at once —
+// fails the dial, because a server that chooses a protocol on its own
+// cannot be trusted with the protocol negotiation.
+//
+// When [WithCompression] is enabled (the default), the client offers
+// permessage-deflate and verifies the response with the same discipline:
+// the extension may be declined, or accepted with at most the client's own
+// constraints — anything else fails the dial.
 func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	parsed, err := url.Parse(rawurl)
 	if err != nil {
@@ -1515,18 +2160,11 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 		}
 	}
 
-	cfg := &Config{
-		// Defaults run before the options so an explicit WithXxx(0) is
-		// preserved: WithIdleTimeout(0) disables keepalive, and
-		// WithWriteTimeout(0) removes the write bound.
-		Headers:        make(http.Header),
-		MaxMessageSize: defaultMaxMessageSize,
-		IdleTimeout:    defaultIdleTimeout,
-		WriteTimeout:   defaultWriteTimeout,
-	}
+	cfg := defaultDialConfig()
 	for _, apply := range opts {
 		apply(cfg)
 	}
+	sanitizeLimits(cfg)
 	if d := cfg.dialTimeout; d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
@@ -1540,13 +2178,13 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 
 	reader := bufio.NewReaderSize(conn, bufSize)
 	key, reqErr := writeHandshakeRequest(conn, parsed.RequestURI(), parsed.Host,
-		cfg.Subprotocols, cfg.Headers)
+		cfg.Subprotocols, cfg.Compression, cfg.Headers)
 	if reqErr != nil {
 		_ = conn.Close()
 
 		return nil, reqErr
 	}
-	subprotocol, respErr := readHandshakeResponse(reader, key)
+	subprotocol, compressed, respErr := readHandshakeResponse(reader, key, cfg.Subprotocols, cfg.Compression)
 	if respErr != nil {
 		_ = conn.Close()
 
@@ -1558,17 +2196,21 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
-	c := newConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
-	c.subprotocol = subprotocol
+	session := newConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
+	session.subprotocol = subprotocol
+	if compressed {
+		session.applyCompression()
+		session.compressLevel = cfg.CompressionLevel
+	}
 
-	return c, nil
+	return session, nil
 }
 
 // writeHandshakeRequest writes the client's opening HTTP request to conn and
 // returns the Sec-WebSocket-Key it used, for verifying the server's
 // response later.
 func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []string,
-	headers http.Header,
+	compression bool, headers http.Header,
 ) (string, error) {
 	keyBytes := make([]byte, wsKeyBytes)
 	_, randErr := rand.Read(keyBytes)
@@ -1590,6 +2232,9 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 			}
 		}
 		fmt.Fprintf(&req, "Sec-WebSocket-Protocol: %s\r\n", strings.Join(subprotocols, ", "))
+	}
+	if compression {
+		req.WriteString("Sec-WebSocket-Extensions: " + deflateResponseHeader + "\r\n")
 	}
 	for headerKey, values := range headers {
 		switch {
@@ -1620,26 +2265,66 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 }
 
 // readHandshakeResponse reads and verifies the server's 101 response,
-// returning the negotiated subprotocol.
-func readHandshakeResponse(reader *bufio.Reader, key string) (string, error) {
+// returning the negotiated subprotocol and whether permessage-deflate was
+// negotiated.
+func readHandshakeResponse(reader *bufio.Reader, key string, offered []string,
+	compressionOffered bool,
+) (string, bool, error) {
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
-		return "", fmt.Errorf("ws: read handshake response: %w", err)
+		return "", false, fmt.Errorf("ws: read handshake response: %w", err)
 	}
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return "", fmt.Errorf("%w: server replied %s", errHandshakeFailed, resp.Status)
+		return "", false, fmt.Errorf("%w: server replied %s", errHandshakeFailed, resp.Status)
 	}
 	// RFC 6455 §4.1: the 101 must carry the websocket upgrade tokens.
 	if !headerContainsToken(resp.Header, "Upgrade", "websocket") ||
 		!headerContainsToken(resp.Header, "Connection", "Upgrade") {
-		return "", fmt.Errorf("%w: 101 response missing the upgrade headers", errHandshakeFailed)
+		return "", false, fmt.Errorf("%w: 101 response missing the upgrade headers", errHandshakeFailed)
 	}
 	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		return "", fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, got)
+		return "", false, fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, got)
 	}
 
-	return resp.Header.Get("Sec-WebSocket-Protocol"), nil
+	subprotocol := resp.Header.Get("Sec-WebSocket-Protocol")
+	echoErr := checkSubprotocolEcho(offered, subprotocol)
+	if echoErr != nil {
+		return "", false, echoErr
+	}
+	compressed, extErr := verifyCompressionResponse(compressionOffered, splitExtensionGroups(resp.Header))
+	if extErr != nil {
+		return "", false, extErr
+	}
+
+	return subprotocol, compressed, nil
+}
+
+// checkSubprotocolEcho validates the Sec-WebSocket-Protocol header of the
+// 101 response against the subprotocols the client offered (RFC 6455
+// §1.9): the server selects none (no header), or exactly one of the
+// offered tokens. Conversely, several selections, or a token the client
+// never offered, fail the handshake. Every offered token was already validated
+// by [validSubprotocol] before it went on the wire, so membership in the
+// offered list implies a valid token.
+func checkSubprotocolEcho(offered []string, echoed string) error {
+	selected := ""
+	for token := range strings.SplitSeq(echoed, ",") {
+		if selected != "" {
+			return fmt.Errorf("%w: 101 response selected multiple subprotocols %q",
+				errHandshakeFailed, echoed)
+		}
+		selected = strings.TrimSpace(token)
+	}
+	if selected == "" {
+		return nil // the server selected no subprotocol
+	}
+	if !slices.Contains(offered, selected) {
+		return fmt.Errorf("%w: 101 response selected the unoffered subprotocol %q",
+			errHandshakeFailed, selected)
+	}
+
+	return nil
 }

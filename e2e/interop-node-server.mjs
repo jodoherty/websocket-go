@@ -3,7 +3,10 @@
 import { WebSocketServer } from "ws";
 
 const port = Number(process.argv[2] ?? 18543);
-const wss = new WebSocketServer({ port, host: "127.0.0.1" });
+// perMessageDeflate: true — accept the Go client's compression offer so the
+// interop exercises permessage-deflate in the Go-client -> Node-server
+// direction as well.
+const wss = new WebSocketServer({ port, host: "127.0.0.1", perMessageDeflate: true });
 
 wss.on("listening", () => console.log("ready"));
 wss.on("error", (e) => {

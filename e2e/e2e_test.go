@@ -240,12 +240,31 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	}
 	defer c.Close(ws.StatusNormalClosure, "")
 
+	// permessage-deflate must be negotiated (the Node server accepts the
+	// Go client's offer), and a large compressible message must survive the
+	// round trip through Node's decompressor.
+	if !c.Compressed() {
+		t.Fatal("Compressed() = false, want true: permessage-deflate should be negotiated with the Node server")
+	}
+	big := make([]byte, 1<<19) // 512 KiB of repetitive data
+	for i := range big {
+		big[i] = byte(i * 13)
+	}
+	wrErr := c.WriteMessage(ws.OpBinary, big)
+	if wrErr != nil {
+		t.Fatal(wrErr)
+	}
+	op, data, err := c.ReadMessage()
+	if err != nil || op != ws.OpBinary || len(data) != len(big) || !bytes.Equal(data, big) {
+		t.Fatalf("compressed binary echo via node = (op=%d len=%d err=%v)", op, len(data), err)
+	}
+
 	// Text and binary round-trips through the Node server.
 	writeErr := c.WriteMessage(ws.OpText, []byte("hello from go"))
 	if writeErr != nil {
 		t.Fatal(writeErr)
 	}
-	op, data, err := c.ReadMessage()
+	op, data, err = c.ReadMessage()
 	if err != nil || op != ws.OpText || string(data) != "hello from go" {
 		t.Fatalf("text echo via node = (%d, %q, %v)", op, data, err)
 	}

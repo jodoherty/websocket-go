@@ -156,6 +156,16 @@ ws/coverage_test.go closes out accessors, option functions, and rejection
 ws/mcdc_test.go     MC/DC test matrix: one subtest per required
                     independence pair, asserting the observable outcome
                     only that decision flip produces
+ws/protocol_test.go  RFC 6455 §4.1 handshake-validation pins and the §7.4
+                    close-code rules: unusable codes failed with 1002,
+                    must-not-set codes never on the wire, request bodies
+                    rejected, client-side subprotocol-echo verification
+                    (§1.9)
+ws/deflate_test.go   permessage-deflate (RFC 7692): extension negotiation
+                    (server offer parsing, client response verification), the
+                    RSV1 state machine, compressed round trips (incl. empty
+                    and fragmented messages), decompression error branches,
+                    and the compressed-path allocation budget
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
@@ -170,6 +180,8 @@ doc/USAGE.md      user-facing guide: design, API, running, VNC example
 doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions
 doc/rfc6455.txt   the RFC 6455 reference
+doc/rfc7692.txt   the RFC 7692 reference (permessage-deflate)
+doc/COMPRESSION.md permessage-deflate design + interop evidence
 e2e/            e2e suites:
                 ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
                                  binary, bearer accept/reject, mTLS rejection, close codes

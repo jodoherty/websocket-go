@@ -19,8 +19,13 @@ hand-written editing.)
    conformance evidence: Node's `ws` library (a completely separate
    codebase) plays both roles. Node client ↔ Go server verifies echo,
    binary, subprotocols, header-based bearer auth (something browsers can't
-   do), 401 rejection, and the 1001 close. Go client ↔ Node server verifies
-   the same in reverse, including a custom 4001 close code.
+   do), 401 rejection, the 1001 close, **and permessage-deflate in both
+   directions** (the negotiated extension is asserted, and a 512 KiB binary
+   round-trips compressed). Go client ↔ Node server verifies the same in
+   reverse, including a custom 4001 close code and compressed traffic
+   (`Conn.Compressed()` asserted). See `doc/COMPRESSION.md` for the details
+   the interop forced (header spelling, the decompression tail, the
+   compressor's Flush-then-truncate shape).
 5. **Browser e2e** (`npm test`) — the user-visible surface in two real
    engines: handshakes, origins, tokens, close codes as the browser
    reports them.
@@ -50,8 +55,8 @@ hand-written editing.)
    Ryzen 7600X a 1 KiB round trip is ~1.8 µs (~570 MB/s) with a single
    allocation (the payload), the masked client write is ~420 ns with zero
    allocations, and the accept key is ~130 ns.
-10. **Statement coverage** — the library sits at **97.7% statement
-    coverage** when the unit and e2e suites are combined (97.7% on the unit
+10. **Statement coverage** — the library sits at **98.3% statement
+    coverage** when the unit and e2e suites are combined (98.1% on the unit
     suite alone). The e2e suite (`go test ./e2e -cover -coverpkg=./ws`) adds
     the TLS client path, the mTLS handshake, and the real-network `Dial`;
     the two count-mode profiles are merged (per-block max of the hit
@@ -64,14 +69,14 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **96.4% branch coverage** (238 of 247
-    outcomes). The nine uncovered outcomes are structurally unreachable
-    without fault injection: two `crypto/rand.Read` error paths (it does
-    not fail), a `resp.Body != nil` guard (the body is never nil from
-    `http.ReadResponse`), a closed-state check the write mutex makes dead,
-    an empty-subprotocol guard the call path cannot reach, and four
-    mid-handshake write/hijack failures that need a live connection to fail
-    at exactly the wrong instant. `make branchcov` reproduces the number;
+    no-match). The library sits at **94.3% branch coverage** (363 of 385
+    outcomes). The uncovered outcomes are error paths that are structurally
+    unreachable without fault injection: the `crypto/rand.Read` error paths
+    (it does not fail), the flate writer/reader error paths (the encoder and
+    decoder do not fail on well-formed input), a guard against an unexpected
+    compressor stream tail, a closed-state check the write mutex makes dead,
+    and mid-handshake write/hijack failures that need a live connection to
+    fail at exactly the wrong instant. `make branchcov` reproduces the number;
     `cmd/branchcov` also documents two limits shared with every
     standard-profile tool (operand-level short-circuiting inside a boolean
     expression, and break-versus-condition-false loop exits).
@@ -91,10 +96,11 @@ hand-written editing.)
     observable outcome that only that decision flip produces. The tool
     re-checks every trace against the live source — a new or changed
     compound condition, a renamed test, or a pair that no longer flips the
-    decision fails the gate. Current state: **15 compound decisions, 33
-    required pairs, all traced**; the other 104 if/for conditions are
-    single-condition (branch-level, no MC/DC requirement). `make mcdc`
-    reproduces the audit.
+    decision fails the gate. Current state: **23 compound decisions, 50
+    required pairs, all traced** (the permessage-deflate RSV state machine
+    and the extension-negotiation parsing contribute 8 of the decisions);
+    the other 164 if/for conditions are single-condition (branch-level, no
+    MC/DC requirement). `make mcdc` reproduces the audit.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
 The keepalive read loop is timing logic — probe at the boundary, kill on
@@ -115,7 +121,20 @@ unreachable in the read loop, and `WithIdleTimeout` silently killed idle
 connections instead of keeping them alive.
 
 Security-relevant invariants baked into the design: clients must mask
-(enforced both directions — RFC §10.3), message size limits (DoS bound),
-strict same-origin default, constant-time token comparison in the demo,
-TLS-only client-cert trust (verification is the TLS layer's, the library
-only checks presence).
+(enforced both directions — RFC §10.3), message size limits (DoS bound —
+and, with permessage-deflate, the bound is enforced on the *decompressed*
+size during inflate, so a high-ratio payload cannot inflate past it,
+failing with 1009), strict same-origin default, constant-time token
+comparison in the demo, TLS-only client-cert trust (verification is the
+TLS layer's, the library only checks presence), client-side verification
+of the server's subprotocol selection (RFC §1.9 — an echoed token must be
+one the client offered, and only one; `checkSubprotocolEcho`), the
+permessage-deflate RSV state machine (RSV1 is legal only on the first
+frame of a negotiated compressed data message; RSV1 on a control or
+continuation frame, or RSV1 without the extension, is a 1002 protocol
+error; RSV2/RSV3 are always errors), client-side verification of the
+server's permessage-deflate response (the extension must be one the client
+offered, at most once, and must not demand more of the client's compressor
+than it allows), and option limits that fall back to the defaults rather
+than degrading (`sanitizeLimits`): non-positive message sizes and negative
+timeouts can never silently disable a protection.

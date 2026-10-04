@@ -19,7 +19,7 @@ func encodeOneFrame(b *testing.B, isClient bool, payload []byte) []byte {
 	b.Helper()
 	var buf bytes.Buffer
 	fc := &frameCodec{bw: bufio.NewWriterSize(&buf, 16<<10), isClient: isClient, maxMsg: 1 << 20}
-	writeErr := fc.writeFrame(OpText, payload)
+	writeErr := fc.writeFrame(OpText, payload, false)
 	if writeErr != nil {
 		b.Fatalf("encodeOneFrame: %v", writeErr)
 	}
@@ -43,7 +43,7 @@ func BenchmarkFrameCodecWrite(b *testing.B) {
 			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
 			for range b.N {
-				writeErr := fc.writeFrame(OpText, payload)
+				writeErr := fc.writeFrame(OpText, payload, false)
 				if writeErr != nil {
 					b.Fatal(writeErr)
 				}

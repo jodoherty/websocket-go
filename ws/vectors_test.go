@@ -159,7 +159,7 @@ func TestFrameCodecRoundtrip(t *testing.T) {
 
 				var sink bytes.Buffer
 				wc := frameCodec{bw: bufio.NewWriterSize(&sink, 16), isClient: isClient, maxMsg: 1 << 20}
-				err := wc.writeFrame(op, payload)
+				err := wc.writeFrame(op, payload, false)
 				if err != nil {
 					t.Fatalf("write (%v, %d, %d): %v", isClient, op, n, err)
 				}

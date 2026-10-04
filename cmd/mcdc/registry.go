@@ -13,18 +13,31 @@ package main
 
 // Test names referenced by the traces.
 const (
-	testControlFrame        = "TestMCDCControlFrame"
-	testIsReadTimeout       = "TestMCDCIsReadTimeout"
-	testWriteOpcode         = "TestMCDCWriteMessageOpcode"
-	testCloseCodeRange      = "TestMCDCCloseCodeRange"
-	testRequireCert         = "TestMCDCRequireClientCert"
-	testDialScheme          = "TestMCDCDialScheme"
-	testMCDCCloseCode       = "TestMCDCCloseCode"
-	testMCDCWebSocketKey    = "TestMCDCWebSocketKey"
-	testMCDCSubprotocol     = "TestMCDCSubprotocol"
-	testMCDCUpgrade101      = "TestMCDCUpgrade101"
-	testMCDCHandleCloseCode = "TestMCDCHandleCloseCode"
-	testMCDCTruncateReason  = "TestMCDCTruncateReason"
+	testControlFrame            = "TestMCDCControlFrame"
+	testIsReadTimeout           = "TestMCDCIsReadTimeout"
+	testWriteOpcode             = "TestMCDCWriteMessageOpcode"
+	testCloseCodeRange          = "TestMCDCCloseCodeRange"
+	testRequireCert             = "TestMCDCRequireClientCert"
+	testDialScheme              = "TestMCDCDialScheme"
+	testMCDCCloseCode           = "TestMCDCCloseCode"
+	testMCDCWebSocketKey        = "TestMCDCWebSocketKey"
+	testMCDCSubprotocol         = "TestMCDCSubprotocol"
+	testMCDCUpgrade101          = "TestMCDCUpgrade101"
+	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
+	testMCDCTruncateReason      = "TestMCDCTruncateReason"
+	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
+	testMCDCDeflateControl      = "TestMCDCDeflateControl"
+	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
+	testMCDCDeflateClientWindow = "TestMCDCDeflateClientWindow"
+	testMCDCDeflateOffered      = "TestMCDCDeflateOffered"
+	testMCDCDeflateWindowBits   = "TestMCDCDeflateWindowBits"
+)
+
+// Subtest names reused across more than one trace.
+const (
+	subtestDecode = "decode"
+	subtestBelow  = "below"
+	subtestAbove  = "above"
 )
 
 // pairTrace is one traced MC/DC independence pair.
@@ -49,6 +62,7 @@ func registry() []decisionTrace {
 	traces := frameTraces()
 	traces = append(traces, closeTraces()...)
 	traces = append(traces, handshakeTraces()...)
+	traces = append(traces, compressionTraces()...)
 
 	return append(traces, serverTraces()...)
 }
@@ -196,7 +210,7 @@ func handshakeTraces() []decisionTrace {
 			pairs: []pairTrace{
 				// "!!!!" is not base64: 400. The same 16-byte key, well
 				// formed, is accepted: 101.
-				{0, []bool{true, false}, []bool{false, false}, testMCDCWebSocketKey, "decode"},
+				{0, []bool{true, false}, []bool{false, false}, testMCDCWebSocketKey, subtestDecode},
 				// "QUFB" decodes to 3 bytes: 400. A 16-byte key is
 				// accepted: 101.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCWebSocketKey, "len"},
@@ -265,6 +279,129 @@ func serverTraces() []decisionTrace {
 				{0, []bool{true, false}, []bool{false, false}, testMCDCHandleCloseCode, "belowMin"},
 				// 5000 remapped to 1002, 4999 passed through unchanged.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCHandleCloseCode, "aboveMax"},
+			},
+		},
+	}
+}
+
+// compressionTraces covers the permessage-deflate (RFC 7692) RSV state
+// machine and the extension negotiation parsing.
+func compressionTraces() []decisionTrace {
+	return append(deflateFrameTraces(), windowBitsTraces()...)
+}
+
+// deflateFrameTraces covers the RSV state machine and the negotiation
+// accept/decline decisions.
+func deflateFrameTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (checkRSV): rsv1Set && !fc.deflate
+		{
+			expr:       "rsv1Set && !fc.deflate",
+			conditions: []string{"rsv1Set", "!fc.deflate"},
+			pairs: []pairTrace{
+				// An RSV1 frame fails on a connection without the extension;
+				// a plain frame on the same connection passes.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCDeflateRSV, "rsv1"},
+				// The same RSV1 frame passes when negotiated and fails when
+				// not.
+				{1, []bool{true, false}, []bool{true, true}, testMCDCDeflateRSV, "deflate"},
+			},
+		},
+		// ws.go (ReadMessage): frm.compressed && frm.isControl()
+		{
+			expr:       "frm.compressed && frm.isControl()",
+			conditions: []string{"frm.compressed", "frm.isControl()"},
+			pairs: []pairTrace{
+				// An RSV1 ping is a protocol error; a plain ping is answered
+				// with a pong.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCDeflateControl, "compressed"},
+				// An RSV1 ping is a protocol error; an RSV1 data frame is a
+				// valid compressed message.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateControl, "isControl"},
+			},
+		},
+		// ws.go (negotiateCompression): bits != 0 && bits < maxWindowBits
+		{
+			expr:       "bits != 0 && bits < maxWindowBits",
+			conditions: []string{"bits != 0", "bits < maxWindowBits"},
+			pairs: []pairTrace{
+				// No window demand is accepted; a 10-bit demand is declined.
+				{0, []bool{false, true}, []bool{true, true}, testMCDCDeflateServerWindow, "bits"},
+				// A 10-bit demand is declined; the full 15-bit demand is
+				// accepted.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateServerWindow, "belowMax"},
+			},
+		},
+		// ws.go (verifyCompressionResponse): bits != 0 && bits <
+		// maxWindowBits (the client-side twin of the server decision above;
+		// identical expression, second occurrence in source order).
+		{
+			expr:       "bits != 0 && bits < maxWindowBits",
+			conditions: []string{"bits != 0", "bits < maxWindowBits"},
+			pairs: []pairTrace{
+				// No window cap is accepted; a 10-bit cap fails the dial.
+				{0, []bool{false, true}, []bool{true, true}, testMCDCDeflateClientWindow, "bits"},
+				// A 10-bit cap fails the dial; the full 15-bit cap is
+				// accepted.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateClientWindow, "belowMax"},
+			},
+		},
+		// ws.go (verifyCompressionResponse): !offered && len(groups) > 0
+		{
+			expr:       "!offered && len(groups) > 0",
+			conditions: []string{"!offered", "len(groups) > 0"},
+			pairs: []pairTrace{
+				// An unoffered extension fails the dial; the same response is
+				// accepted when the client offered it.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCDeflateOffered, "offered"},
+				// With no offer, a response without the extension is accepted
+				// and one with it fails.
+				{1, []bool{true, false}, []bool{true, true}, testMCDCDeflateOffered, "groups"},
+			},
+		},
+	}
+}
+
+// windowBitsTraces covers the parseWindowBits decisions: the leading-zero
+// check and the range check on max_window_bits values.
+func windowBitsTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (parseWindowBits): len(value) > 1 && value[0] == '0'
+		{
+			expr:       "len(value) > 1 && value[0] == '0'",
+			conditions: []string{"len(value) > 1", "value[0] == '0'"},
+			pairs: []pairTrace{
+				// "010" is a leading zero; "0" skips the check and fails the
+				// range check instead.
+				{0, []bool{true, true}, []bool{false, true}, testMCDCDeflateWindowBits, "leadingZeroLen"},
+				// "010" is a leading zero; "10" is a valid value.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateWindowBits, "leadingZeroFirst"},
+			},
+		},
+		// ws.go (parseWindowBits): err != nil || bits < 8 ||
+		// bits > maxWindowBits
+		{
+			expr:       "err != nil || bits < 8 || bits > maxWindowBits",
+			conditions: []string{"err != nil", "bits < 8", "bits > maxWindowBits"},
+			pairs: []pairTrace{
+				// "abc" is not a number; "10" decodes in range.
+				{0, []bool{true, false, false}, []bool{false, false, false}, testMCDCDeflateWindowBits, subtestDecode},
+				// "7" is below the floor; "10" is in range.
+				{1, []bool{false, true, false}, []bool{false, false, false}, testMCDCDeflateWindowBits, subtestBelow},
+				// "16" is above the ceiling; "15" is in range.
+				{2, []bool{false, false, true}, []bool{false, false, false}, testMCDCDeflateWindowBits, subtestAbove},
+			},
+		},
+		// ws.go (parseWindowBits): err != nil || bits < 8 (nested: Go groups
+		// a || b || c as (a || b) || c)
+		{
+			expr:       "err != nil || bits < 8",
+			conditions: []string{"err != nil", "bits < 8"},
+			pairs: []pairTrace{
+				// "abc" is not a number; "10" decodes in range.
+				{0, []bool{true, false}, []bool{false, false}, testMCDCDeflateWindowBits, subtestDecode},
+				// "7" is below the floor; "10" is in range.
+				{1, []bool{false, true}, []bool{false, false}, testMCDCDeflateWindowBits, subtestBelow},
 			},
 		},
 	}

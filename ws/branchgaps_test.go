@@ -165,14 +165,14 @@ func TestWriteFramePayloadFailure(t *testing.T) {
 
 	// Client side (masked payload).
 	clientFC := &frameCodec{bw: bufio.NewWriterSize(failWriteConn{}, bufSize), isClient: true, maxMsg: 1 << 20}
-	writeErr := clientFC.writeFrame(OpBinary, payload)
+	writeErr := clientFC.writeFrame(OpBinary, payload, false)
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "payload") {
 		t.Fatalf("masked writeFrame over failing transport = %v, want a payload write error", writeErr)
 	}
 
 	// Server side (unmasked payload).
 	serverFC := &frameCodec{bw: bufio.NewWriterSize(failWriteConn{}, bufSize), isClient: false, maxMsg: 1 << 20}
-	writeErr = serverFC.writeFrame(OpBinary, payload)
+	writeErr = serverFC.writeFrame(OpBinary, payload, false)
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "payload") {
 		t.Fatalf("unmasked writeFrame over failing transport = %v, want a payload write error", writeErr)
 	}
@@ -285,5 +285,36 @@ func TestProbePingWriteFailure(t *testing.T) {
 	_, _, err := c.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "simulated write failure") {
 		t.Fatalf("ReadMessage after probe ping failure = %v, want the write error", err)
+	}
+}
+
+// TestSanitizeLimits pins the option-limit guard: a non-positive message
+// size, a negative idle window, or a negative write bound falls back to the
+// library default rather than degrading to "no limit" or "disabled", while
+// zero keeps its documented meanings (disabled keepalive, unbounded
+// writes).
+func TestSanitizeLimits(t *testing.T) {
+	up := NewUpgrader(
+		WithMaxMessageSize(0),
+		WithMaxMessageSize(-1),
+		WithIdleTimeout(-time.Second),
+		WithWriteTimeout(-time.Second),
+	)
+	if up.maxMessageSize != defaultMaxMessageSize {
+		t.Errorf("maxMessageSize = %d, want default %d", up.maxMessageSize, defaultMaxMessageSize)
+	}
+	if up.idleTimeout != defaultIdleTimeout {
+		t.Errorf("idleTimeout = %v, want default %v", up.idleTimeout, defaultIdleTimeout)
+	}
+	if up.writeTimeout != defaultWriteTimeout {
+		t.Errorf("writeTimeout = %v, want default %v", up.writeTimeout, defaultWriteTimeout)
+	}
+
+	// Explicit zeros are preserved: they are documented settings, not
+	// misconfiguration.
+	up = NewUpgrader(WithMaxMessageSize(1<<20), WithIdleTimeout(0), WithWriteTimeout(0))
+	if up.maxMessageSize != 1<<20 || up.idleTimeout != 0 || up.writeTimeout != 0 {
+		t.Errorf("explicit values not preserved: max=%d idle=%v write=%v",
+			up.maxMessageSize, up.idleTimeout, up.writeTimeout)
 	}
 }
