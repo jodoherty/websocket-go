@@ -58,7 +58,11 @@ func BenchmarkFrameCodecWrite(b *testing.B) {
 }
 
 // BenchmarkFrameCodecRead measures decoding one 1 KiB text frame, again on
-// both sides of the masking rule.
+// both sides of the masking rule. The reported ~3 allocs/op are benchmark
+// setup, not the codec: each iteration allocates a fresh frameCodec (which
+// escapes to the heap) and a fresh bytes.NewReader. The authoritative
+// steady-state number — exactly 1 alloc/op, the payload — is pinned by
+// TestReadFrameAllocationBudget in memory_test.go.
 func BenchmarkFrameCodecRead(b *testing.B) {
 	payload := benchPayload()
 	for name, isClient := range map[string]bool{

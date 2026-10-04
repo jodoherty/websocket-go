@@ -7,6 +7,11 @@ A WebSocket (RFC 6455) implementation for Go, stdlib only, designed to slot
 into `net/http` — `http.ServeMux`, `http.Handler`, `http.HandlerFunc` —
 rather than replace it.
 
+**Requirements:** Go 1.25 or newer — the code uses `errors.AsType`,
+`strings.SplitSeq`, and `slices`, which arrived in 1.24–1.25. The
+stdlib-only *import* invariant holds on any Go; the language floor is what
+it is.
+
 ## Design
 
 **The websocket is the second half of an ordinary HTTP request.**
@@ -405,6 +410,12 @@ DEMO_TOKEN=secret go run ./cmd/demo -addr :8443 -certs e2e/certs
 # open https://localhost:8443/ in a browser; console shows the echo test
 ```
 
+For test harnesses the demo also accepts `:0` (an ephemeral port) and a
+`-report host:port` flag: it then binds its listeners and reports the actual
+bound addresses back over that callback connection, so the harness can
+discover the demo's ports without any fixed value. The Go e2e and the
+Playwright global setup use exactly this to run the demo on ephemeral ports.
+
 `/ws/bearer` accepts the token two ways: the `Authorization: Bearer …`
 header, or `?token=…` on the URL. The query-param channel exists because
 browsers cannot set custom request headers on a `WebSocket` handshake, so
@@ -427,6 +438,14 @@ npm run test:go                           # Go client: full mTLS path (cert pres
 npm run test:all                          # both
 ```
 
+No test relies on a fixed port or a fixed shared path. The Go e2e
+(`e2e_test.go`) and the Playwright global setup (`global-setup.ts`) both
+build the demo and its throwaway certificates into a fresh temp directory
+and start it on ephemeral ports, learning the real addresses from the
+demo's `-report` callback (Playwright re-evaluates its config in every
+worker, so the ports live in the once-per-run `globalSetup`, which sets
+`WS_BASE_URL` for the workers). Repeated or parallel runs cannot collide.
+
 **Why the mTLS positive path is a Go test, not a browser test:** Chromium
 and Firefox refuse to present client certificates on connections whose
 server certificate they do not trust, and the demo server intentionally
@@ -445,7 +464,7 @@ certificate against the real demo binary (`e2e/e2e_test.go`).
 | `rfc6455.txt` | **Governing** — fully implemented and vector-pinned | The WebSocket protocol itself |
 | `rfc7692.txt` | **Implemented** — permessage-deflate (RFC 7692), on by default | The only extension with universal browser support; design and interop evidence in `doc/COMPRESSION.md` |
 | `rfc8307.txt` | Reference only | Defines `/ws://host/.well-known/…` URI conventions; no protocol mechanics, nothing to implement |
-| `rfc8441.txt` | Reference only | WebSockets over HTTP/2; no browser ships it, and serving it requires non-stdlib HTTP/2 extended-CONNECT code, which conflicts with the single-file stdlib-only invariant |
+| `rfc8441.txt` | Reference only | WebSockets over HTTP/2; Chromium and Firefox support it, but serving it needs HTTP/2 extended-CONNECT, which the Go standard library does not expose — unreachable for a stdlib-only package |
 | `rfc9220.txt` | Reference only | WebSockets over HTTP/3; no browser ships it, and QUIC is categorically outside the stdlib-only constraint |
 
 ## A VNC-shaped example

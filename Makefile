@@ -42,11 +42,13 @@ coverage:
 # Branch coverage. Go's built-in -cover counts statements only; this
 # derives per-branch outcomes (if true/false, for entry/exit, switch
 # cases) from a count-mode profile with cmd/branchcov, merging the unit
-# and e2e suites (the latter via -coverpkg).
+# and e2e suites (the latter via -coverpkg). -min makes it a real gate:
+# the run fails if merged coverage drops below 90% (the current 95%+ has
+# headroom over the documented structurally-unreachable error branches).
 branchcov:
 	go test -covermode=count -coverprofile=bc-unit.out ./ws/
 	go test -covermode=count -coverpkg=./ws -coverprofile=bc-e2e.out ./e2e/
-	go run ./cmd/branchcov ws bc-unit.out bc-e2e.out
+	go run ./cmd/branchcov -min 90 ws bc-unit.out bc-e2e.out
 
 # MC/DC audit: computes the required independence pairs for every
 # compound decision in ws/ and verifies each is traced to a test in

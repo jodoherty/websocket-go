@@ -50,6 +50,59 @@ func deflateTestConn(data []byte, isClient bool) *Conn {
 	return c
 }
 
+// TestWriteCompressedMessageOverLimitIsRefused pins the write-side size
+// guarantee under compression: an incompressible message exactly at
+// maxMessageSize expands under deflate, so the compressed frame exceeds the
+// limit even though the raw message fit. The write must be refused with
+// errMessageTooBig (a peer with the same limit would 1002 such a frame) and
+// the connection must stay open for a later, smaller write.
+func TestWriteCompressedMessageOverLimitIsRefused(t *testing.T) {
+	fc := &fakeConn{}
+	c := newConn(fc, fc, true, 100, 0, 0)
+	c.fc.deflate = true
+	c.deflateNegotiated = true
+	c.compressLevel = flate.DefaultCompression
+
+	// 100 incompressible bytes: the raw message is exactly at the limit, but
+	// compressing it yields ~106 bytes (see the compress() block overhead).
+	// Byte-space arithmetic (no int->byte conversion) keeps the buffer
+	// deterministic and lint-clean.
+	data := make([]byte, 100)
+	var v byte = 1
+	for i := range data {
+		v = v*131 + 17 // wraps mod 256: varied, non-repetitive bytes
+		data[i] = v
+	}
+	err := c.WriteMessage(OpBinary, data)
+	if !errors.Is(err, errMessageTooBig) {
+		t.Fatalf("WriteMessage(compressed over limit) = %v, want errMessageTooBig", err)
+	}
+	if c.Closed() {
+		t.Fatal("connection closed after refusing an oversized compressed write")
+	}
+
+	// A small write still succeeds: the refusal was per-write, not terminal.
+	err = c.WriteMessage(OpBinary, []byte("ok"))
+	if err != nil {
+		t.Fatalf("write after refusal: %v", err)
+	}
+}
+
+// TestWriteCompressedMessageAtLimitSucceeds is the mirror: a compressible
+// message at the limit stays under it once compressed and is accepted.
+func TestWriteCompressedMessageAtLimitSucceeds(t *testing.T) {
+	fc := &fakeConn{}
+	c := newConn(fc, fc, true, 100, 0, 0)
+	c.fc.deflate = true
+	c.deflateNegotiated = true
+	c.compressLevel = flate.DefaultCompression
+
+	err := c.WriteMessage(OpBinary, bytes.Repeat([]byte("a"), 100))
+	if err != nil {
+		t.Fatalf("compressible message at the limit: %v", err)
+	}
+}
+
 // offerHeader builds an http.Header carrying the given
 // Sec-WebSocket-Extension value ("" = no header at all).
 func offerHeader(offer string) http.Header {

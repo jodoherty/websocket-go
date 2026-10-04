@@ -4,7 +4,11 @@
 // Usage:
 //
 //	go test -covermode=count -coverprofile=bc.out <pkg>
-//	go run ./cmd/branchcov <package-dir> bc.out [more.out ...]
+//	go run ./cmd/branchcov [-min <percent>] <package-dir> bc.out [more.out ...]
+//
+// With -min, the command exits non-zero when the merged branch coverage is
+// below the given percentage, so the Makefile gate can enforce a floor
+// instead of merely reporting. Without it the report is informational.
 //
 // It walks the package's AST and, for every branch point, reports whether
 // each outcome was taken, using the basic-block counts from the profile:
@@ -34,6 +38,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -87,19 +92,21 @@ type block struct {
 }
 
 func main() {
-	if len(os.Args) < minArgs {
+	minPct := flag.Float64("min", 0, "fail if branch coverage is below this percentage (default 0 = report only)")
+	flag.Parse()
+	if flag.NArg() < minArgs {
 		printUsage()
 
 		os.Exit(exitBadArgs)
 	}
 
 	fset := token.NewFileSet()
-	files, err := parsePackages(fset, os.Args[1])
+	files, err := parsePackages(fset, flag.Arg(0))
 	if err != nil {
 		fail(err)
 	}
 
-	merged, err := mergeProfiles(os.Args[2:])
+	merged, err := mergeProfiles(flag.Args()[1:])
 	if err != nil {
 		fail(err)
 	}
@@ -109,10 +116,17 @@ func main() {
 	if reportErr != nil {
 		fail(reportErr)
 	}
+	if *minPct > 0 && total > 0 {
+		percent := pctPerWhole * float64(covered) / float64(total)
+		if percent < *minPct {
+			fmt.Fprintf(os.Stderr, "branchcov: coverage %.1f%% is below the %.1f%% minimum\n", percent, *minPct)
+			os.Exit(exitFailure)
+		}
+	}
 }
 
 func printUsage() {
-	_, _ = fmt.Fprintln(os.Stderr, "usage: branchcov <package-dir> <count-profile> [more ...]")
+	_, _ = fmt.Fprintln(os.Stderr, "usage: branchcov [-min <percent>] <package-dir> <count-profile> [more ...]")
 }
 
 // parsePackages parses every non-test Go file in dir.

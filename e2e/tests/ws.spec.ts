@@ -1,6 +1,12 @@
 import { test, expect, type Page } from "@playwright/test";
 
-const BASE = "wss://127.0.0.1:8443";
+// The base URLs are injected by global-setup.ts (which starts the demo on
+// ephemeral ports before workers fork), so no fixed address is baked in.
+const BASE = process.env.WS_BASE_URL;
+const HTTP_BASE = process.env.WS_HTTP_BASE_URL;
+if (!BASE || !HTTP_BASE) {
+  throw new Error("WS_BASE_URL/WS_HTTP_BASE_URL are not set — run via `make e2e` / `npm test` (global-setup.ts sets them)");
+}
 const TOKEN = process.env.DEMO_TOKEN ?? "demo-secret";
 
 /**
@@ -9,7 +15,7 @@ const TOKEN = process.env.DEMO_TOKEN ?? "demo-secret";
  * by the demo server itself.
  */
 async function sameOriginPage(page: Page) {
-  await page.goto("/");
+  await page.goto(HTTP_BASE + "/");
 }
 
 /** Connect, send one text message, resolve with the echo and the negotiated subprotocol. */
@@ -125,12 +131,12 @@ test("bearer: bad token is refused before the upgrade", async ({ page }) => {
 });
 
 test("bearer: plain HTTP without token gets 401", async ({ request }) => {
-  const resp = await request.get("/ws/bearer");
+  const resp = await request.get(HTTP_BASE + "/ws/bearer");
   expect(resp.status()).toBe(401);
 });
 
 test("bearer: valid token over plain HTTP is refused (400, upgrade headers required)", async ({ request }) => {
-  const resp = await request.get(`/ws/bearer?token=${TOKEN}`);
+  const resp = await request.get(`${HTTP_BASE}/ws/bearer?token=${TOKEN}`);
   expect(resp.status()).toBe(400);
 });
 
@@ -142,7 +148,7 @@ test("bearer: valid token over plain HTTP is refused (400, upgrade headers requi
  * the browser *can* verify is the rejection path, below.
  */
 test("mtls: plain HTTP request without client certificate gets 403", async ({ request }) => {
-  const resp = await request.get("/ws/mtls");
+  const resp = await request.get(HTTP_BASE + "/ws/mtls");
   expect(resp.status()).toBe(403);
 });
 

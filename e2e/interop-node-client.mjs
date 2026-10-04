@@ -4,8 +4,15 @@
 // under `go test`; pass the base address to run it standalone).
 import WebSocket from "ws";
 
-const BASE = process.argv[2] ?? "wss://127.0.0.1:18443";
+const BASE = process.argv[2];
+if (!BASE) {
+  console.error("usage: node interop-node-client.mjs <ws|wss base URL>");
+  process.exit(2);
+}
 const tlsOpts = BASE.startsWith("wss:") ? { rejectUnauthorized: false } : {};
+// The demo's default origin policy compares the Origin header against
+// scheme://Host, so the origin must mirror the actual dialed host:port.
+const origin = BASE.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
 
 const fails = [];
 
@@ -13,7 +20,7 @@ function open(url, opts = {}) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url, {
       ...tlsOpts,
-      origin: "https://127.0.0.1:18443",
+      origin,
       ...opts,
     });
     ws.on("open", () => resolve(ws));

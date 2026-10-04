@@ -4,11 +4,9 @@
   "private": true,
   "description": "Playwright e2e tests for the websocket package, run against the Go demo server in Firefox and Chromium",
   "scripts": {
-    "setup": "go -C .. run ./cmd/certgen -dir e2e/certs && go -C .. build -o e2e/.bin/demo ./cmd/demo",
-    "pretest": "npm run setup",
     "test": "playwright test",
     "test:go": "go -C .. test ./e2e -count=1",
-    "test:all": "npm run test:go && npm run test"
+    "test:all": "npm run test:go && npm test"
   },
   "devDependencies": {
     "@playwright/test": "^1.54.0",

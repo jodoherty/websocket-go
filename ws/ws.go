@@ -1358,11 +1358,9 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 	// permessage-deflate (RFC 7692 §6.1): the whole message is one raw
-	// DEFLATE stream and RSV1 marks the single frame as compressed. The
-	// compressed bytes are strictly no larger than the bound above plus a
-	// fixed block overhead, so no second size check is needed. Compressing
-	// happens under the write lock, with the compressor's scratch therefore
-	// owned by exactly one writer at a time.
+	// DEFLATE stream and RSV1 marks the single frame as compressed.
+	// Compressing happens under the write lock, with the compressor's
+	// scratch therefore owned by exactly one writer at a time.
 	frame, compressed := data, false
 	if c.deflateNegotiated {
 		compressErr := c.compress(data)
@@ -1373,6 +1371,19 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 			return compressErr
 		}
 		frame, compressed = c.compressBuf.Bytes(), true
+		// Incompressible or high-entropy data expands under deflate, so the
+		// compressed frame can exceed maxMessageSize even though the raw
+		// message fit the pre-check above. A peer rejects any frame over its
+		// own limit with 1002, so refuse the write here instead of sending a
+		// frame that a peer with the same limit would fail — the connection
+		// stays open, exactly as with the other validation rejections.
+		if int64(len(frame)) > c.fc.maxMsg {
+			_ = c.nc.SetWriteDeadline(time.Time{})
+			c.mu.Unlock()
+
+			return fmt.Errorf("%w: compressed message of %d bytes exceeds the %d byte limit",
+				errMessageTooBig, len(frame), c.fc.maxMsg)
+		}
 	}
 	writeErr := c.fc.writeFrame(opcode, frame, compressed)
 	_ = c.nc.SetWriteDeadline(time.Time{})

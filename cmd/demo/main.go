@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -53,9 +55,11 @@ const (
 )
 
 func main() {
-	addr := flag.String("addr", ":8443", "TLS listen address")
+	addr := flag.String("addr", ":8443", "TLS listen address (:0 for an ephemeral port)")
 	certs := flag.String("certs", "e2e/certs", "directory containing ca.pem, server.pem, server.key")
-	healthAddr := flag.String("health-addr", "127.0.0.1:8444", "plain-HTTP health-check listen address")
+	healthAddr := flag.String("health-addr", "127.0.0.1:8444",
+		"plain-HTTP health-check listen address (:0 = ephemeral)")
+	report := flag.String("report", "", "host:port of a harness-owned callback listener to report the bound addresses to")
 	flag.Parse()
 
 	srv := &http.Server{
@@ -64,7 +68,6 @@ func main() {
 		ReadHeaderTimeout: readHeaderTimeout,
 		TLSConfig:         tlsConfig(*certs),
 	}
-	log.Printf("demo server on %s (bearer token via DEMO_TOKEN, default %q)", *addr, token())
 	health := &http.Server{
 		Addr:              *healthAddr,
 		ReadHeaderTimeout: healthReadHeaderTimeout,
@@ -77,14 +80,60 @@ func main() {
 			http.NotFound(writer, request)
 		}),
 	}
-	go func() {
-		log.Printf("health check on %s", *healthAddr)
-		_ = health.ListenAndServe()
-	}()
-	listenErr := srv.ListenAndServeTLS(*certs+"/server.pem", *certs+"/server.key")
-	if listenErr != nil {
-		log.Fatal(listenErr)
+
+	// Bind the listeners before serving so an ephemeral address (:0) resolves
+	// to a real port we can report to the harness, and so a port conflict
+	// fails before we ever claim readiness. A fresh ListenConfig keeps the
+	// dials context-bounded (noctx).
+	lc := net.ListenConfig{}
+	tlsL, err := lc.Listen(context.Background(), "tcp", *addr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", *addr, err)
 	}
+	healthL, err := lc.Listen(context.Background(), "tcp", *healthAddr)
+	if err != nil {
+		log.Fatalf("listen %s: %v", *healthAddr, err)
+	}
+
+	// -report turns this into a harness-discoverable server: the callback
+	// listener is created and reserved by the harness before it launches us,
+	// so this connection is the "here are my (ephemeral) ports" handshake.
+	// Without it the demo just serves on the configured address.
+	if *report != "" {
+		go reportBound(*report, tlsL.Addr(), healthL.Addr())
+	}
+	log.Printf("demo server on %s (bearer token via DEMO_TOKEN, default %q)",
+		tlsL.Addr(), token())
+
+	go func() {
+		log.Printf("health check on %s", healthL.Addr())
+		_ = health.Serve(healthL)
+	}()
+	serveErr := srv.ServeTLS(tlsL, *certs+"/server.pem", *certs+"/server.key")
+	if serveErr != nil {
+		log.Fatal(serveErr)
+	}
+}
+
+// reportBound dials the harness-owned callback listener given by -report and
+// writes the actual bound addresses of the demo's listeners, one line of
+// space-separated "host:port" strings, then closes. The callback listener is
+// bound and reserved by the harness before it launches this process, so the
+// connection is the handshake that lets the harness learn ephemeral (:0)
+// listeners without any fixed port.
+func reportBound(callback string, addrs ...net.Addr) {
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", callback)
+	if err != nil {
+		log.Printf("report: dial %s: %v", callback, err)
+
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	parts := make([]string, len(addrs))
+	for i, a := range addrs {
+		parts[i] = a.String()
+	}
+	_, _ = fmt.Fprintf(conn, "%s\n", strings.Join(parts, " "))
 }
 
 // buildMux assembles the demo's routes: echo (plain upgrader sugar),

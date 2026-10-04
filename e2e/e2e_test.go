@@ -17,28 +17,33 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	ws "github.com/jodoherty/websocket-go/ws"
 )
 
-const (
-	wsAddr    = "127.0.0.1:18443"
-	healthURL = "http://127.0.0.1:18444/health"
-)
+// demoEnv holds the demo server's resolved TLS address and the directory of
+// its throwaway certificates, populated once by setup() into ephemeral
+// allocations (no fixed ports or paths) so repeated or parallel runs cannot
+// collide.
+//
+//nolint:gochecknoglobals // session-wide test state, set once in TestMain's setup
+var demoEnv = struct {
+	addr    string
+	certDir string
+}{}
 
 func TestMain(m *testing.M) {
-	demoCmd, err := setup()
+	demoCmd, cleanup, err := setup()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "e2e setup failed:", err)
 		os.Exit(1)
@@ -48,47 +53,154 @@ func TestMain(m *testing.M) {
 		_ = demoCmd.Process.Kill()
 		_ = demoCmd.Wait()
 	}
+	cleanup()
 	os.Exit(code)
 }
 
-func setup() (*exec.Cmd, error) {
+// setup generates the throwaway CA/server/client certificates and a demo
+// binary into a fresh temp directory, launches the demo on ephemeral ports,
+// and learns the actual ports from the demo's port report (see cmd/demo's
+// -report). It returns the demo command, a cleanup function, and any setup
+// error. Setup is verified, not assumed: the demo must report two addresses,
+// stay alive, and actually serve TLS before the tests run.
+func setup() (*exec.Cmd, func(), error) {
 	root, err := filepath.Abs("..")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	certgenErr := run(root, "run", "./cmd/certgen", "-dir", filepath.Join(root, "e2e/certs"))
-	if certgenErr != nil {
-		return nil, fmt.Errorf("certgen: %w", certgenErr)
+	tmp, err := os.MkdirTemp("", "ws-e2e-")
+	if err != nil {
+		return nil, nil, fmt.Errorf("mkdtemp: %w", err)
 	}
-	mkdirErr := os.MkdirAll(filepath.Join(root, "e2e/.bin"), 0o750)
-	if mkdirErr != nil {
-		return nil, mkdirErr
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	// On any error below, remove the temp dir before returning; on success the
+	// caller owns cleanup.
+	ok := false
+	defer func() {
+		if !ok {
+			cleanup()
+		}
+	}()
+
+	certsDir := filepath.Join(tmp, "certs")
+	err = run(root, "run", "./cmd/certgen", "-dir", certsDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("certgen: %w", err)
 	}
-	buildErr := run(root, "build", "-o", filepath.Join(root, "e2e/.bin/demo.e2e"), "./cmd/demo")
-	if buildErr != nil {
-		return nil, fmt.Errorf("build demo: %w", buildErr)
+	demoEnv.certDir = certsDir
+	demoBin := filepath.Join(tmp, "demo.e2e")
+	err = run(root, "build", "-o", demoBin, "./cmd/demo")
+	if err != nil {
+		return nil, nil, fmt.Errorf("build demo: %w", err)
 	}
+
+	// The callback listener is bound (and held) by us before the demo
+	// launches, so its port is reserved: nothing else can take it. The demo
+	// binds its own service listeners on ephemeral ports and reports the
+	// actual addresses back over this reserved connection.
+	callback, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, fmt.Errorf("reserve report listener: %w", err)
+	}
+	defer callback.Close()
+
 	//nolint:gosec // the binary path is built from the repo root, not peer input.
-	demoCmd := exec.Command(filepath.Join(root, "e2e/.bin/demo.e2e"),
-		"-addr", wsAddr, "-certs", filepath.Join(root, "e2e/certs"), "-health-addr", "127.0.0.1:18444")
+	demoCmd := exec.Command(demoBin,
+		"-addr", "127.0.0.1:0", "-health-addr", "127.0.0.1:0",
+		"-certs", demoEnv.certDir, "-report", callback.Addr().String())
 	demoCmd.Stdout = os.Stderr
 	demoCmd.Stderr = os.Stderr
-	startErr := demoCmd.Start()
-	if startErr != nil {
-		return nil, startErr
+	err = demoCmd.Start()
+	if err != nil {
+		return nil, nil, fmt.Errorf("start demo: %w", err)
 	}
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(healthURL)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return demoCmd, nil
-			}
+
+	addrs, err := readReport(callback, 20*time.Second)
+	if err != nil {
+		_ = demoCmd.Process.Kill()
+
+		return nil, nil, fmt.Errorf("demo did not report its listeners: %w", err)
+	}
+	if len(addrs) != 2 {
+		_ = demoCmd.Process.Kill()
+
+		return nil, nil, fmt.Errorf("demo reported %d addresses, want 2", len(addrs))
+	}
+	demoEnv.addr = addrs[0]
+
+	// Verify setup: the demo must still be alive and actually serving TLS on
+	// the reported address, not merely bound.
+	err = demoCmd.Process.Signal(syscall.Signal(0))
+	if err != nil {
+		return nil, nil, fmt.Errorf("demo exited during startup: %w", err)
+	}
+	err = waitTLSReady(demoEnv.addr)
+	if err != nil {
+		_ = demoCmd.Process.Kill()
+
+		return nil, nil, err
+	}
+
+	ok = true
+
+	return demoCmd, cleanup, nil
+}
+
+// readReport accepts one connection on the reserved callback listener and
+// reads a single line of space-separated "host:port" addresses from it. The
+// callback listener is bound before the child launches, so the child's
+// connect completes in the kernel backlog and this accept returns whenever
+// it is called — no fixed port, no readiness race.
+func readReport(l net.Listener, timeout time.Duration) ([]string, error) {
+	type report struct {
+		addrs []string
+		err   error
+	}
+	ch := make(chan report, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			ch <- report{err: err}
+
+			return
 		}
+		defer conn.Close()
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			ch <- report{err: err}
+
+			return
+		}
+		ch <- report{addrs: strings.Fields(line)}
+	}()
+	select {
+	case r := <-ch:
+		return r.addrs, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timed out after %s", timeout)
+	}
+}
+
+// waitTLSReady dials addr and completes a TLS handshake (accepting any
+// certificate — the demo uses a throwaway self-signed CA), retrying until the
+// demo is actually serving. This is the setup verification that the reported
+// port is a live TLS server, not just a bound socket.
+func waitTLSReady(addr string) error {
+	//nolint:gosec // e2e: the demo's self-signed certificate is deliberately untrusted.
+	cfg := &tls.Config{InsecureSkipVerify: true}
+	var lastErr error
+	for range 50 {
+		conn, err := tls.Dial("tcp", addr, cfg)
+		if err == nil {
+			_ = conn.Close()
+
+			return nil
+		}
+		lastErr = err
 		time.Sleep(100 * time.Millisecond)
 	}
-	return nil, errors.New("demo server did not become ready")
+
+	return fmt.Errorf("demo TLS listener never became ready: %w", lastErr)
 }
 
 func run(dir string, args ...string) error {
@@ -100,11 +212,11 @@ func run(dir string, args ...string) error {
 	return cmd.Run()
 }
 
-func tlsConfigWithClientCert(t *testing.T, root string) *tls.Config {
+func tlsConfigWithClientCert(t *testing.T) *tls.Config {
 	t.Helper()
-	caPEM := read(t, filepath.Join(root, "e2e/certs/ca.pem"))
-	clientPEM := read(t, filepath.Join(root, "e2e/certs/client.pem"))
-	clientKey := read(t, filepath.Join(root, "e2e/certs/client.key"))
+	caPEM := read(t, filepath.Join(demoEnv.certDir, "ca.pem"))
+	clientPEM := read(t, filepath.Join(demoEnv.certDir, "client.pem"))
+	clientKey := read(t, filepath.Join(demoEnv.certDir, "client.key"))
 	cert, err := tls.X509KeyPair(clientPEM, clientKey)
 	if err != nil {
 		t.Fatalf("client keypair: %v", err)
@@ -154,12 +266,11 @@ func (l *lockedBuffer) String() string {
 }
 
 func TestMTLSClientCertOpensSession(t *testing.T) {
-	root, _ := filepath.Abs("..")
-	cfg := tlsConfigWithClientCert(t, root)
+	cfg := tlsConfigWithClientCert(t)
 
-	c, err := ws.Dial(context.Background(), "wss://"+wsAddr+"/ws/mtls",
+	c, err := ws.Dial(context.Background(), "wss://"+demoEnv.addr+"/ws/mtls",
 		ws.WithTLS(cfg), ws.WithIdleTimeout(0), ws.WithSubprotocols("vnc1"),
-		ws.WithHeader("Origin", "https://"+wsAddr))
+		ws.WithHeader("Origin", "https://"+demoEnv.addr))
 	if err != nil {
 		t.Fatalf("dial /ws/mtls with client cert: %v", err)
 	}
@@ -183,14 +294,13 @@ func TestMTLSClientCertOpensSession(t *testing.T) {
 }
 
 func TestMTLSWithoutClientCertIsRefused(t *testing.T) {
-	root, _ := filepath.Abs("..")
-	caPEM := read(t, filepath.Join(root, "e2e/certs/ca.pem"))
+	caPEM := read(t, filepath.Join(demoEnv.certDir, "ca.pem"))
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPEM)
 
-	_, err := ws.Dial(context.Background(), "wss://"+wsAddr+"/ws/mtls",
+	_, err := ws.Dial(context.Background(), "wss://"+demoEnv.addr+"/ws/mtls",
 		ws.WithTLS(&tls.Config{ServerName: "localhost", RootCAs: pool}),
-		ws.WithIdleTimeout(0), ws.WithHeader("Origin", "https://"+wsAddr))
+		ws.WithIdleTimeout(0), ws.WithHeader("Origin", "https://"+demoEnv.addr))
 	if err == nil {
 		t.Fatal("dial /ws/mtls without client cert succeeded, want refusal")
 	}
@@ -207,7 +317,8 @@ func TestMTLSWithoutClientCertIsRefused(t *testing.T) {
 // Node server.
 
 func TestInteropNodeClientAgainstGoServer(t *testing.T) {
-	cmd := exec.Command("node", "interop-node-client.mjs", "wss://"+wsAddr)
+	//nolint:gosec // the base URL is the demo address we just started, not peer input.
+	cmd := exec.Command("node", "interop-node-client.mjs", "wss://"+demoEnv.addr)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node ws client failed against Go server:\n%s (%v)", out, err)
@@ -216,14 +327,20 @@ func TestInteropNodeClientAgainstGoServer(t *testing.T) {
 }
 
 func TestInteropGoClientAgainstNodeServer(t *testing.T) {
-	const nodeAddr = "127.0.0.1:18543"
-	cmd := exec.Command("node", "interop-node-server.mjs", "18543")
-	var serverOut lockedBuffer
-	cmd.Stderr = &serverOut
-	stdout, err := cmd.StdoutPipe()
+	// The node server binds its own ephemeral ws listener and reports the
+	// actual address over a reserved callback listener — the same pattern as
+	// the demo's -report — so the Go client learns the port without any
+	// fixed value.
+	callback, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer callback.Close()
+
+	//nolint:gosec // the callback address is the listener we just reserved, not peer input.
+	cmd := exec.Command("node", "interop-node-server.mjs", callback.Addr().String())
+	var serverOut lockedBuffer
+	cmd.Stderr = &serverOut
 	startErr := cmd.Start()
 	if startErr != nil {
 		t.Fatalf("start node server: %v", startErr)
@@ -236,25 +353,18 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 		}
 	}()
 
-	// Wait for the node server to report readiness, then for the port to
-	// actually be reachable — the former is the process's claim, the latter
-	// is the precondition we depend on.
-	scanner := bufio.NewScanner(stdout)
-	if !scanner.Scan() || scanner.Text() != "ready" {
-		t.Fatalf("node server did not report ready (stderr: %s)", serverOut.String())
+	// Readiness is the report itself: the node server reports its address
+	// from the "listening" event, by which point the listener is bound and
+	// accepting, so the Go client can dial it directly.
+	addrs, err := readReport(callback, 10*time.Second)
+	if err != nil {
+		t.Fatalf("node server did not report its port: %v (stderr: %s)", err, serverOut.String())
 	}
-	const maxAttempts = 50
-	for attempt := 0; ; attempt++ {
-		nc, err := net.DialTimeout("tcp", nodeAddr, time.Second)
-		if err == nil {
-			_ = nc.Close()
-			break
-		}
-		if attempt == maxAttempts {
-			t.Fatalf("node server port never became reachable: %v (stderr: %s)", err, serverOut.String())
-		}
-		time.Sleep(50 * time.Millisecond)
+	if len(addrs) != 1 {
+		t.Fatalf("node server reported %d addresses, want 1", len(addrs))
 	}
+	nodeAddr := addrs[0]
+	t.Logf("node server listening on %s", nodeAddr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
