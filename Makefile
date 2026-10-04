@@ -57,11 +57,12 @@ branchcov:
 mcdc:
 	go run ./cmd/mcdc ws
 
-# Multi-toolchain check: on the oldest supported Go (go.mod's floor; ws.go is
-# vendored by copying, so the floor is the oldest Go a vendoring project may
-# run) and on each newer release we test with, the whole module must build,
-# vet, and pass the ws unit suite AND the Go e2e suite (mTLS + Node interop)
-# under the race detector. The Playwright browser half is deliberately not
+# Multi-toolchain check: on the oldest supported Go (go.mod's floor — the
+# test suite uses testing/synctest, new in 1.25; ws.go vendored by copying
+# works on older Go, since it compiles under the vendoring project's own
+# go.mod) and on each newer release we test with, the whole module must
+# build, vet, and pass the ws unit suite AND the Go e2e suite (mTLS + Node
+# interop) under the race detector. The Playwright browser half is deliberately not
 # repeated per toolchain — browsers exercise the protocol, not the Go
 # runtime, so it runs once on the default toolchain via the e2e target.
 # Toolchains download on first use.

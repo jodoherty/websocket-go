@@ -7,8 +7,10 @@ A WebSocket (RFC 6455) implementation for Go, stdlib only, designed to slot
 into `net/http` — `http.ServeMux`, `http.Handler`, `http.HandlerFunc` —
 rather than replace it.
 
-**Requirements:** Go 1.27.1 or newer (the `go.mod` floor) — the code uses
-`errors.AsType` (new in 1.26) and `strings.SplitSeq` (new in 1.24). The
+**Requirements:** Go 1.25.0 or newer as a module (the `go.mod` floor; the
+test suite uses `testing/synctest`, new in 1.25), or Go 1.24.0 or newer if
+you vendor `ws/ws.go` by copying it into an existing project — the
+implementation file itself only needs `strings.SplitSeq` (new in 1.24). The
 stdlib-only *import* invariant holds on any Go; the language floor is what
 it is.
 
