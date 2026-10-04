@@ -78,7 +78,7 @@ same. Do not commit, push, or declare work done until all pass:
 make lint        # golangci-lint, every linter enabled (.golangci.yml)
 make staticcheck # staticcheck -checks=all
 make test        # go test ./...
-make race        # go test -race ./ws/ ./e2e/
+make race        # go test -race ./...
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
