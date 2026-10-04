@@ -341,11 +341,9 @@ func subtestName(node ast.Node) (string, bool) {
 
 // verify joins the source decisions with the registry and checks every
 // requirement: a trace per condition, a valid pair per trace, an
-// existing test per trace.
-// verify joins the source decisions with the registry and checks every
-// requirement: a trace per condition, a valid pair per trace, an existing
-// test per trace. It returns the per-decision statuses and, separately,
-// the registry entries that no longer match any source decision.
+// existing test per trace. It returns the per-decision statuses and,
+// separately, the registry entries that no longer match any source
+// decision.
 func verify(decisions []decision, tests map[string]map[string]bool) ([]status, []status) {
 	results := make([]status, len(decisions))
 	var stale []status

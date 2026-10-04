@@ -135,15 +135,17 @@ New `ws/deflate_test.go` (internal `package ws`, using `newTestConn`/
 
 - **Handshake:** no header; bare token; each parameter individually and
   combined; explicit `client_max_window_bits` (15 → accepted, <15 →
-  refused); unknown extension alongside permessage-deflate (ignored);
-  permessage-deflate listed twice (400 — the RFC says fail).
+  refused); unknown extension alongside permessage-deflate (400 — the
+  server fails an extension it does not understand, mirroring the
+  twice-listed case); permessage-deflate listed twice (400 — the RFC says
+  fail).
 - **Frame rules:** RSV1 on control frame → 1002; RSV1 on continuation
   → 1002; RSV1 cleared mid-message → 1002; RSV2/3 with the extension
   negotiated → 1002.
 - **Round trips (internal conn pair):** text, binary, fragmented
-  (RSV1 only on the first fragment), empty-after-inflate edge (payload
-  that inflates to zero bytes is **not** valid — a compressed message
-  must inflate to ≥1 byte; 1002), MaxMessageSize enforcement on the
+  (RSV1 only on the first fragment), empty-after-inflate edge (a payload
+  that inflates to zero bytes is the legal empty message — it round-trips),
+  MaxMessageSize enforcement on the
   expanded payload, decompression-bomb-shaped payload (compresses small,
   inflates past the bound → 1009 before the inflate buffer can grow
   unboundedly — the inflate stops at the bound).

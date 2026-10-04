@@ -63,7 +63,13 @@ rather than replace it.
      `errors.Is(err, io.EOF)`
    - any other close code (including 1001 "going away") → `*ws.CloseError`
      with code and reason
-   - resets, timeouts, protocol violations → the error, directly or wrapped
+   - frame-level protocol violation (masking, reserved-bit misuse,
+     malformed or oversized frame, unknown opcode) → `*ws.CloseError` code
+     1002; the peer gets the matching 1002 close frame before the
+     transport is torn down (RFC 6455 §7.1.7). Errors found while a
+     message is being assembled (fragmentation, size, UTF-8, decompression)
+     end the connection the same way but without a close frame
+   - resets, timeouts → the error, directly or wrapped
 
    The keepalive (default 60 s window) detects silently dead peers (crash,
    power loss, NAT expiry): a connection silent for one window is probed
@@ -143,9 +149,12 @@ read, control-frame validation, ping/pong handled transparently (auto-pong),
 UTF-8 validation on text frames (RFC 6455 §5.6 — a non-UTF-8 text message
 fails the connection with 1007, the close Node's ws and browsers use for
 exactly this; `WriteMessage(OpText, …)` with invalid UTF-8 is refused before
-it reaches the wire), subprotocol negotiation with client-side echo
-verification (RFC 6455 §1.9 — the dial fails if the server selects a token
-the client never offered, or several at once), close-code semantics per RFC
+it reaches the wire), subprotocol negotiation with token validation on
+both sides and client-side echo verification (RFC 6455 §1.9 — a client
+offer the server cannot echo is refused, the dial fails if the server
+selects a token the client never offered, or several at once, and a
+server-advertised token that is not a valid token fails its handshake with
+400), close-code semantics per RFC
 6455, and CR/LF rejection in client request headers and subprotocols.
 
 ## Security

@@ -912,6 +912,14 @@ func (c *Conn) finish(err error) error {
 // reason, so the distinction between a clean end and a notification is
 // visible to the application.
 //
+// A frame-level protocol violation — a masking violation, reserved-bit
+// misuse, a malformed or oversized frame header, an unknown opcode — is
+// answered with a 1002 close frame before the transport is torn down
+// (RFC 6455 §7.1.7). Errors detected while a data message is being
+// assembled (fragmentation violations, size and decompression limits) end
+// the connection without a close frame: the stream has already diverged,
+// so anything written past that point is best effort at best.
+//
 // Pings and pongs are handled transparently: incoming pings are answered
 // automatically and pongs are consumed, so neither appears in the return
 // values. Text messages must be valid UTF-8 (RFC 6455 §5.6): a text
@@ -935,18 +943,9 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 		return 0, nil, terminalErr(closeErr)
 	}
 	for {
-		armErr := c.armIdle()
-		if armErr != nil {
-			return 0, nil, c.finish(armErr)
-		}
-		frm, err := c.fc.readFrame()
-		if err != nil {
-			retry, connErr := c.keepaliveTimeout(err)
-			if retry {
-				continue
-			}
-
-			return 0, nil, c.finish(connErr)
+		frm, readErr := c.readNextFrame()
+		if readErr != nil {
+			return 0, nil, readErr
 		}
 		_ = c.nc.SetReadDeadline(time.Time{}) // clear the keepalive deadline
 		c.lastActivity = time.Now()
@@ -983,8 +982,7 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 
 			return msgOp, payload, nil
 		default:
-			return 0, nil, c.finish(
-				fmt.Errorf("%w: unknown opcode %d", errProtocol, frm.opcode))
+			return 0, nil, c.failProtocol(fmt.Sprintf("unknown opcode %d", frm.opcode))
 		}
 	}
 }
@@ -1033,6 +1031,36 @@ func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
 	}
 
 	return msgOp, out, true, nil
+}
+
+// readNextFrame reads one frame, resolving read errors against the
+// keepalive clock: a silence timeout that still allows a probe ping
+// re-arms and retries; a frame-level protocol violation (masking, RSV,
+// malformed or oversized header) is answered with a 1002 close frame
+// before the transport is torn down (RFC 6455 §7.1.7), so the peer sees
+// a close frame rather than a bare TCP close; a transport error or a
+// silence timeout that killed the connection is terminal.
+func (c *Conn) readNextFrame() (frame, error) {
+	for {
+		armErr := c.armIdle()
+		if armErr != nil {
+			return frame{}, c.finish(armErr)
+		}
+		frm, err := c.fc.readFrame()
+		if err == nil {
+			return frm, nil
+		}
+		retry, connErr := c.keepaliveTimeout(err)
+		if retry {
+			continue
+		}
+		if errors.Is(connErr, errProtocol) {
+			return frame{}, c.failProtocol(
+				strings.TrimPrefix(connErr.Error(), errProtocol.Error()+": "))
+		}
+
+		return frame{}, c.finish(connErr)
+	}
 }
 
 // keepaliveTimeout processes a read error against the keepalive clock. It
@@ -1479,8 +1507,10 @@ type Config struct {
 // requires a subprotocol must reject the request itself, in
 // [WithPreHandshake] or its own code, before the switch. The client
 // verifies the server's choice: the echoed token must be one of the ones
-// it offered (RFC 6455 §1.9), or the dial fails. The result is visible on
-// both sides via [Conn.Subprotocol].
+// it offered (RFC 6455 §1.9), or the dial fails. An advertised token that
+// is not a valid token (RFC 2616) fails every handshake on the upgrader
+// with 400 — a misconfiguration the 101 must not echo onto the wire. The
+// result is visible on both sides via [Conn.Subprotocol].
 func WithSubprotocols(list ...string) Option {
 	return func(cfg *Config) { cfg.Subprotocols = list }
 }
@@ -1746,6 +1776,25 @@ func rejectStatus(writer http.ResponseWriter, status int, msg string) *UpgradeEr
 	return &UpgradeError{Status: status, Msg: msg}
 }
 
+// rejectOnConn writes the HTTP error response directly on an already
+// hijacked connection and tears it down. After the hijack the
+// ResponseWriter is dead — net/http logs the write but the bytes never
+// reach the client — so the response must go over the raw connection.
+// Connection: close keeps the client from ever treating the remainder of
+// the stream as WebSocket traffic.
+func rejectOnConn(raw net.Conn, status int, msg string) *UpgradeError {
+	text := http.StatusText(status)
+	body := msg + "\n"
+	_, _ = fmt.Fprintf(raw, "HTTP/1.1 %d %s\r\n"+
+		"Content-Type: text/plain; charset=utf-8\r\n"+
+		"X-Content-Type-Options: nosniff\r\n"+
+		"Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+		status, text, len(body), body)
+	_ = raw.Close()
+
+	return &UpgradeError{Status: status, Msg: msg}
+}
+
 // checkHandshakeHeaders validates the websocket protocol headers on the
 // request and returns its Sec-WebSocket-Key (RFC 6455 §4.1-§4.2): the
 // Connection and Upgrade tokens, a supported Sec-WebSocket-Version, and a
@@ -1885,16 +1934,16 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	// return before calling Upgrade, and nothing may be written to writer
 	// after it succeeds.)
 	if buf.Reader.Buffered() > 0 {
-		_ = raw.Close()
-
-		return nil, &UpgradeError{
-			Status: http.StatusBadRequest, Msg: "unconsumed request data"}
+		return nil, rejectOnConn(raw, http.StatusBadRequest, "unconsumed request data")
 	}
 
-	protocol := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
+	protocol, protoErr := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
+	if protoErr != nil {
+		return nil, rejectOnConn(raw, http.StatusBadRequest, protoErr.Error())
+	}
 	extension, extErr := u.negotiateExtensions(request)
 	if extErr != nil {
-		return reject(writer, http.StatusBadRequest, extErr.Error())
+		return nil, rejectOnConn(raw, http.StatusBadRequest, extErr.Error())
 	}
 	writeErr := writeSwitchingProtocols(raw, protocol, acceptKey(key), extension)
 	if writeErr != nil {
@@ -2014,17 +2063,22 @@ func headerContainsToken(h http.Header, key, token string) bool {
 // server's advertised list and the client's Sec-WebSocket-Protocol request
 // (RFC 6455 §1.9): the first advertised token the client also requested,
 // or "" when there is no overlap — a handshake with no subprotocol is
-// legal.
-func negotiateProtocol(server []string, clientHeader string) string {
+// legal. An advertised token that is not a valid token (RFC 2616) is a
+// misconfiguration the 101 must not echo onto the wire, so it fails the
+// handshake.
+func negotiateProtocol(server []string, clientHeader string) (string, error) {
 	for _, advertised := range server {
+		if !validSubprotocol(advertised) {
+			return "", fmt.Errorf("%w: %q", errBadSubprotocol, advertised)
+		}
 		for requested := range strings.SplitSeq(clientHeader, ",") {
 			if strings.TrimSpace(requested) == advertised {
-				return advertised
+				return advertised, nil
 			}
 		}
 	}
 
-	return ""
+	return "", nil
 }
 
 // Sec-WebSocket-Extension negotiation (RFC 6455 §9.1, RFC 7692 §7).
@@ -2295,7 +2349,9 @@ func defaultDialConfig() *Config {
 // dialTarget resolves the dial parameters for a ws/wss URL: the tcp
 // target with the scheme's default port filled in, the request path, and
 // whether the connection is TLS. A malformed URL, a non-ws scheme, or a
-// missing host is an error before any network I/O.
+// missing host is an error before any network I/O. Port detection uses
+// [url.URL.Port], so a bracketed IPv6 literal without a port (ws://[::1]/)
+// gets the default port too.
 func dialTarget(rawurl string) (string, string, bool, error) {
 	parsed, err := url.Parse(rawurl)
 	if err != nil {
@@ -2309,12 +2365,17 @@ func dialTarget(rawurl string) (string, string, bool, error) {
 		return "", "", false, fmt.Errorf("%w %q: no host", errBadURL, rawurl)
 	}
 	host := parsed.Host
-	if !strings.Contains(host, ":") {
+	if parsed.Port() == "" {
+		// Port detection goes through url.URL.Port, not a colon search:
+		// a bracketed IPv6 literal (ws://[::1]/) has colons in the host and
+		// no port, and the default port belongs on the outside.
+		// JoinHostPort adds the colon itself, so strip the constant's.
+		defaultPort := wsDefaultPort[1:]
 		if isTLS {
-			host += wssDefaultPort
-		} else {
-			host += wsDefaultPort
+			defaultPort = wssDefaultPort[1:]
 		}
+
+		host = net.JoinHostPort(parsed.Hostname(), defaultPort)
 	}
 
 	return host, parsed.RequestURI(), isTLS, nil
@@ -2422,7 +2483,9 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 			strings.EqualFold(headerKey, "Connection"),
 			strings.EqualFold(headerKey, "Sec-WebSocket-Key"),
 			strings.EqualFold(headerKey, "Sec-WebSocket-Version"),
-			strings.EqualFold(headerKey, "Sec-WebSocket-Protocol"):
+			strings.EqualFold(headerKey, "Sec-WebSocket-Protocol"),
+			strings.EqualFold(headerKey, extHeaderPlural),
+			strings.EqualFold(headerKey, extHeaderSingular):
 			continue
 		}
 		if strings.ContainsAny(headerKey, "\r\n") {

@@ -8,6 +8,7 @@ package ws
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1" //nolint:gosec // RFC 6455 mandates SHA-1 in the handshake
 	"encoding/base64"
@@ -571,6 +572,93 @@ func TestClientRejectsLineBreakHeader(t *testing.T) {
 	_, err = Dial(ctx, host, WithHeader("X-Test\r\nX-Inject: 1", "v"))
 	if err == nil || !strings.Contains(err.Error(), "line break") {
 		t.Fatalf("line-break header key: %v, want line break rejection", err)
+	}
+}
+
+// rawUpgrade performs a raw client handshake against the given upgrader
+// and returns the HTTP response Upgrade produced (101 with the negotiated
+// headers, or the rejection status).
+func rawUpgrade(t *testing.T, up *Upgrader) *http.Response {
+	t.Helper()
+	srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error {
+		return nil
+	}))
+	defer srv.Close()
+	host := srv.URL[len("http://"):]
+	conn, err := net.Dial("tcp", host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\n"+
+		"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"Sec-WebSocket-Protocol: chat\r\n\r\n", host)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	return resp
+}
+
+// TestServerSubprotocolValidation pins the guard on the server's
+// advertised subprotocols: a token that is not a valid token (RFC 2616) —
+// one that would corrupt the Sec-WebSocket-Protocol header of the 101 —
+// fails the handshake with 400 instead of being echoed onto the wire.
+// A valid advertised list still negotiates as before.
+func TestServerSubprotocolValidation(t *testing.T) {
+	t.Parallel()
+	t.Run("invalid token fails the handshake", func(t *testing.T) {
+		t.Parallel()
+		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin), WithSubprotocols("chat,chat2"))
+		resp := rawUpgrade(t, up)
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 for an invalid advertised subprotocol", resp.StatusCode)
+		}
+	})
+	t.Run("valid tokens still negotiate", func(t *testing.T) {
+		t.Parallel()
+		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin), WithSubprotocols("chat", "other"))
+		resp := rawUpgrade(t, up)
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("status %d, want 101", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "chat" {
+			t.Fatalf("Sec-WebSocket-Protocol = %q, want chat", got)
+		}
+	})
+}
+
+// TestReservedExtensionHeaderSkipped pins the reserved-header guard on the
+// client's opening request: a user-supplied Sec-WebSocket-Extension header
+// (either spelling) must not be written in addition to the package's own
+// permessage-deflate offer.
+func TestReservedExtensionHeaderSkipped(t *testing.T) {
+	t.Parallel()
+	fc := &fakeConn{}
+	headers := http.Header{}
+	headers.Set("Sec-WebSocket-Extensions", "permessage-deflate")
+	headers.Set(extHeaderSingular, "x-legacy")
+	_, err := writeHandshakeRequest(fc, "/ws", "example.com:80", nil, true, headers)
+	if err != nil {
+		t.Fatalf("writeHandshakeRequest: %v", err)
+	}
+	req := fc.written
+	if n := bytes.Count(req, []byte("Sec-WebSocket-Extensions:")); n != 1 {
+		t.Fatalf("opening request carries %d Sec-WebSocket-Extensions lines, want exactly one:\n%s",
+			n, req)
+	}
+	if n := bytes.Count(req, []byte("Sec-WebSocket-Extension:\r\n")); n != 0 {
+		t.Fatalf("opening request carries %d singular Sec-WebSocket-Extension lines, want none:\n%s",
+			n, req)
 	}
 }
 

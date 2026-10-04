@@ -69,7 +69,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.0% branch coverage** (379 of 399
+    no-match). The library sits at **95.1% branch coverage** (389 of 409
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -96,10 +96,10 @@ hand-written editing.)
     observable outcome that only that decision flip produces. The tool
     re-checks every trace against the live source — a new or changed
     compound condition, a renamed test, or a pair that no longer flips the
-    decision fails the gate. Current state: **23 compound decisions, 50
+    decision fails the gate. Current state: **25 compound decisions, 54
     required pairs, all traced** (the permessage-deflate RSV state machine
     and the extension-negotiation parsing contribute 8 of the decisions);
-    the other 164 if/for conditions are single-condition (branch-level, no
+    the other 173 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
@@ -129,13 +129,19 @@ comparison in the demo, TLS-only client-cert trust (verification is the
 TLS layer's, the library only checks presence), strict subprotocol token
 validation (RFC 6455 §1.9: 1#token over U+0021..U+007E minus the RFC 2616
 separators — a token containing a comma or similar could not corrupt or
-split the Sec-WebSocket-Protocol header), client-side verification
+split the Sec-WebSocket-Protocol header, enforced on client offers and on
+the server's advertised tokens alike, so a misconfigured token fails the
+handshake with 400 instead of being echoed in the 101), client-side verification
 of the server's subprotocol selection (RFC §1.9 — an echoed token must be
 one the client offered, and only one; `checkSubprotocolEcho`), the
 permessage-deflate RSV state machine (RSV1 is legal only on the first
 frame of a negotiated compressed data message; RSV1 on a control or
 continuation frame, or RSV1 without the extension, is a 1002 protocol
-error; RSV2/RSV3 are always errors), UTF-8 validation on text frames
+error; RSV2/RSV3 are always errors), the §7.1.7 close discipline (every
+frame-level protocol violation — masking, reserved-bit misuse, a malformed
+or oversized frame, an unknown opcode — is answered with a 1002 close
+frame before the transport is torn down, so the peer sees the close rather
+than a bare TCP close), UTF-8 validation on text frames
 (RFC 6455 §5.6 — a non-UTF-8 text message, whole, reassembled from
 fragments, or compressed, fails the connection with 1007, the close Node's
 ws and browsers use; an OpText write that is not valid UTF-8 is refused
