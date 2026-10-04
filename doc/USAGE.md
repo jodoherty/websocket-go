@@ -116,7 +116,11 @@ WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 // Conn
 Conn.ReadMessage() (op int, data []byte, err error)
    // a clean end reads as (0, nil, io.EOF); other closes as *CloseError
-Conn.WriteMessage(op int, data []byte) error   // fails on a closed conn: recorded error, or ErrClosed
+Conn.WriteMessage(op int, data []byte) error   // the echo form: the op comes off the wire;
+                                               // on a closed conn: recorded error, or ErrClosed
+Conn.WriteText(s string) error                 // OpText; invalid UTF-8 refused before the wire
+Conn.WriteBinary(b []byte) error               // OpBinary, bytes untouched
+Conn.WriteJSON(v any) error                    // marshal (off-lock) then OpText
 Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
 Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
 Conn.Compressed() bool     // whether permessage-deflate was negotiated on this connection

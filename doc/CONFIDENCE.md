@@ -55,8 +55,8 @@ hand-written editing.)
    Ryzen 7600X a 1 KiB round trip is ~1.8 µs (~570 MB/s) with a single
    allocation (the payload), the masked client write is ~420 ns with zero
    allocations, and the accept key is ~130 ns.
-10. **Statement coverage** — the library sits at **97.3% statement
-    coverage** when the unit and e2e suites are combined (97.2% on the unit
+10. **Statement coverage** — the library sits at **97.4% statement
+    coverage** when the unit and e2e suites are combined (97.3% on the unit
     suite alone). The e2e suite (`go test ./e2e -cover -coverpkg=./ws`) adds
     the TLS client path, the mTLS handshake, and the real-network `Dial`;
     the two count-mode profiles are merged (per-block max of the hit
@@ -69,7 +69,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.0% branch coverage** (377 of 397
+    no-match). The library sits at **95.0% branch coverage** (379 of 399
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and

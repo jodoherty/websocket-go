@@ -63,8 +63,9 @@
 //
 // # Concurrency
 //
-//  1. [Conn.WriteMessage] and [Conn.Close] are safe to call from any
-//     goroutine.
+//  1. [Conn.WriteMessage] and its natural-typed forms ([Conn.WriteText],
+//     [Conn.WriteBinary], [Conn.WriteJSON]) — plus [Conn.Close] — are safe
+//     to call from any goroutine.
 //  2. [Conn.ReadMessage] is not: read state is owned by the goroutine that
 //     pumps the connection. Never call ReadMessage from two goroutines.
 //  3. Between sequential ReadMessage calls in the same goroutine there are no
@@ -137,6 +138,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -330,6 +332,7 @@ var errProtocol = errors.New("ws: protocol violation")
 // errMessageTooBig marks a frame or message that exceeds maxMessageSize.
 var errMessageTooBig = errors.New("ws: message exceeds size limit")
 var errInvalidUTF8 = errors.New("ws: text message is not valid UTF-8")
+var errBadJSON = errors.New("ws: cannot marshal JSON message")
 
 // Static error bases, wrapped with context where the detail varies.
 var (
@@ -1320,6 +1323,34 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	c.mu.Unlock()
 
 	return writeErr
+}
+
+// WriteText writes s as a text message. If s is not valid UTF-8 it is
+// rejected before reaching the wire, exactly as any OpText write
+// (RFC 6455 §5.6).
+func (c *Conn) WriteText(s string) error {
+	return c.WriteMessage(OpText, []byte(s))
+}
+
+// WriteBinary writes data as a binary message: the bytes pass through
+// unchanged, with no copy and no validation.
+func (c *Conn) WriteBinary(data []byte) error {
+	return c.WriteMessage(OpBinary, data)
+}
+
+// WriteJSON marshals v to JSON and writes it as a text message. The
+// marshal happens before the write lock is taken, so a large marshal does
+// not hold up other writers or [Conn.Close]; a marshal failure is returned
+// before anything reaches the wire. JSON output is valid UTF-8 by
+// construction, so the text-frame rule (RFC 6455 §5.6) holds by
+// construction as well.
+func (c *Conn) WriteJSON(v any) error {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("%w: %w", errBadJSON, err)
+	}
+
+	return c.WriteMessage(OpText, payload)
 }
 
 // Close closes the connection, sending a close frame with the given code and
