@@ -73,6 +73,52 @@ func TestWriteMessageValidationBranches(t *testing.T) {
 	}
 }
 
+// deadlineRecordConn is a net.Conn that records every write-deadline
+// change, to pin the per-frame write-bound invariant of WriteMessage.
+type deadlineRecordConn struct {
+	deadlines []time.Time
+}
+
+func (d *deadlineRecordConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (d *deadlineRecordConn) Write(_ []byte) (int, error) { return 0, io.EOF }
+func (d *deadlineRecordConn) SetReadDeadline(_ time.Time) error {
+	return nil
+}
+func (d *deadlineRecordConn) SetWriteDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+	return nil
+}
+func (d *deadlineRecordConn) SetDeadline(_ time.Time) error { return nil }
+func (d *deadlineRecordConn) LocalAddr() net.Addr           { return fakeAddr{} }
+func (d *deadlineRecordConn) RemoteAddr() net.Addr          { return fakeAddr{} }
+func (d *deadlineRecordConn) Close() error                  { return nil }
+
+// TestWriteMessageClearsDeadlineOnCompressFailure pins the per-frame
+// write-bound invariant on every exit path: a WriteMessage whose
+// compression fails must leave no armed write deadline behind on the
+// transport — the bound is per-write, cleared on return, so the next
+// operation starts with a clean deadline state.
+func TestWriteMessageClearsDeadlineOnCompressFailure(t *testing.T) {
+	rec := &deadlineRecordConn{}
+	c := newConn(rec, rec, true, 1<<20, 0, time.Second)
+	// Force the compressor to fail at creation: an out-of-range flate
+	// level makes flate.NewWriter reject, so compress returns before any
+	// frame is written.
+	c.deflateNegotiated = true
+	c.compressLevel = 99
+
+	writeErr := c.WriteMessage(OpText, []byte("hello"))
+	if writeErr == nil {
+		t.Fatal("WriteMessage = nil, want the compression failure")
+	}
+	if len(rec.deadlines) == 0 {
+		t.Fatal("no write deadline recorded; expected the armed write bound")
+	}
+	if last := rec.deadlines[len(rec.deadlines)-1]; !last.IsZero() {
+		t.Fatalf("last write deadline after the failed WriteMessage = %v, want it cleared (zero)", last)
+	}
+}
+
 // TestCloseRejectsOutOfRangeCode pins the close-code range check in
 // Close: codes outside 1000-4999 are rejected before any I/O.
 func TestCloseRejectsOutOfRangeCode(t *testing.T) {

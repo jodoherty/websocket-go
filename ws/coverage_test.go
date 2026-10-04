@@ -542,6 +542,20 @@ func TestDialMalformedURL(t *testing.T) {
 	}
 }
 
+// TestDialEmptyHost pins that a URL without a host fails the dial before
+// any connect attempt: "ws:///path" must not silently dial localhost:
+// appending the default port to an empty host yields ":80", which would
+// connect to the machine's own port 80.
+func TestDialEmptyHost(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := ws.Dial(ctx, "ws:///ws")
+	if err == nil || !strings.Contains(err.Error(), "bad url") {
+		t.Fatalf("Dial(\"ws:///ws\") = %v, want a 'bad url' error", err)
+	}
+}
+
 // TestDialDefaultPort pins the no-port branch on both schemes: a host without
 // an explicit port must have the default (80 for ws, 443 for wss) filled in
 // before dialing. The dials themselves fail (nothing serves those ports

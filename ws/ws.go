@@ -296,7 +296,10 @@ var errMessageTooBig = errors.New("ws: message exceeds size limit")
 
 // Static error bases, wrapped with context where the detail varies.
 var (
-	errBadScheme       = errors.New("ws: unsupported scheme")
+	errBadScheme = errors.New("ws: unsupported scheme")
+	// errBadURL is the base for a URL that cannot be dialed: malformed,
+	// or missing its host.
+	errBadURL          = errors.New("ws: bad url")
 	errBadCloseCode    = errors.New("ws: invalid close code")
 	errHandshakeFailed = errors.New("ws: handshake failed")
 	errBadSubprotocol  = errors.New("ws: invalid subprotocol")
@@ -1227,6 +1230,7 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	if c.deflateNegotiated {
 		compressErr := c.compress(data)
 		if compressErr != nil {
+			_ = c.nc.SetWriteDeadline(time.Time{})
 			c.mu.Unlock()
 
 			return compressErr
@@ -1389,7 +1393,7 @@ func WithCompression(enabled bool) Option {
 // flate.DefaultCompression). It only has an effect when [WithCompression] is
 // enabled. Compressed messages trade CPU for bandwidth; on high-throughput
 // byte tunnels (the VNC-shaped example in doc/USAGE.md) flate.BestSpeed or
-// [WithCompression] is usually the right call.
+// flate.DefaultCompression is usually the right call.
 func WithCompressionLevel(level int) Option {
 	return func(cfg *Config) { cfg.CompressionLevel = level }
 }
@@ -2148,6 +2152,34 @@ func defaultDialConfig() *Config {
 	}
 }
 
+// dialTarget resolves the dial parameters for a ws/wss URL: the tcp
+// target with the scheme's default port filled in, the request path, and
+// whether the connection is TLS. A malformed URL, a non-ws scheme, or a
+// missing host is an error before any network I/O.
+func dialTarget(rawurl string) (string, string, bool, error) {
+	parsed, err := url.Parse(rawurl)
+	if err != nil {
+		return "", "", false, fmt.Errorf("%w %q: %w", errBadURL, rawurl, err)
+	}
+	isTLS := parsed.Scheme == wssScheme
+	if parsed.Scheme != wsScheme && parsed.Scheme != wssScheme {
+		return "", "", false, fmt.Errorf("%w: %q", errBadScheme, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return "", "", false, fmt.Errorf("%w %q: no host", errBadURL, rawurl)
+	}
+	host := parsed.Host
+	if !strings.Contains(host, ":") {
+		if isTLS {
+			host += wssDefaultPort
+		} else {
+			host += wsDefaultPort
+		}
+	}
+
+	return host, parsed.RequestURI(), isTLS, nil
+}
+
 // Dial opens a WebSocket client connection to rawurl (ws:// or wss://).
 // It performs the handshake and returns an open [Conn] whose read state is
 // owned by the calling goroutine.
@@ -2163,21 +2195,9 @@ func defaultDialConfig() *Config {
 // the extension may be declined, or accepted with at most the client's own
 // constraints — anything else fails the dial.
 func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
-	parsed, err := url.Parse(rawurl)
+	host, path, isTLS, err := dialTarget(rawurl)
 	if err != nil {
-		return nil, fmt.Errorf("ws: bad url %q: %w", rawurl, err)
-	}
-	isTLS := parsed.Scheme == wssScheme
-	if parsed.Scheme != wsScheme && parsed.Scheme != wssScheme {
-		return nil, fmt.Errorf("%w: %q", errBadScheme, parsed.Scheme)
-	}
-	host := parsed.Host
-	if !strings.Contains(host, ":") {
-		if isTLS {
-			host += wssDefaultPort
-		} else {
-			host += wsDefaultPort
-		}
+		return nil, err
 	}
 
 	cfg := defaultDialConfig()
@@ -2197,7 +2217,7 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	}
 
 	reader := bufio.NewReaderSize(conn, bufSize)
-	key, reqErr := writeHandshakeRequest(conn, parsed.RequestURI(), parsed.Host,
+	key, reqErr := writeHandshakeRequest(conn, path, host,
 		cfg.Subprotocols, cfg.Compression, cfg.Headers)
 	if reqErr != nil {
 		_ = conn.Close()
