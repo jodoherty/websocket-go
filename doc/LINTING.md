@@ -30,6 +30,14 @@ deliberate choices:
 | `exhaustruct` | forces every struct literal to spell out all fields, including meaningful zeros; for option-heavy types (`tls.Config`, `net.Dialer`, `Config`) that is anti-clarity |
 | `funcorder` | wants all unexported methods after all exported ones; the file is organized by protocol concern instead, so each method sits with the behavior it belongs to |
 
+One linter *setting* is also deliberate: `exhaustive` runs with
+`default-signifies-exhaustive: true` because the read loops switch on the
+named `Op` type with a `default` arm that is the data-message case
+(`OpText`/`OpBinary`), while `OpContinuation` never surfaces from a read
+loop and cannot be enumerated. A switch over `Op` that lacks that
+`default` arm is still checked, so the setting narrows exactly the
+intentional pattern and nothing else.
+
 Test files (`_test.go`) get a second, documented exclusion rule — test
 scaffolding is not the drop-in artifact, and stateful tests (shared ports,
 synctest, table-driven literals) make a blanket strict set there noise.

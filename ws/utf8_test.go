@@ -10,7 +10,7 @@ import (
 // encodeDataFrame encodes one data frame with the given opcode; fin=false
 // clears the FIN bit so the frame starts (or continues) a fragmented
 // message instead.
-func encodeDataFrame(t *testing.T, isClient bool, fin bool, opcode int, payload []byte) []byte {
+func encodeDataFrame(t *testing.T, isClient bool, fin bool, opcode Op, payload []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	fc := frameCodec{bw: bufio.NewWriter(&buf), isClient: isClient, maxMsg: 1 << 20}

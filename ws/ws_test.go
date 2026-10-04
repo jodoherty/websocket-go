@@ -16,7 +16,17 @@ import (
 
 const goodToken = "good-token"
 
-func echo(c *ws.Conn) error {
+// principalKey carries the authenticated principal on the request context
+// between the auth middleware and the message handler.
+type principalKey struct{}
+
+func principal(r *http.Request) string {
+	p, _ := r.Context().Value(principalKey{}).(string)
+
+	return p
+}
+
+func echo(c *ws.Session) error {
 	for {
 		op, data, err := c.ReadMessage()
 		if err != nil {
@@ -42,21 +52,24 @@ func startServer(t *testing.T) *httptest.Server {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/echo", up.Handle(func(_ *http.Request, c *ws.Conn) error {
+	mux.Handle("/echo", up.Handle(func(_ *http.Request, c *ws.Session) error {
 		return echo(c)
 	}))
-	mux.Handle("/bye", up.Handle(func(_ *http.Request, c *ws.Conn) error {
+	mux.Handle("/bye", up.Handle(func(_ *http.Request, c *ws.Session) error {
 		_ = c.WriteMessage(ws.OpText, []byte("farewell"))
 		_ = c.Close(ws.StatusGoingAway, "later")
 		return nil
 	}))
-	mux.Handle("/data", up.Handle(func(_ *http.Request, c *ws.Conn) error {
-		if c.HandshakeData() != "principal" {
-			return errors.New("handshake data missing")
+	mux.Handle("/data", up.Handle(func(r *http.Request, c *ws.Session) error {
+		// The principal is what pre-upgrade auth recorded on the request
+		// context; dialing /data directly leaves it unset, so the handler's
+		// policy failure reaches the peer as a 1011 close.
+		if principal(r) != "principal" {
+			return errors.New("principal missing")
 		}
 		return echo(c)
 	}))
-	mux.Handle("/strict", ws.NewUpgrader().Handle(func(_ *http.Request, c *ws.Conn) error { // default origin policy
+	mux.Handle("/strict", ws.NewUpgrader().Handle(func(_ *http.Request, c *ws.Session) error { // default origin policy
 		return echo(c)
 	}))
 	mux.Handle("/auth", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +78,10 @@ func startServer(t *testing.T) *httptest.Server {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		c, err := up.Upgrade(w, r, ws.WithHandshakeData("authed"))
+		// Ordinary auth middleware: record the principal on the request
+		// context, then let the upgrader do the protocol switch.
+		r = r.WithContext(context.WithValue(r.Context(), principalKey{}, "authed"))
+		c, err := up.Upgrade(w, r)
 		if err != nil {
 			return
 		}
@@ -81,7 +97,7 @@ func startServer(t *testing.T) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
-func mustDial(t *testing.T, url string, opts ...ws.Option) *ws.Conn {
+func mustDial(t *testing.T, url string, opts ...ws.Option) *ws.Session {
 	t.Helper()
 	c, err := ws.Dial(context.Background(), url, opts...)
 	if err != nil {
@@ -140,7 +156,7 @@ func TestAppPingPongRoundTrip(t *testing.T) {
 			ws.WithCheckOrigin(func(*http.Request) bool { return true }),
 			ws.WithPongHandler(func(payload []byte) { pong <- append([]byte(nil), payload...) }),
 		)
-		srv := httptest.NewServer(up.Handle(func(_ *http.Request, c *ws.Conn) error {
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, c *ws.Session) error {
 			_ = c.Ping([]byte("srv-probe"))
 			return echo(c)
 		}))
@@ -299,13 +315,13 @@ func TestCleanCloseIsEOF(t *testing.T) {
 	}
 }
 
-func TestHandshakeData(t *testing.T) {
+func TestHandlerPolicyFailure(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()
 
-	// /data requires the HandshakeData that only the /auth upgrade sets.
-	// Dialing it directly leaves the data nil, so the handler's policy
-	// failure reaches the peer as a 1011 close — not a misreported normal
+	// /data requires a principal on the request context; dialing it
+	// directly leaves the context bare, so the handler's policy failure
+	// reaches the peer as a 1011 close — not a misreported normal
 	// closure.
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/data")
 	defer c.Close(ws.StatusNormalClosure, "")
@@ -415,7 +431,7 @@ func TestKeepaliveDetectsDeadPeer(t *testing.T) {
 		ws.WithIdleTimeout(300*time.Millisecond),
 	)
 	mux := http.NewServeMux()
-	mux.Handle("/quiet", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
+	mux.Handle("/quiet", up.Handle(func(_ *http.Request, _ *ws.Session) error {
 		time.Sleep(30 * time.Second) // never read, never write
 		return nil
 	}))

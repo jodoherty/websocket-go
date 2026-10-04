@@ -36,6 +36,13 @@ linters:
           allow:
             - $gostd
             - github.com/jodoherty/websocket-go
+    exhaustive:
+      # The Op switch in the read loops handles the control ops (ping, pong,
+      # close) by case and lets data messages (OpText/OpBinary) fall to the
+      # default arm; OpContinuation never surfaces from a read loop, so it
+      # cannot be enumerated. A default case therefore means the switch is
+      # already exhaustive for the reachable set.
+      default-signifies-exhaustive: true
     wrapcheck:
       # net.Conn deadline setters are transport pass-throughs; wrapping
       # their errors adds noise without context.

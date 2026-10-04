@@ -8,8 +8,9 @@ package ws
 // and each example doubles as an integration test of one entry point:
 //
 //   - Example:         ws.Handle + Dial — an echo round trip
-//   - ExampleUpgrader:  auth middleware + WithHandshakeData + Upgrade
+//   - ExampleUpgrader:  auth middleware + the request context + Upgrade
 //   - ExampleDial:      programmatic client, bearer token via WithHeader
+//   - ExampleWithDialer: the custom-transport seam (WithDialer)
 //   - ExampleDialRaw:   the raw face — events, answering pings, a two-frame
 //                       write, and the peer's close as an OpClose event
 //   - ExampleCloseCode: application close codes, end to end
@@ -95,36 +96,41 @@ func Example() {
 }
 
 // ExampleUpgrader shows the pattern the package is built around:
-// authentication and authorization are ordinary middleware that runs before
-// the upgrade, and its result rides on the connection via WithHandshakeData
-// instead of globals. Browsers cannot set headers on the upgrade, so the
-// token comes in a query parameter here.
+// authentication is ordinary middleware that runs before the upgrade, and
+// its result rides on the request context into the message handler instead
+// of globals. Browsers cannot set headers on the upgrade, so the token
+// comes in a query parameter here.
 func ExampleUpgrader() {
 	up := NewUpgrader(
 		WithCheckOrigin(func(*http.Request) bool { return true }),
 		WithSubprotocols("chat.v1"),
 	)
 
-	mux := http.NewServeMux()
-	mux.Handle("/ws", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		if token != "secret" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		c, err := up.Upgrade(w, r, WithHandshakeData(token))
-		if err != nil {
-			return // an HTTP error response was already written
-		}
-		defer c.Close(StatusNormalClosure, "")
+	// auth is a plain http.Handler wrapper: nothing about it is
+	// websocket-specific.
+	type principalKey struct{}
+	auth := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := r.URL.Query().Get("token")
+			if token != "secret" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), principalKey{}, token))
+			next.ServeHTTP(w, r)
+		})
+	}
 
+	mux := http.NewServeMux()
+	mux.Handle("/ws", auth(up.Handle(func(r *http.Request, c *Session) error {
+		principal, _ := r.Context().Value(principalKey{}).(string)
 		op, data, err := c.ReadMessage()
 		if err != nil {
-			return
+			return err
 		}
-		fmt.Println(c.Subprotocol(), c.HandshakeData(), "says", string(data))
-		_ = c.WriteMessage(op, data)
-	}))
+		fmt.Println(c.Subprotocol(), principal, "says", string(data))
+		return c.WriteMessage(op, data)
+	})))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -149,29 +155,31 @@ func ExampleUpgrader() {
 }
 
 // ExampleDial shows a programmatic client authenticating with a bearer
-// token. Unlike browsers, programmatic clients can set headers on the
-// upgrade request; the server checks the token in a WithPreHandshake hook,
-// before the protocol switch.
+// token. The token check is ordinary middleware in front of the upgrader —
+// nothing about it is websocket-specific — while the client sets the header
+// on the upgrade request with WithHeader, which browsers cannot do.
 func ExampleDial() {
-	up := NewUpgrader(
-		WithCheckOrigin(func(*http.Request) bool { return true }),
-		WithPreHandshake(func(r *http.Request) error {
+	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
+
+	bearer := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get("Authorization") != "Bearer demo-secret" {
-				return errors.New("unauthorized")
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
 			}
-			return nil
-		}),
-	)
+			next.ServeHTTP(w, r)
+		})
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
+	mux.Handle("/ws", bearer(up.Handle(func(_ *http.Request, c *Session) error {
 		_, data, err := c.ReadMessage()
 		if err != nil {
 			return err
 		}
 		fmt.Println("server:", string(data))
 		return nil // the handler returns: Handle closes with 1000
-	}))
+	})))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -191,6 +199,48 @@ func ExampleDial() {
 	}
 	if op != 0 {
 		panic("expected normal close")
+	}
+	fmt.Println("client: closed normally")
+	// Output:
+	// server: hi
+	// client: closed normally
+}
+
+// ExampleWithDialer shows the custom-transport seam: the application owns
+// the connection policy — here TLS is deliberately omitted, so a wss://
+// URL runs over plain TCP — and the library performs only the WebSocket
+// handshake over whatever connection the dialer returns.
+func ExampleWithDialer() {
+	up := NewUpgrader()
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+		fmt.Println("server:", string(data))
+		return nil
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c, err := Dial(context.Background(), "wss://"+srv.Listener.Addr().String()+"/ws",
+		WithDialer(func(_ context.Context, target *url.URL) (net.Conn, error) {
+			return net.Dial("tcp", target.Host) // the app's policy: no TLS
+		}))
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+
+	err = c.WriteMessage(OpText, []byte("hi"))
+	if err != nil {
+		panic(err)
+	}
+	_, _, err = c.ReadMessage()
+	if !errors.Is(err, io.EOF) {
+		panic(err)
 	}
 	fmt.Println("client: closed normally")
 	// Output:
@@ -271,6 +321,7 @@ func ExampleDialRaw() {
 			if readErr != nil {
 				return readErr
 			}
+			// This example reacts only to pings and text; any other event is ignored.
 			switch event.Op {
 			case OpPing:
 				// The application is the responder: no auto-pong in raw mode.
@@ -284,6 +335,7 @@ func ExampleDialRaw() {
 					return writeErr
 				}
 				return c.Close(StatusGoingAway, "done")
+			default:
 			}
 		}
 	}))
@@ -317,6 +369,8 @@ func ExampleDialRaw() {
 			fmt.Println("terminal:", code, reason, ok)
 			break
 		}
+		// This example prints pongs, text, and the close; any other event is
+		// ignored.
 		switch event.Op {
 		case OpPong:
 			fmt.Println("pong:", string(event.Payload))
@@ -324,6 +378,7 @@ func ExampleDialRaw() {
 			fmt.Println("text:", string(event.Payload))
 		case OpClose:
 			fmt.Println("close event:", event.Code, event.Reason)
+		default:
 		}
 	}
 	// Output:

@@ -1,6 +1,6 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc e2e demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc multiver e2e demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -8,7 +8,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc branchcov coverage e2e
+gate: all race fuzz bench mcdc branchcov coverage multiver e2e
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -56,6 +56,19 @@ branchcov:
 # untraced compound condition.
 mcdc:
 	go run ./cmd/mcdc ws
+
+# Multi-toolchain floor check: the library must build and pass its unit
+# suite on the oldest supported Go (go.mod's floor; ws.go is vendored by
+# copying, so the floor is the oldest Go a vendoring project may run) and
+# on each newer release we test with. Toolchains download on first use.
+TOOLCHAINS ?= go1.25.0 go1.26.0 go1.27.1
+multiver:
+	@for tc in $(TOOLCHAINS); do \
+		echo "multiver: $$tc"; \
+		GOTOOLCHAIN=$$tc go build ./... && \
+		GOTOOLCHAIN=$$tc go vet ./ws ./e2e ./cmd/... && \
+		GOTOOLCHAIN=$$tc go test -count=1 ./ws || exit 1; \
+	done
 
 # Full end-to-end: Go mTLS/interop test plus the Playwright suite
 # (Firefox + Chromium) against the real demo binary. npm test runs the

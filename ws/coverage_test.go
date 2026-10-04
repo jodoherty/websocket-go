@@ -1,25 +1,20 @@
 package ws_test
 
 // This file closes out the cheap coverage gaps: small accessors, error
-// strings, option functions, the package-level Handle, ClientCert, and the
-// Dial failure path. Each test exists for a specific line that would
-// otherwise never execute; the behavior assertions are intentionally light.
+// strings, option functions, the package-level Handle, and the Dial
+// failure path. Each test exists for a specific line that would otherwise
+// never execute; the behavior assertions are intentionally light.
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -83,67 +78,15 @@ func TestConnAccessorsAndDeadlines(t *testing.T) {
 	}
 }
 
-// TestClientCert covers both branches: certificate present, absent, and no
-// TLS at all.
-func TestClientCert(t *testing.T) {
-	cert, err := selfSignedCert("e2e-client")
-	if err != nil {
-		t.Fatal(err)
-	}
-	withCert := httptest.NewRequest(http.MethodGet, "/ws", nil)
-	withCert.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
-	got := ws.ClientCert(withCert)
-	if got != cert {
-		t.Fatalf("ClientCert with cert = %v, want the cert", got)
-	}
-
-	noCert := httptest.NewRequest(http.MethodGet, "/ws", nil)
-	noCert.TLS = &tls.ConnectionState{}
-	got = ws.ClientCert(noCert)
-	if got != nil {
-		t.Fatalf("ClientCert without cert = %v, want nil", got)
-	}
-
-	plain := httptest.NewRequest(http.MethodGet, "/ws", nil)
-	got = ws.ClientCert(plain)
-	if got != nil {
-		t.Fatalf("ClientCert without TLS = %v, want nil", got)
-	}
-}
-
-// selfSignedCert makes a throwaway self-signed certificate for testing
-// ClientCert; nothing needs to verify it.
-func selfSignedCert(cn string) (*x509.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: cn},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-	return x509.ParseCertificate(der)
-}
-
 // TestOptionEffects applies every option to a Config and checks its effect,
-// covering the client-only options (TLS, dial timeout) that the unit tests
-// otherwise never touch.
+// covering the client-only options (headers, dialer, dial timeout) that the
+// unit tests otherwise never touch.
 func TestOptionEffects(t *testing.T) {
 	cfg := &ws.Config{}
 
 	ws.WithCheckOrigin(func(_ *http.Request) bool { return true })(cfg)
 	if cfg.CheckOrigin == nil || !cfg.CheckOrigin(nil) {
 		t.Error("WithCheckOrigin not applied")
-	}
-	ws.WithRequireClientCert()(cfg)
-	if !cfg.RequireClientCert {
-		t.Error("WithRequireClientCert not applied")
 	}
 	ws.WithSubprotocols("vnc1", "binary")(cfg)
 	if len(cfg.Subprotocols) != 2 || cfg.Subprotocols[0] != "vnc1" {
@@ -157,18 +100,6 @@ func TestOptionEffects(t *testing.T) {
 	if cfg.IdleTimeout != 5*time.Second {
 		t.Errorf("WithIdleTimeout = %v", cfg.IdleTimeout)
 	}
-	called := false
-	ws.WithPreHandshake(func(*http.Request) error {
-		called = true
-		return nil
-	})(cfg)
-	if len(cfg.PreHandshake) != 1 {
-		t.Fatalf("WithPreHandshake: %d hooks", len(cfg.PreHandshake))
-	}
-	err := cfg.PreHandshake[0](nil)
-	if err != nil || !called {
-		t.Error("PreHandshake hook not the one registered")
-	}
 
 	// Client-only options: no observable Config field, but each body must
 	// run; a broken closure would panic here or at Dial time.
@@ -177,14 +108,10 @@ func TestOptionEffects(t *testing.T) {
 	if got != "Bearer x" {
 		t.Errorf("WithHeader = %q", got)
 	}
-	ws.WithTLS(&tls.Config{InsecureSkipVerify: true})(cfg) //nolint:gosec // test: no real server to verify
-	cert, err := selfSignedCert("client")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ws.WithTLSClientCert(cert, nil)(cfg)
+	ws.WithDialer(func(context.Context, *url.URL) (net.Conn, error) {
+		return nil, errors.New("dialer body ran")
+	})(cfg)
 	ws.WithDialTimeout(time.Second)(cfg)
-	_ = ws.WithHandshakeData("v") // HandshakeOption body
 }
 
 // TestPackageHandle covers ws.Handle (the default-upgrader shorthand). The
@@ -192,7 +119,7 @@ func TestOptionEffects(t *testing.T) {
 // matching Origin header — which is exactly what a browser would do.
 func TestPackageHandle(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.Handle("/pkg", ws.Handle(func(_ *http.Request, c *ws.Conn) error {
+	mux.Handle("/pkg", ws.Handle(func(_ *http.Request, c *ws.Session) error {
 		err := c.WriteMessage(ws.OpText, []byte("from ws.Handle"))
 		if err != nil {
 			return err
@@ -218,10 +145,9 @@ func TestPackageHandle(t *testing.T) {
 	}
 }
 
-// TestUpgradeRejectBranches covers the policy rejections that a dial-based
-// test cannot reach individually: client-cert requirement, and the two
-// pre-handshake hook failure modes (UpgradeError carries its own status;
-// a plain error becomes 403).
+// TestUpgradeRejectBranches covers the policy and protocol-header
+// rejections that a dial-based test cannot reach individually: the origin
+// rejection, and each malformed-handshake response.
 func TestUpgradeRejectBranches(t *testing.T) {
 	upgradeReq := func() *http.Request {
 		r := httptest.NewRequest(http.MethodGet, "/ws", nil)
@@ -235,18 +161,22 @@ func TestUpgradeRejectBranches(t *testing.T) {
 
 	openOrigin := ws.WithCheckOrigin(func(*http.Request) bool { return true })
 
-	up := ws.NewUpgrader(openOrigin, ws.WithRequireClientCert())
-	_, err := up.Upgrade(httptest.NewRecorder(), upgradeReq())
-	if !errors.As(err, &ue) || ue.Status != http.StatusForbidden || ue.Msg != "client certificate required" {
-		t.Fatalf("client-cert requirement: %v, want 403 UpgradeError", err)
+	// A failing origin check is a 403 before the protocol headers are
+	// inspected.
+	up := ws.NewUpgrader()
+	req := upgradeReq()
+	req.Header.Set("Origin", "https://evil.example.com")
+	req.Host = "example.com"
+	_, err := up.Upgrade(httptest.NewRecorder(), req)
+	if !errors.As(err, &ue) || ue.Status != http.StatusForbidden || ue.Msg != "origin not allowed" {
+		t.Fatalf("origin rejection: %v, want 403 UpgradeError", err)
 	}
 
-	hook := func(*http.Request) error { return nil }
 	// The passing case goes all the way through the protocol switch, which
 	// requires a real hijackable connection — a ResponseRecorder cannot.
-	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(hook))
+	up = ws.NewUpgrader(openOrigin)
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *ws.Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *ws.Session) error {
 		return c.Close(ws.StatusNormalClosure, "")
 	}))
 	s := httptest.NewServer(mux)
@@ -254,35 +184,13 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/ws")
 	op, _, err := c.ReadMessage()
 	if op != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("pre-handshake pass: ReadMessage = (%d, %v), want (0, io.EOF)", op, err)
-	}
-
-	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(func(*http.Request) error {
-		return &ws.UpgradeError{Status: http.StatusTeapot, Msg: "short and stout"}
-	}))
-	_, err = up.Upgrade(httptest.NewRecorder(), upgradeReq())
-	if !errors.As(err, &ue) || ue.Status != http.StatusTeapot {
-		t.Fatalf("pre-handshake UpgradeError: %v, want 418", err)
-	}
-
-	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(func(*http.Request) error {
-		return errors.New("nope: internal detail")
-	}))
-	hookRec := httptest.NewRecorder()
-	_, err = up.Upgrade(hookRec, upgradeReq())
-	if !errors.As(err, &ue) || ue.Status != http.StatusForbidden {
-		t.Fatalf("pre-handshake plain error: %v, want 403", err)
-	}
-	// The hook's error detail must not reach the client: the body is a
-	// fixed string, not err.Error(); only a *UpgradeError carries detail.
-	if body := hookRec.Body.String(); body != "forbidden\n" {
-		t.Fatalf("plain-error body %q, want the fixed \"forbidden\" body", body)
+		t.Fatalf("origin pass: ReadMessage = (%d, %v), want (0, io.EOF)", op, err)
 	}
 
 	// The protocol-header rejections. Each drops exactly one required
 	// piece of the handshake.
 	up = ws.NewUpgrader(openOrigin)
-	req := upgradeReq()
+	req = upgradeReq()
 	req.Method = http.MethodPost
 	_, err = up.Upgrade(httptest.NewRecorder(), req)
 	if !errors.As(err, &ue) || ue.Status != http.StatusMethodNotAllowed {
@@ -330,7 +238,7 @@ func TestUpgradeRejectBranches(t *testing.T) {
 func TestHandleCloseErrorBranch(t *testing.T) {
 	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
 	mux := http.NewServeMux()
-	mux.Handle("/custom", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
+	mux.Handle("/custom", up.Handle(func(_ *http.Request, _ *ws.Session) error {
 		return &ws.CloseError{Code: 4001, Reason: "policy"}
 	}))
 	s := httptest.NewServer(mux)
@@ -352,7 +260,7 @@ func TestHandleCloseErrorBranch(t *testing.T) {
 func TestHandleErrorBranch(t *testing.T) {
 	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
 	mux := http.NewServeMux()
-	mux.Handle("/boom", up.Handle(func(_ *http.Request, _ *ws.Conn) error {
+	mux.Handle("/boom", up.Handle(func(_ *http.Request, _ *ws.Session) error {
 		return errors.New("policy failure")
 	}))
 	s := httptest.NewServer(mux)
@@ -413,15 +321,6 @@ func TestSmallGaps(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
 		t.Fatalf("Dial with http scheme: %v, want unsupported scheme", err)
 	}
-
-	// WithTLSClientCert on a config with no prior TLS state (the nil-cfg
-	// branch of the option).
-	cfg := &ws.Config{}
-	cert, err := selfSignedCert("c")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ws.WithTLSClientCert(cert, nil)(cfg)
 }
 
 // TestDialCanceledContext covers Dial's context-cancellation path.

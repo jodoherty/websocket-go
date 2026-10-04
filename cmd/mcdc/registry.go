@@ -17,7 +17,6 @@ const (
 	testIsReadTimeout           = "TestMCDCIsReadTimeout"
 	testWriteOpcode             = "TestMCDCWriteMessageOpcode"
 	testCloseCodeRange          = "TestMCDCCloseCodeRange"
-	testRequireCert             = "TestMCDCRequireClientCert"
 	testDialScheme              = "TestMCDCDialScheme"
 	testMCDCCloseCode           = "TestMCDCCloseCode"
 	testMCDCWebSocketKey        = "TestMCDCWebSocketKey"
@@ -286,19 +285,6 @@ func closeTraces() []decisionTrace {
 // handshakeTraces covers the upgrader policy and the Dial scheme check.
 func handshakeTraces() []decisionTrace {
 	return []decisionTrace{
-		// ws.go: u.requireClientCert && ClientCert(request) == nil
-		{
-			expr:       "u.requireClientCert && ClientCert(request) == nil",
-			conditions: []string{"u.requireClientCert", "ClientCert(request) == nil"},
-			pairs: []pairTrace{
-				// WithRequireClientCert without a certificate rejected; the
-				// same request accepted without the option.
-				{0, []bool{true, true}, []bool{false, true}, testRequireCert, "require"},
-				// WithRequireClientCert with a certificate accepted; the
-				// same upgrader without a certificate rejected.
-				{1, []bool{true, false}, []bool{true, true}, testRequireCert, "cert"},
-			},
-		},
 		// ws.go: parsed.Scheme != wsScheme && parsed.Scheme != wssScheme
 		{
 			expr:       "parsed.Scheme != wsScheme && parsed.Scheme != wssScheme",

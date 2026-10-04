@@ -42,9 +42,10 @@
 //     [http.ServeMux].
 //
 //  2. Authentication and authorization are ordinary middleware. Bearer
-//     tokens, sessions, and anything else run before the upgrade, in plain
-//     http.Handler code. Client certificates presented via mTLS are available
-//     through [ClientCert] (which reads r.TLS.PeerCertificates).
+//     tokens, mTLS client-certificate checks (r.TLS.PeerCertificates),
+//     sessions, and anything else run before the upgrade, in plain
+//     http.Handler code; the result rides on the request context into the
+//     message handler.
 //
 //  3. There are no callbacks and no pump goroutine. The goroutine that calls
 //     [Session.ReadMessage] is the connection's goroutine. Your handler does
@@ -107,7 +108,7 @@
 // the whole negotiation off), and the client offers it on [Dial]. Messages
 // compress per message — no context takeover — and the full 32 KiB window
 // is used, so offers or responses that cap the window below that are
-// declined (server) or fail the dial (client). [Conn.Compressed] reports
+// declined (server) or fail the dial (client). [Session.Compressed] reports
 // whether the extension was negotiated on a live connection. Every other
 // reserved bit on a frame — and RSV1 on a control or continuation frame —
 // is a protocol error.
@@ -126,6 +127,17 @@
 //  3. Between sequential read calls in the same goroutine there are no
 //     visibility concerns: handler-local state modified in one iteration is
 //     plainly visible in the next.
+//
+// # Cancellation
+//
+// A context bounds connection *establishment*: [Dial] takes one, and the
+// [WithDialer] dial function takes one. On a live connection, the
+// *deadlines* do the bounding: the keepalive window (or a read deadline
+// when keepalive is disabled) bounds reads, and the write timeout bounds
+// writes and [Session.Close]. Cancelling a live connection is therefore
+// [Session.Close] from another goroutine — bounded, idempotent, and safe
+// from anywhere — rather than a context cancellation, which is what the
+// deadline ownership above makes the cheaper answer.
 //
 // # Real-world interop
 //
@@ -166,8 +178,8 @@
 // order, so the file is organized for reading instead — the high-level API
 // first, the internals after:
 //
-//  1. the session face: [Session], the [Conn] alias, [Session.ReadMessage],
-//     the session write/close/accessor surface
+//  1. the session face: [Session], [Session.ReadMessage], the session
+//     write/close/accessor surface
 //  2. options: [Option], [Config], and every [WithSubprotocols] function
 //  3. server entry: [Upgrader], [Upgrader.Upgrade]/[Upgrader.UpgradeRaw],
 //     [Upgrader.Handle]/[Upgrader.HandleRaw], the handshake validation and
@@ -195,7 +207,6 @@ import (
 	"crypto/rand"
 	"crypto/sha1" //nolint:gosec // RFC 6455 mandates SHA-1 in the handshake
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -277,12 +288,13 @@ func newSession(raw *RawConn, pongHandler func([]byte)) *Session {
 // detected within about two windows.
 //
 // ReadMessage must only be called from one goroutine at a time.
-func (s *Session) ReadMessage() (int, []byte, error) {
+func (s *Session) ReadMessage() (Op, []byte, error) {
 	for {
 		event, readErr := s.raw.ReadEvent()
 		if readErr != nil {
 			return 0, nil, readErr
 		}
+		// OpText and OpBinary are the data-message ops: the default arm.
 		switch event.Op {
 		case OpPing:
 			// Answer inline, exactly as a raw application would with
@@ -310,16 +322,10 @@ func (s *Session) ReadMessage() (int, []byte, error) {
 	}
 }
 
-// Conn is the message-oriented session.
-//
-// Deprecated: use [*Session]; the alias exists so existing code that
-// names *Conn keeps compiling and will be removed in a later release.
-type Conn = Session
-
 // WriteMessage writes a complete text or binary message, exactly as
 // [RawConn.WriteMessage]: safe from any goroutine, validated before the
 // wire, and a transport failure fails the connection.
-func (s *Session) WriteMessage(op int, data []byte) error { return s.raw.WriteMessage(op, data) }
+func (s *Session) WriteMessage(op Op, data []byte) error { return s.raw.WriteMessage(op, data) }
 
 // WriteText writes s as a text message, exactly as [RawConn.WriteText].
 func (s *Session) WriteText(msg string) error { return s.raw.WriteText(msg) }
@@ -351,10 +357,6 @@ func (s *Session) ID() uint64 { return s.raw.ID() }
 // [RawConn.Subprotocol].
 func (s *Session) Subprotocol() string { return s.raw.Subprotocol() }
 
-// HandshakeData returns the value passed to the upgrade via
-// WithHandshakeData, exactly as [RawConn.HandshakeData].
-func (s *Session) HandshakeData() any { return s.raw.HandshakeData() }
-
 // RemoteAddr returns the peer's network address, exactly as
 // [RawConn.RemoteAddr].
 func (s *Session) RemoteAddr() net.Addr { return s.raw.RemoteAddr() }
@@ -381,18 +383,18 @@ func (s *Session) Compressed() bool { return s.raw.Compressed() }
 // Option configures a [Upgrader] (via [NewUpgrader]) or a client connection
 // (via [Dial]). The same option names work on both sides where the setting
 // is symmetric (subprotocols, message size, idle timeout); client-only
-// options (headers, TLS, dial timeout) are ignored on the server side.
+// options (headers, dial timeout, [WithDialer]) are ignored on the server
+// side, and the server-only origin policy ([WithCheckOrigin]) is ignored on
+// the client side.
 type Option func(*Config)
 
 // Config holds the resolved options described by [Option].
 type Config struct {
-	CheckOrigin       func(r *http.Request) bool
-	RequireClientCert bool
-	Subprotocols      []string
-	MaxMessageSize    int64
-	IdleTimeout       time.Duration
-	WriteTimeout      time.Duration
-	PreHandshake      []func(r *http.Request) error
+	CheckOrigin    func(r *http.Request) bool
+	Subprotocols   []string
+	MaxMessageSize int64
+	IdleTimeout    time.Duration
+	WriteTimeout   time.Duration
 
 	// Compression enables permessage-deflate (RFC 7692) on both sides
 	// (default: true); CompressionLevel is the flate level used to
@@ -404,8 +406,8 @@ type Config struct {
 	Headers http.Header
 
 	// Unexported client-only state.
-	tlsConfigClient *tls.Config
-	dialTimeout     time.Duration
+	dialer      func(ctx context.Context, u *url.URL) (net.Conn, error)
+	dialTimeout time.Duration
 
 	// Unexported shared state.
 	pongHandler func([]byte)
@@ -415,13 +417,13 @@ type Config struct {
 // subprotocols. The server selects the first one it advertises that the
 // client requested, if any, and echoes it on the 101; when none match it
 // selects none and the handshake still succeeds — an application that
-// requires a subprotocol must reject the request itself, in
-// [WithPreHandshake] or its own code, before the switch. The client
+// requires a subprotocol must reject the request itself, in its own
+// [http.Handler] code before the request reaches the upgrader. The client
 // verifies the server's choice: the echoed token must be one of the ones
 // it offered (RFC 6455 §1.9), or the dial fails. An advertised token that
 // is not a valid token (RFC 2616) fails every handshake on the upgrader
 // with 400 — a misconfiguration the 101 must not echo onto the wire. The
-// result is visible on both sides via [Conn.Subprotocol].
+// result is visible on both sides via [Session.Subprotocol].
 func WithSubprotocols(list ...string) Option {
 	return func(cfg *Config) { cfg.Subprotocols = list }
 }
@@ -461,7 +463,7 @@ func WithMaxMessageSize(n int64) Option {
 
 // WithIdleTimeout sets the keepalive window on either side (default 60s).
 // When no frame has been received for the window, the next blocking
-// [Conn.ReadMessage] probes the peer with a ping; the connection is
+// [Session.ReadMessage] probes the peer with a ping; the connection is
 // considered dead and the read fails with a timeout if the peer is still
 // silent after a second window. A pong (or any frame) from the peer resets
 // the clock, so an idle-but-alive connection is kept alive and probed
@@ -469,15 +471,15 @@ func WithMaxMessageSize(n int64) Option {
 // frame that takes longer than the window to arrive — a large message on a
 // slow link — triggers the probe and, if it is still incomplete after a
 // second window, the kill. Pass zero to disable keepalive and manage
-// deadlines via [Conn.SetReadDeadline]. A negative window is invalid and is
+// deadlines via [Session.SetReadDeadline]. A negative window is invalid and is
 // replaced by the default, never by "disabled".
 func WithIdleTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.IdleTimeout = d }
 }
 
-// WithWriteTimeout bounds how long a single [Conn.WriteMessage] may block
+// WithWriteTimeout bounds how long a single [Session.WriteMessage] may block
 // writing to the transport, so a blackholed peer cannot wedge the write
-// mutex and, with it, [Conn.Close]. The default is 30 s; pass 0 to remove
+// mutex and, with it, [Session.Close]. The default is 30 s; pass 0 to remove
 // the bound (a write then blocks until the transport completes or the
 // connection is closed). A negative bound is invalid and is replaced by
 // the default, never by "unbounded".
@@ -528,26 +530,6 @@ func WithCheckOrigin(check func(r *http.Request) bool) Option {
 	return func(cfg *Config) { cfg.CheckOrigin = check }
 }
 
-// WithRequireClientCert requires the request to carry a client certificate
-// presented via mTLS and verified by the TLS layer (an
-// http.Server.TLSConfig with ClientAuth set to VerifyClientCertIfGiven or
-// RequireAndVerifyClientCert). Requests without a verified certificate are
-// rejected with 403 before the protocol switch.
-func WithRequireClientCert() Option {
-	return func(cfg *Config) { cfg.RequireClientCert = true }
-}
-
-// WithPreHandshake runs check on the request after the method, origin, and
-// client-certificate checks, before the protocol headers are validated and
-// the switch happens. Return an error to reject the upgrade with 403 — the
-// response body is a fixed "forbidden", so the hook's error detail never
-// reaches the client — or a [*UpgradeError] to control the status code and
-// body. Use it for policy checks that need the full request (rate
-// limiting, per-path checks, logging).
-func WithPreHandshake(check func(r *http.Request) error) Option {
-	return func(cfg *Config) { cfg.PreHandshake = append(cfg.PreHandshake, check) }
-}
-
 // WithHeader sets a request header on the client handshake. Browsers cannot
 // do this (they can only pass subprotocols and URLs), but programmatic
 // clients use it for bearer tokens and the like.
@@ -560,56 +542,30 @@ func WithHeader(key, value string) Option {
 	}
 }
 
-// WithTLS provides a complete TLS configuration for wss:// connections.
-func WithTLS(tlsConfig *tls.Config) Option {
-	return func(cfg *Config) {
-		cfg.tlsConfigClient = tlsConfig
-	}
-}
-
-// WithTLSClientCert enables mTLS by presenting the given client certificate
-// and key. Server certificate verification uses the system root store
-// (or tls.Config.InsecureSkipVerify, set via [WithTLS]). For custom root
-// stores or SNI control, use [WithTLS] directly. When combining [WithTLS]
-// with this option, pass [WithTLS] first: options apply in order and
-// [WithTLS] replaces the whole configuration.
-func WithTLSClientCert(cert *x509.Certificate, key any) Option {
-	return func(cfg *Config) {
-		clientTLS := cfg.tlsConfigClient
-		if clientTLS == nil {
-			clientTLS = &tls.Config{}
-		}
-		clientTLS.Certificates = []tls.Certificate{
-			{Certificate: [][]byte{cert.Raw}, PrivateKey: key},
-		}
-		cfg.tlsConfigClient = clientTLS
-	}
-}
-
-// WithTLSClientChain enables mTLS with a full client certificate: cert
-// plus its intermediate chain, presented leaf-first. Server certificate
-// verification uses the system root store (or
-// tls.Config.InsecureSkipVerify, set via [WithTLS]). For a single
-// certificate, [WithTLSClientCert] suffices. When combining [WithTLS] with
-// this option, pass [WithTLS] first: options apply in order and [WithTLS]
-// replaces the whole configuration.
-func WithTLSClientChain(cert *x509.Certificate, chain []*x509.Certificate, key any) Option {
-	return func(cfg *Config) {
-		clientTLS := cfg.tlsConfigClient
-		if clientTLS == nil {
-			clientTLS = &tls.Config{}
-		}
-		// A tls.Certificate is the whole chain, leaf first.
-		fullChain := make([][]byte, 0, len(chain)+1)
-		fullChain = append(fullChain, cert.Raw)
-		for _, intermediate := range chain {
-			fullChain = append(fullChain, intermediate.Raw)
-		}
-		clientTLS.Certificates = []tls.Certificate{
-			{Certificate: fullChain, PrivateKey: key},
-		}
-		cfg.tlsConfigClient = clientTLS
-	}
+// WithDialer replaces the client's transport: dial returns the connection
+// the WebSocket handshake runs over, so the application owns the transport
+// policy — TLS (custom root stores, client certificates for mTLS), proxy
+// CONNECT tunnels, Unix sockets — while the library performs only the
+// WebSocket handshake. When set, the library applies no TLS of its own,
+// even for wss:// URLs: the returned connection is used as-is, and the URL
+// is passed so the dialer sees the scheme, host, and path. The context
+// deadline, when one was given, is set on the returned connection for the
+// handshake and cleared once it succeeds, exactly as on the default
+// transport.
+//
+//	ws.Dial(ctx, "wss://example.com/ws", ws.WithDialer(func(ctx context.Context, u *url.URL) (net.Conn, error) {
+//		conn, err := net.Dial("tcp", u.Host)
+//		if err != nil {
+//			return nil, err
+//		}
+//		return tls.Client(conn, &tls.Config{ServerName: u.Hostname(),
+//			Certificates: clientCerts}), nil
+//	}))
+//
+// Without this option the default transport is used: plain TCP for ws://
+// and TLS with the system root store for wss://.
+func WithDialer(dial func(ctx context.Context, u *url.URL) (net.Conn, error)) Option {
+	return func(cfg *Config) { cfg.dialer = dial }
 }
 
 // WithDialTimeout bounds the connect + handshake time (default: the context
@@ -622,18 +578,16 @@ func WithDialTimeout(d time.Duration) Option {
 // 3 · Server entry: upgrading a request to a connection
 
 // Upgrader validates the HTTP portion of a WebSocket handshake and performs
-// the protocol switch to [Conn].
+// the protocol switch to a [*Session].
 type Upgrader struct {
-	checkOrigin       func(r *http.Request) bool
-	requireClientCert bool
-	subprotocols      []string
-	maxMessageSize    int64
-	idleTimeout       time.Duration
-	writeTimeout      time.Duration
-	preHandshake      []func(r *http.Request) error
-	compressEnabled   bool
-	compressLevel     int // flate level, as configured
-	pongHandler       func([]byte)
+	checkOrigin     func(r *http.Request) bool
+	subprotocols    []string
+	maxMessageSize  int64
+	idleTimeout     time.Duration
+	writeTimeout    time.Duration
+	compressEnabled bool
+	compressLevel   int // flate level, as configured
+	pongHandler     func([]byte)
 }
 
 // NewUpgrader creates an Upgrader with sensible defaults: strict same-origin
@@ -658,48 +612,15 @@ func NewUpgrader(opts ...Option) *Upgrader {
 	sanitizeLimits(cfg)
 
 	return &Upgrader{
-		checkOrigin:       cfg.CheckOrigin,
-		requireClientCert: cfg.RequireClientCert,
-		subprotocols:      cfg.Subprotocols,
-		maxMessageSize:    cfg.MaxMessageSize,
-		idleTimeout:       cfg.IdleTimeout,
-		writeTimeout:      cfg.WriteTimeout,
-		preHandshake:      cfg.PreHandshake,
-		compressEnabled:   cfg.Compression,
-		compressLevel:     cfg.CompressionLevel,
-		pongHandler:       cfg.pongHandler,
+		checkOrigin:     cfg.CheckOrigin,
+		subprotocols:    cfg.Subprotocols,
+		maxMessageSize:  cfg.MaxMessageSize,
+		idleTimeout:     cfg.IdleTimeout,
+		writeTimeout:    cfg.WriteTimeout,
+		compressEnabled: cfg.Compression,
+		compressLevel:   cfg.CompressionLevel,
+		pongHandler:     cfg.pongHandler,
 	}
-}
-
-// ClientCert returns the client's first verified certificate from an
-// mTLS-terminated request, or nil if no client certificate was presented.
-// Chain verification has already been performed by the TLS layer; this is a
-// convenience for reading identity out of the handshake.
-func ClientCert(request *http.Request) *x509.Certificate {
-	if request.TLS == nil {
-		return nil
-	}
-	if len(request.TLS.PeerCertificates) == 0 {
-		return nil
-	}
-
-	return request.TLS.PeerCertificates[0]
-}
-
-// handshakeOpts carries the settings for a single upgrade.
-type handshakeOpts struct {
-	data any
-}
-
-// HandshakeOption configures a single upgrade.
-type HandshakeOption func(*handshakeOpts)
-
-// WithHandshakeData attaches a value to the connection produced by the
-// upgrade, retrievable with [Conn.HandshakeData]. Use it to pass the result
-// of pre-upgrade setup (an authenticated principal, a session) to the
-// message loop without globals.
-func WithHandshakeData(v any) HandshakeOption {
-	return func(opts *handshakeOpts) { opts.data = v }
 }
 
 // UpgradeError is returned by [Upgrader.Upgrade] when the handshake is
@@ -792,25 +713,14 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 	return keys[0], nil
 }
 
-// checkPolicy runs the upgrader's authentication and policy gates in order
-// — origin, client certificate, then each PreHandshake hook. Rejections
-// write the HTTP error response themselves.
+// checkPolicy runs the upgrader's origin gate. Authentication and
+// authorization are ordinary middleware in front of the upgrader; the
+// origin check is the one policy the library itself enforces, because a
+// cross-origin browser is the cross-site WebSocket hijacking attack case.
+// Rejections write the HTTP error response themselves.
 func (u *Upgrader) checkPolicy(writer http.ResponseWriter, request *http.Request) *UpgradeError {
 	if !u.checkOrigin(request) {
 		return rejectStatus(writer, http.StatusForbidden, "origin not allowed")
-	}
-	if u.requireClientCert && ClientCert(request) == nil {
-		return rejectStatus(writer, http.StatusForbidden, "client certificate required")
-	}
-	for _, check := range u.preHandshake {
-		err := check(request)
-		if err != nil {
-			if ue, ok := errors.AsType[*UpgradeError](err); ok {
-				return rejectStatus(writer, ue.Status, ue.Msg)
-			}
-
-			return rejectStatus(writer, http.StatusForbidden, "forbidden")
-		}
 	}
 
 	return nil
@@ -849,12 +759,9 @@ func writeSwitchingProtocols(conn net.Conn, protocol, accept, extension string) 
 // and returns a [*UpgradeError] for logging; the handler should simply
 // return.
 //
-// Origin checking, client certificate requirements, and PreHandshake hooks
-// are applied in that order.
-func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
-	opts ...HandshakeOption,
-) (*Conn, error) {
-	raw, err := u.upgradeCore(writer, request, opts)
+// Origin checking is applied before the protocol headers are validated.
+func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request) (*Session, error) {
+	raw, err := u.upgradeCore(writer, request)
 	if err != nil {
 		return nil, err
 	}
@@ -867,30 +774,20 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 // a [*RawConn] — every ping, pong, and close arrives as an [Event], pings
 // are not answered automatically, and fragmented writes are available via
 // [RawConn.WriteFrame].
-func (u *Upgrader) UpgradeRaw(writer http.ResponseWriter, request *http.Request,
-	opts ...HandshakeOption,
-) (*RawConn, error) {
-	return u.upgradeCore(writer, request, opts)
+func (u *Upgrader) UpgradeRaw(writer http.ResponseWriter, request *http.Request) (*RawConn, error) {
+	return u.upgradeCore(writer, request)
 }
 
 // upgradeCore performs the handshake validation and protocol switch and
 // returns the raw connection; [Upgrader.Upgrade] wraps it in a [*Session]
 // on top.
-func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request,
-	opts []HandshakeOption,
-) (*RawConn, error) {
-	var sessionOpts handshakeOpts
-	for _, o := range opts {
-		o(&sessionOpts)
-	}
-
+func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request) (*RawConn, error) {
 	if request.Method != http.MethodGet {
 		return reject(writer, http.StatusMethodNotAllowed, "method not allowed")
 	}
-	// Authentication and policy checks run before protocol validation, so a
-	// request that is not authorized is rejected before the server reveals
-	// anything about the websocket handshake (and, for mTLS, before the
-	// protocol headers are even inspected).
+	// The origin check runs before protocol validation, so a request from a
+	// cross-origin browser is rejected before the server reveals anything
+	// about the websocket handshake.
 	rejection := u.checkPolicy(writer, request)
 	if rejection != nil {
 		return nil, rejection
@@ -945,7 +842,7 @@ func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request
 		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
 
-	return u.finishRaw(raw, buf, protocol, sessionOpts.data, extension), nil
+	return u.finishRaw(raw, buf, protocol, extension), nil
 }
 
 // finishRaw assembles the upgraded raw connection: the frame codec on the
@@ -953,11 +850,10 @@ func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request
 // permessage-deflate switch when the extension was granted. The caller
 // wraps it in a [*Session] when the message-oriented view was asked for.
 func (u *Upgrader) finishRaw(raw net.Conn, buf *bufio.ReadWriter, protocol string,
-	data any, extension string,
+	extension string,
 ) *RawConn {
 	conn := newRawConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
-	conn.handshakeData = data
 	if extension != "" {
 		conn.applyCompression()
 		conn.compressLevel = u.compressLevel
@@ -994,7 +890,7 @@ func (u *Upgrader) negotiateExtensions(request *http.Request) (string, error) {
 // error), the recorded close wins and nothing more goes on the wire.
 //
 // The returned handler is ordinary: wrap it in further middleware as needed.
-func (u *Upgrader) Handle(handler func(request *http.Request, c *Conn) error) http.Handler {
+func (u *Upgrader) Handle(handler func(request *http.Request, c *Session) error) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		conn, err := u.Upgrade(writer, request)
 		if err != nil {
@@ -1032,7 +928,8 @@ func (u *Upgrader) HandleRaw(handler func(request *http.Request, c *RawConn) err
 func closeAfterHandler(conn interface {
 	Close(code int, reason string) error
 }, err error) {
-	if closeErr, ok := errors.AsType[*CloseError](err); ok {
+	var closeErr *CloseError
+	if ok := errors.As(err, &closeErr); ok {
 		code := closeErr.Code
 		if code < closeCodeMin || code > closeCodeMax {
 			// An out-of-range code cannot go on the wire; tear down with
@@ -1055,7 +952,7 @@ func closeAfterHandler(conn interface {
 
 // Handle is [NewUpgrader].Handle with the default upgrader, for the simple
 // cases where no upgrader configuration is needed.
-func Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
+func Handle(handler func(r *http.Request, c *Session) error) http.Handler {
 	return NewUpgrader().Handle(handler)
 }
 
@@ -1343,17 +1240,19 @@ func acceptKey(key string) string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// dialTransport connects to host, performs the TLS handshake when isTLS, and
-// bounds the connection with the context deadline so the handshake and the
-// opening request cannot outlive the caller's cancellation.
-func dialTransport(ctx context.Context, host string, isTLS bool, tlsConfig *tls.Config) (net.Conn, error) {
+// dialTransport connects to host on the default transport: plain TCP for
+// ws:// URLs and TLS with the system root store for wss:// URLs (the SNI
+// server name falls back to the host the connection dialed). Custom
+// transport policy — custom root stores, client certificates, proxy
+// tunnels — goes through [WithDialer], which replaces this entirely.
+func dialTransport(ctx context.Context, host string, isTLS bool) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return nil, fmt.Errorf("ws: dial %s: %w", host, err)
 	}
 	if isTLS {
-		tconn := tls.Client(conn, tlsConfig)
+		tconn := tls.Client(conn, nil)
 		handshakeErr := tconn.HandshakeContext(ctx)
 		if handshakeErr != nil {
 			_ = conn.Close()
@@ -1361,9 +1260,6 @@ func dialTransport(ctx context.Context, host string, isTLS bool, tlsConfig *tls.
 			return nil, fmt.Errorf("ws: tls handshake: %w", handshakeErr)
 		}
 		conn = tconn
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
 	}
 
 	return conn, nil
@@ -1386,22 +1282,22 @@ func defaultDialConfig() *Config {
 }
 
 // dialTarget resolves the dial parameters for a ws/wss URL: the tcp
-// target with the scheme's default port filled in, the request path, and
-// whether the connection is TLS. A malformed URL, a non-ws scheme, or a
-// missing host is an error before any network I/O. Port detection uses
-// [url.URL.Port], so a bracketed IPv6 literal without a port (ws://[::1]/)
-// gets the default port too.
-func dialTarget(rawurl string) (string, string, bool, error) {
+// target with the scheme's default port filled in, the request path, the
+// parsed URL (for [WithDialer]), and whether the connection is TLS. A
+// malformed URL, a non-ws scheme, or a missing host is an error before any
+// network I/O. Port detection uses [url.URL.Port], so a bracketed IPv6
+// literal without a port (ws://[::1]/) gets the default port too.
+func dialTarget(rawurl string) (string, string, bool, *url.URL, error) {
 	parsed, err := url.Parse(rawurl)
 	if err != nil {
-		return "", "", false, fmt.Errorf("%w %q: %w", errBadURL, rawurl, err)
+		return "", "", false, nil, fmt.Errorf("%w %q: %w", errBadURL, rawurl, err)
 	}
 	isTLS := parsed.Scheme == wssScheme
 	if parsed.Scheme != wsScheme && parsed.Scheme != wssScheme {
-		return "", "", false, fmt.Errorf("%w: %q", errBadScheme, parsed.Scheme)
+		return "", "", false, nil, fmt.Errorf("%w: %q", errBadScheme, parsed.Scheme)
 	}
 	if parsed.Host == "" {
-		return "", "", false, fmt.Errorf("%w %q: no host", errBadURL, rawurl)
+		return "", "", false, nil, fmt.Errorf("%w %q: no host", errBadURL, rawurl)
 	}
 	host := parsed.Host
 	if parsed.Port() == "" {
@@ -1417,7 +1313,7 @@ func dialTarget(rawurl string) (string, string, bool, error) {
 		host = net.JoinHostPort(parsed.Hostname(), defaultPort)
 	}
 
-	return host, parsed.RequestURI(), isTLS, nil
+	return host, parsed.RequestURI(), isTLS, parsed, nil
 }
 
 // Dial opens a WebSocket client connection to rawurl (ws:// or wss://) and
@@ -1435,7 +1331,7 @@ func dialTarget(rawurl string) (string, string, bool, error) {
 // permessage-deflate and verifies the response with the same discipline:
 // the extension may be declined, or accepted with at most the client's own
 // constraints — anything else fails the dial.
-func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
+func Dial(ctx context.Context, rawurl string, opts ...Option) (*Session, error) {
 	raw, cfg, err := dialConn(ctx, rawurl, opts...)
 	if err != nil {
 		return nil, err
@@ -1486,7 +1382,7 @@ func dialConn(ctx context.Context, rawurl string, opts ...Option) (*RawConn, *Co
 }
 
 func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *Config, error) {
-	host, path, isTLS, err := dialTarget(rawurl)
+	host, path, isTLS, target, err := dialTarget(rawurl)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1496,9 +1392,21 @@ func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *C
 		defer cancel()
 	}
 
-	conn, err := dialTransport(ctx, host, isTLS, cfg.tlsConfigClient)
+	var conn net.Conn
+	if cfg.dialer != nil {
+		conn, err = cfg.dialer(ctx, target)
+	} else {
+		conn, err = dialTransport(ctx, host, isTLS)
+	}
 	if err != nil {
 		return nil, nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		// Bound the handshake on the fresh connection, whether the transport
+		// is the default one or [WithDialer]'s; cleared below once the
+		// handshake succeeds, so the session is governed by its own
+		// deadlines from there on.
+		_ = conn.SetDeadline(deadline)
 	}
 
 	reader := bufio.NewReaderSize(conn, bufSize)
@@ -1710,9 +1618,8 @@ type RawConn struct {
 	id          uint64
 	subprotocol string
 
-	state         atomic.Int32 // stOpen or stClosed
-	closeErr      error        // valid once state == stClosed; guarded by c.mu
-	handshakeData any
+	state    atomic.Int32 // stOpen or stClosed
+	closeErr error        // valid once state == stClosed; guarded by c.mu
 
 	idleTimeout  time.Duration
 	writeTimeout time.Duration
@@ -1725,7 +1632,7 @@ type RawConn struct {
 	probeAt                 time.Time
 
 	inFrag         bool
-	fragOp         int
+	fragOp         Op
 	fragBuf        []byte
 	fragCompressed bool // assembled message is a compressed (RFC 7692) payload
 
@@ -1798,7 +1705,7 @@ func newRawConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize i
 //     nil. The connection is already replying to the close and tearing
 //     down: the next ReadEvent returns the terminal error.
 type Event struct {
-	Op      int
+	Op      Op
 	Payload []byte
 	Code    int
 	Reason  string
@@ -1930,7 +1837,7 @@ func (c *RawConn) readNextFrame() (frame, error) {
 // compressed, expands it. It returns the message opcode and payload; complete
 // reports whether a possibly fragmented message has ended. A decompression
 // failure (a corrupt or oversized payload) is returned as the error.
-func (c *RawConn) readData(frm frame) (int, []byte, bool, error) {
+func (c *RawConn) readData(frm frame) (Op, []byte, bool, error) {
 	msgOp, payload, complete, compressed, msgErr := c.handleData(frm)
 	if msgErr != nil {
 		return 0, nil, false, msgErr
@@ -1966,7 +1873,7 @@ func (c *RawConn) readData(frm frame) (int, []byte, bool, error) {
 // fragment — and compressed when that finished message arrived as a
 // compressed (RFC 7692) payload (RSV1 on the first frame only); it holds
 // the partial message in the connection otherwise.
-func (c *RawConn) handleData(frm frame) (int, []byte, bool, bool, error) {
+func (c *RawConn) handleData(frm frame) (Op, []byte, bool, bool, error) {
 	if frm.opcode == OpContinuation {
 		if frm.compressed {
 			return 0, nil, false, false, fmt.Errorf("%w: permessage-deflate bit set on a continuation frame", errProtocol)
@@ -2027,7 +1934,7 @@ func (c *RawConn) keepaliveTimeout(err error) (bool, error) {
 	}
 	c.probedSinceLastActivity = true
 	c.probeAt = time.Now()
-	// The ping write carries the write-timeout bound (see Conn.writeFrame),
+	// The ping write carries the write-timeout bound (see RawConn.writeFrame),
 	// so a blackholed transport cannot wedge the read loop here.
 	pingErr := c.writeFrame(OpPing, nil, false)
 	if pingErr != nil {
@@ -2159,7 +2066,7 @@ func (c *RawConn) failProtocol(what string) error {
 }
 
 // opcodeName is the human-readable name of an opcode for error messages.
-func opcodeName(opcode int) string {
+func opcodeName(opcode Op) string {
 	switch opcode {
 	case OpContinuation:
 		return "continuation"
@@ -2190,11 +2097,11 @@ func (c *RawConn) closedWriteErr() error {
 }
 
 // writeFrame writes a frame, taking the write lock. It serves every frame
-// write on the connection — data frames ([Conn.WriteMessage]), the
-// automatic pong and keepalive ping, and the close frame ([Conn.Close]) —
+// write on the connection — data frames ([RawConn.WriteMessage]), the
+// automatic pong and keepalive ping, and the close frame ([RawConn.Close]) —
 // each of which validates its own use. A closed connection yields
-// [Conn.closedWriteErr], never a silent success.
-func (c *RawConn) writeFrame(opcode int, payload []byte, compressed bool) error {
+// [RawConn.closedWriteErr], never a silent success.
+func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state.Load() == stClosed {
@@ -2242,7 +2149,7 @@ func (c *RawConn) writeFrame(opcode int, payload []byte, compressed bool) error 
 // the read path answers to a peer ping. A peer whose keepalive window is
 // shorter than the write bound may therefore declare the connection dead
 // while a write is in flight; tune the two to match.
-func (c *RawConn) WriteMessage(opcode int, data []byte) error {
+func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 	if opcode != OpText && opcode != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
 	}
@@ -2264,7 +2171,7 @@ func (c *RawConn) WriteMessage(opcode int, data []byte) error {
 	if c.writeTimeout > 0 {
 		// Bound the write so a blackholed transport cannot hold the write
 		// mutex forever: a stuck write must fail (releasing the mutex) so
-		// [Conn.Close] can still tear the connection down. Cleared on return
+		// [RawConn.Close] can still tear the connection down. Cleared on return
 		// so the bound is per-write, not sticky.
 		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
@@ -2303,7 +2210,7 @@ func (c *RawConn) WriteMessage(opcode int, data []byte) error {
 		// write on this connection can succeed. Fail the connection with
 		// the error recorded — the same verdict the read path gives a
 		// failed pong or keepalive probe — and close the transport, as
-		// [Conn.Close] does, so a reader blocked in ReadMessage wakes
+		// [RawConn.Close] does, so a reader blocked in ReadMessage wakes
 		// now instead of on keepalive, and the hijacked conn cannot
 		// leak if the read path is not currently in a read.
 		if c.state.Load() == stOpen {
@@ -2347,7 +2254,7 @@ func (c *RawConn) WriteMessage(opcode int, data []byte) error {
 // message to pass the peer's check (RFC 6455 §5.6). The frame is written
 // uncompressed: permessage-deflate applies to whole messages, and only
 // [RawConn.WriteMessage] compresses.
-func (c *RawConn) WriteFrame(opcode int, payload []byte, more bool) error {
+func (c *RawConn) WriteFrame(opcode Op, payload []byte, more bool) error {
 	validateErr := c.validateRawFrame(opcode, payload, more)
 	if validateErr != nil {
 		return validateErr
@@ -2394,7 +2301,7 @@ func (c *RawConn) WriteFrame(opcode int, payload []byte, more bool) error {
 // size limit, the writable opcode set, the control-frame shape, and the
 // single-frame UTF-8 rule. A refused frame never reaches the wire and
 // never touches the connection's state.
-func (c *RawConn) validateRawFrame(opcode int, payload []byte, more bool) error {
+func (c *RawConn) validateRawFrame(opcode Op, payload []byte, more bool) error {
 	if int64(len(payload)) > c.fc.maxMsg {
 		return fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit",
 			errMessageTooBig, len(payload), c.fc.maxMsg)
@@ -2479,7 +2386,7 @@ func (c *RawConn) WriteBinary(data []byte) error {
 
 // WriteJSON marshals v to JSON and writes it as a text message. The
 // marshal happens before the write lock is taken, so a large marshal does
-// not hold up other writers or [Conn.Close]; a marshal failure is returned
+// not hold up other writers or [RawConn.Close]; a marshal failure is returned
 // before anything reaches the wire. JSON output is valid UTF-8 by
 // construction, so the text-frame rule (RFC 6455 §5.6) holds by
 // construction as well.
@@ -2490,6 +2397,61 @@ func (c *RawConn) WriteJSON(v any) error {
 	}
 
 	return c.WriteMessage(OpText, payload)
+}
+
+// closeWith performs the close sequence shared by [RawConn.Close] and
+// [RawConn.CloseFrame]: it validates the close code, builds the payload, and,
+// on an open connection, records the terminal error, sends the close frame
+// (bounded by the write timeout or the fixed fallback), and closes the
+// transport. It returns (writeErr, terminal) — the close-frame write status
+// and the terminal error recorded on the connection. A validation failure
+// returns (error, nil) and leaves the connection untouched; an already
+// closed connection returns (recorded, recorded) without touching the wire.
+func (c *RawConn) closeWith(code int, reason string) (error, error) {
+	if code < closeCodeMin || code > closeCodeMax {
+		return fmt.Errorf("%w: %d", errBadCloseCode, code), nil
+	}
+	var payload []byte
+	if !mustNotSetCloseCode(code) {
+		// RFC 6455 §5.5: the reason is the UTF-8 of a text message, so a
+		// non-UTF-8 reason is dropped — the close frame carries the code
+		// alone — rather than putting invalid bytes on the wire.
+		if !utf8.ValidString(reason) {
+			reason = ""
+		}
+		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
+		reason = truncateReason(reason)
+		payload = make([]byte, closeCodeBytes+len(reason))
+		binary.BigEndian.PutUint16(payload, uint16(code))
+		copy(payload[closeCodeBytes:], reason)
+	}
+	c.mu.Lock()
+	if c.state.Load() == stClosed {
+		writeErr := c.closedWriteErr()
+		terminal := terminalErr(c.closeErr)
+		c.mu.Unlock()
+
+		return writeErr, terminal
+	}
+	c.state.Store(stClosed)
+	c.closeErr = closeErrFor(code, reason)
+	// The close frame is sent best-effort: the kernel delivers queued data
+	// before the FIN, so it reaches the peer in order when the transport
+	// allows. The write is bounded by the connection's write timeout when
+	// the caller set one — the same bound every other write on this
+	// connection obeys — and by the fixed fallback otherwise, so a silent
+	// or half-dead peer must not be able to hold the close open forever.
+	closeBound := closeWriteTimeout
+	if c.writeTimeout > 0 {
+		closeBound = c.writeTimeout
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(closeBound))
+	writeErr := c.fc.writeFrame(OpClose, payload, false, true)
+	_ = c.nc.SetWriteDeadline(time.Time{})
+	c.mu.Unlock()
+	_ = c.nc.Close()
+
+	return writeErr, terminalErr(c.closeErr)
 }
 
 // Close closes the connection, sending a close frame with the given code and
@@ -2515,53 +2477,40 @@ func (c *RawConn) WriteJSON(v any) error {
 // Close takes the same write mutex as every other writer, so it queues
 // behind an in-flight data write (itself bounded by the write timeout), and
 // the read path answers the peer's close frame with its own, so a peer that
-// stops reading can also delay the [Conn.ReadMessage] that reports the
+// stops reading can also delay the [Session.ReadMessage] that reports the
 // closure by that same bound. Worst case, handler teardown waits on the
-// order of the write timeout plus the close bound.
+// order of the write timeout plus the close bound. The close-frame write
+// status itself is [RawConn.CloseFrame]'s return value.
 func (c *RawConn) Close(code int, reason string) error {
-	if code < closeCodeMin || code > closeCodeMax {
-		return fmt.Errorf("%w: %d", errBadCloseCode, code)
+	writeErr, terminal := c.closeWith(code, reason)
+	if terminal == nil {
+		// terminal is nil only when the code was rejected: the connection
+		// is untouched and the validation error is the return value.
+		return writeErr
 	}
-	var payload []byte
-	if !mustNotSetCloseCode(code) {
-		// RFC 6455 §5.5: the reason is the UTF-8 of a text message, so a
-		// non-UTF-8 reason is dropped — the close frame carries the code
-		// alone — rather than putting invalid bytes on the wire.
-		if !utf8.ValidString(reason) {
-			reason = ""
-		}
-		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
-		reason = truncateReason(reason)
-		payload = make([]byte, closeCodeBytes+len(reason))
-		binary.BigEndian.PutUint16(payload, uint16(code))
-		copy(payload[closeCodeBytes:], reason)
-	}
-	c.mu.Lock()
-	if c.state.Load() == stClosed {
-		err := c.closeErr
-		c.mu.Unlock()
 
-		return terminalErr(err)
-	}
-	c.state.Store(stClosed)
-	c.closeErr = closeErrFor(code, reason)
-	// The close frame is sent best-effort: the kernel delivers queued data
-	// before the FIN, so it reaches the peer in order when the transport
-	// allows. The write is bounded by the connection's write timeout when
-	// the caller set one — the same bound every other write on this
-	// connection obeys — and by the fixed fallback otherwise, so a silent
-	// or half-dead peer must not be able to hold the close open forever.
-	closeBound := closeWriteTimeout
-	if c.writeTimeout > 0 {
-		closeBound = c.writeTimeout
-	}
-	_ = c.nc.SetWriteDeadline(time.Now().Add(closeBound))
-	_ = c.fc.writeFrame(OpClose, payload, false, true)
-	_ = c.nc.SetWriteDeadline(time.Time{})
-	c.mu.Unlock()
-	_ = c.nc.Close()
+	return terminal
+}
 
-	return terminalErr(c.closeErr)
+// CloseFrame is the low-level half of [RawConn.Close]: the same validation,
+// the same close frame, the same bounded write, and the same teardown —
+// but it returns the status of the close-frame write itself instead of the
+// recorded terminal error. It returns nil when the frame was written, a
+// transport error when the write failed or its deadline fired, the recorded
+// close error (or [ErrClosed] after a normal closure) when the connection
+// was already closed — never a silent success for a frame that will not be
+// sent — and an error wrapping [errBadCloseCode], with the connection
+// untouched, for an out-of-range code. Use it when you need to know whether
+// the peer actually received the close frame, not just how the connection
+// ended.
+//
+// Like [RawConn.Close], it is idempotent and safe to call from any
+// goroutine, including the pumping goroutine. The session face does not
+// expose it: [Session.Close] reports the terminal error.
+func (c *RawConn) CloseFrame(code int, reason string) error {
+	writeErr, _ := c.closeWith(code, reason)
+
+	return writeErr
 }
 
 // Closed reports whether the connection has been closed, from any goroutine.
@@ -2578,10 +2527,6 @@ func (c *RawConn) ID() uint64 { return c.id }
 
 // Subprotocol returns the negotiated subprotocol, or "" if none.
 func (c *RawConn) Subprotocol() string { return c.subprotocol }
-
-// HandshakeData returns the value passed to the upgrade via
-// WithHandshakeData, or nil if none was provided.
-func (c *RawConn) HandshakeData() any { return c.handshakeData }
 
 // RemoteAddr returns the peer's network address.
 func (c *RawConn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
@@ -2789,14 +2734,14 @@ func (g *inflateGuard) Write(p []byte) (int, error) {
 // frame is one decoded RFC 6455 frame.
 type frame struct {
 	fin        bool
-	opcode     int
+	opcode     Op
 	payload    []byte
 	compressed bool // RSV1 set on the first frame of this data message
 }
 
 func (f frame) isControl() bool { return f.opcode >= OpClose }
 
-// frameCodec is the byte-level half of a [Conn]: it reads and writes RFC
+// frameCodec is the byte-level half of a [RawConn]: it reads and writes RFC
 // 6455 frames on a buffered stream pair. Masking enforcement depends on
 // which side we are on; everything else is independent of connection state,
 // so it lives in its own struct — frame encoding and decoding can be
@@ -2813,7 +2758,7 @@ type frameCodec struct {
 	// the read and random-number interfaces: one to three small
 	// allocations per frame. The read-side and write-side scratch are kept
 	// apart on purpose: the reader goroutine (readFrame) and the writer
-	// goroutines (writeFrame, serialized by the Conn's write mutex) run
+	// goroutines (writeFrame, serialized by the RawConn's write mutex) run
 	// concurrently, so each side's scratch must be owned by exactly one.
 	// Neither side needs synchronization of its own.
 	in    [4]byte  // read: header (2) + 16-bit extended length (2)
@@ -2838,7 +2783,7 @@ func (fc *frameCodec) readFrame() (frame, error) {
 	if err != nil {
 		return frame{}, fmt.Errorf("ws: read frame header: %w", err)
 	}
-	frm := frame{fin: fc.in[0]&finBit != 0, opcode: int(fc.in[0] & opcodeMask)}
+	frm := frame{fin: fc.in[0]&finBit != 0, opcode: Op(fc.in[0] & opcodeMask)}
 	rsvErr := fc.checkRSV()
 	if rsvErr != nil {
 		return frame{}, rsvErr
@@ -2876,7 +2821,7 @@ func (fc *frameCodec) readFrame() (frame, error) {
 // permessage-deflate "compressed" bit and may be set only when the
 // extension was negotiated. RSV1 marks the first frame of a data message,
 // so its misuse on control frames and continuation frames is checked where
-// the message context is known: Conn.ReadMessage and handleData.
+// the message context is known: RawConn.ReadEvent and handleData.
 func (fc *frameCodec) checkRSV() error {
 	rsv := fc.in[0] & rsvMask
 	if rsv&rsv23Mask != 0 {
@@ -2981,7 +2926,7 @@ func xorMaskKey(dst, src []byte, key [4]byte) {
 // which is reserved for permessage-deflate and must only be set on data
 // frames carrying a compressed message (RFC 7692 §6). It does not take any
 // lock; the [RawConn] serializes calls via its write mutex.
-func (fc *frameCodec) writeFrame(opcode int, payload []byte, compressed, fin bool) error {
+func (fc *frameCodec) writeFrame(opcode Op, payload []byte, compressed, fin bool) error {
 	hdr := fc.hdr[:]
 	// opcode is a 4-bit value (0-15), so the conversion cannot overflow.
 	first := byte(opcode) //nolint:gosec // 4-bit opcode
@@ -3067,14 +3012,20 @@ const (
 	closeCodeTLSFailure = 1015 // library-designated: TLS handshake failure
 )
 
+// Op is the WebSocket message and frame op-type (RFC 6455 §5.2). The data
+// messages reported by [Session.ReadMessage] and [RawConn.ReadEvent] carry
+// OpText or OpBinary; the writable set is documented on
+// [RawConn.WriteMessage] and [RawConn.WriteFrame].
+type Op int
+
 // Frame opcodes (RFC 6455 §5.2).
 const (
-	OpContinuation = 0
-	OpText         = 1
-	OpBinary       = 2
-	OpClose        = 8
-	OpPing         = 9
-	OpPong         = 10
+	OpContinuation Op = 0
+	OpText         Op = 1
+	OpBinary       Op = 2
+	OpClose        Op = 8
+	OpPing         Op = 9
+	OpPong         Op = 10
 )
 
 // Wire format constants (RFC 6455 §5-§6).
@@ -3173,7 +3124,7 @@ var deflateTailBytes = [9]byte{ //nolint:gochecknoglobals // RFC 7692 §7.2 cons
 // ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 // 9 · Errors (CloseError, CloseCode, ErrClosed, internal sentinels)
 
-// CloseError is returned by [Conn.ReadMessage] when the connection is closed
+// CloseError is returned by [Session.ReadMessage] when the connection is closed
 // with a status code other than a normal closure (1000, or a close frame
 // with no status). A normal closure reads as [io.EOF] from ReadMessage
 // instead; expected notices such as 1001 "going away" arrive here so the
@@ -3188,19 +3139,19 @@ func (e *CloseError) Error() string {
 }
 
 // CloseCode extracts the close code and reason from an error returned by
-// [Conn.ReadMessage], by a write that failed with the connection's
-// recorded close error, or from [Conn.Close] itself. ok is false if the
+// [Session.ReadMessage], by a write that failed with the connection's
+// recorded close error, or from [Session.Close] itself. ok is false if the
 // error does not carry a close code.
 func CloseCode(err error) (int, string, bool) {
-	closeErr, ok := errors.AsType[*CloseError](err)
-	if ok {
-		return closeErr.Code, closeErr.Reason, true
+	var closeErr *CloseError
+	if !errors.As(err, &closeErr) {
+		return 0, "", false
 	}
 
-	return 0, "", false
+	return closeErr.Code, closeErr.Reason, true
 }
 
-// ErrClosed is returned by [Conn.WriteMessage] when the connection has been
+// ErrClosed is returned by [Session.WriteMessage] when the connection has been
 // closed with a normal closure (1000). A normal closure records a nil
 // terminal error, so without a sentinel a write after such a close would
 // report success for a frame that is never sent.

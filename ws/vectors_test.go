@@ -62,7 +62,7 @@ func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 // client we expect unmasked frames from the (server) peer; as the server
 // we expect masked frames from the (client) peer. Tests that need the raw
 // connection's internals use newTestRawConn.
-func newTestConn(data []byte, isClient bool) *Conn {
+func newTestConn(data []byte, isClient bool) *Session {
 	return newSession(newTestRawConn(data, isClient), nil)
 }
 
@@ -159,8 +159,8 @@ func TestFrameCodecRoundtrip(t *testing.T) {
 			for i := range payload {
 				payload[i] = byte(i*31 + 7)
 			}
-			for op := range [3]int{OpText, OpBinary, OpPing} {
-				if op >= 8 && n > 125 {
+			for _, op := range [3]Op{OpText, OpBinary, OpPing} {
+				if op >= OpClose && n > 125 {
 					continue // control frames max at 125
 				}
 

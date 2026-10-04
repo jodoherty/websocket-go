@@ -1,7 +1,7 @@
 // Command demo runs a TLS server exercising the ws package: bearer-token
-// auth, mTLS client-cert auth, subprotocol negotiation, and a controlled
-// close — the same surfaces the e2e Playwright suite drives from real
-// Firefox and Chromium.
+// auth and mTLS client-cert auth as ordinary middleware, subprotocol
+// negotiation, and a controlled close — the same surfaces the e2e
+// Playwright suite drives from real Firefox and Chromium.
 package main
 
 import (
@@ -152,10 +152,6 @@ func buildMux() http.Handler {
 		ws.WithSubprotocols("vnc1", "binary"),
 		ws.WithMaxMessageSize(demoMaxMessageSize),
 	)
-	mtlsUp := ws.NewUpgrader(
-		ws.WithRequireClientCert(),
-		ws.WithSubprotocols("vnc1"),
-	)
 
 	// Plain upgrader sugar: the handler itself is the session.
 	mux.Handle("/ws/echo", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
@@ -182,16 +178,17 @@ func buildMux() http.Handler {
 	// Self-upgrading handler: ordinary HTTP auth first, then the upgrade.
 	mux.Handle("/ws/bearer", bearerHandler(echoUp))
 
-	// mTLS: the TLS layer verifies the client cert; RequireClientCert
-	// rejects any request that arrived without one.
-	mux.Handle("/ws/mtls", mtlsUp.Handle(func(request *http.Request, conn *ws.Session) error {
-		if cert := ws.ClientCert(request); cert != nil {
+	// mTLS: the TLS layer verifies the client cert; the middleware gate
+	// rejects any request that arrived without one, and the handler reads
+	// the CN out of the verified chain.
+	mux.Handle("/ws/mtls", requireClientCert(echoUp.Handle(func(request *http.Request, conn *ws.Session) error {
+		if cert := clientCert(request); cert != nil {
 			greeting := "hello, " + cert.Subject.CommonName
 			_ = conn.WriteMessage(ws.OpText, []byte(greeting))
 		}
 
 		return echo(conn)
-	}))
+	})))
 
 	// Controlled close: one message, then 1001 "going away".
 	mux.Handle("/ws/goodbye", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
@@ -208,9 +205,7 @@ func buildMux() http.Handler {
 // certinfoHandler echoes the client certificate's common name, if the
 // request was presented with one.
 func certinfoHandler(writer http.ResponseWriter, request *http.Request) {
-	//nolint:gosec // demo: the cert CN is echoed back verbatim; the demo is
-	// not a production endpoint.
-	if cert := ws.ClientCert(request); cert != nil {
+	if cert := clientCert(request); cert != nil {
 		_, _ = writer.Write([]byte(cert.Subject.CommonName))
 
 		return
@@ -238,7 +233,7 @@ func bearerHandler(upgrader *ws.Upgrader) http.HandlerFunc {
 
 			return
 		}
-		conn, err := upgrader.Upgrade(writer, request, ws.WithHandshakeData("bearer-user"))
+		conn, err := upgrader.Upgrade(writer, request)
 		if err != nil {
 			return // response already written
 		}
@@ -255,9 +250,33 @@ func bearerHandler(upgrader *ws.Upgrader) http.HandlerFunc {
 	}
 }
 
+// requireClientCert is the mTLS gate as ordinary middleware: the TLS layer
+// verifies the chain; this just refuses requests that arrived without a
+// verified certificate.
+func requireClientCert(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if clientCert(request) == nil {
+			http.Error(writer, "client certificate required", http.StatusForbidden)
+
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+// clientCert returns the request's first verified client certificate, or
+// nil if the request was not presented with one.
+func clientCert(request *http.Request) *x509.Certificate {
+	if request.TLS == nil || len(request.TLS.PeerCertificates) == 0 {
+		return nil
+	}
+
+	return request.TLS.PeerCertificates[0]
+}
+
 // tlsConfig builds the server's TLS configuration: server verification
-// against the e2e CA and optional client-cert verification (the mTLS
-// gate itself is per-endpoint, via ws.WithRequireClientCert).
+// against the e2e CA and optional client-cert verification (the mTLS gate
+// itself is per-endpoint middleware, see requireClientCert).
 func tlsConfig(certsDir string) *tls.Config {
 	//nolint:gosec // certsDir is an operator-supplied flag, not peer input.
 	caPEM, err := os.ReadFile(certsDir + "/ca.pem")

@@ -19,6 +19,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -232,6 +233,28 @@ func tlsConfigWithClientCert(t *testing.T) *tls.Config {
 	}
 }
 
+// tlsDialer is a ws.WithDialer function that wraps the fresh TCP
+// connection in the given TLS configuration: the application owns the
+// transport policy (root store, client certificates), and the library
+// performs only the WebSocket handshake.
+func tlsDialer(cfg *tls.Config) func(context.Context, *url.URL) (net.Conn, error) {
+	return func(_ context.Context, target *url.URL) (net.Conn, error) {
+		conn, err := net.Dial("tcp", target.Host)
+		if err != nil {
+			return nil, err
+		}
+		tconn := tls.Client(conn, cfg)
+		handshakeErr := tconn.Handshake()
+		if handshakeErr != nil {
+			_ = conn.Close()
+
+			return nil, handshakeErr
+		}
+
+		return tconn, nil
+	}
+}
+
 func read(t *testing.T, path string) []byte {
 	t.Helper()
 	//nolint:gosec // paths are literal e2e/certs locations, not peer input.
@@ -269,7 +292,7 @@ func TestMTLSClientCertOpensSession(t *testing.T) {
 	cfg := tlsConfigWithClientCert(t)
 
 	c, err := ws.Dial(context.Background(), "wss://"+demoEnv.addr+"/ws/mtls",
-		ws.WithTLS(cfg), ws.WithIdleTimeout(0), ws.WithSubprotocols("vnc1"),
+		ws.WithDialer(tlsDialer(cfg)), ws.WithIdleTimeout(0), ws.WithSubprotocols("vnc1"),
 		ws.WithHeader("Origin", "https://"+demoEnv.addr))
 	if err != nil {
 		t.Fatalf("dial /ws/mtls with client cert: %v", err)
@@ -299,7 +322,7 @@ func TestMTLSWithoutClientCertIsRefused(t *testing.T) {
 	pool.AppendCertsFromPEM(caPEM)
 
 	_, err := ws.Dial(context.Background(), "wss://"+demoEnv.addr+"/ws/mtls",
-		ws.WithTLS(&tls.Config{ServerName: "localhost", RootCAs: pool}),
+		ws.WithDialer(tlsDialer(&tls.Config{ServerName: "localhost", RootCAs: pool})),
 		ws.WithIdleTimeout(0), ws.WithHeader("Origin", "https://"+demoEnv.addr))
 	if err == nil {
 		t.Fatal("dial /ws/mtls without client cert succeeded, want refusal")

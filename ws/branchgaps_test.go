@@ -168,7 +168,7 @@ func TestFragmentChainAcrossThreeFrames(t *testing.T) {
 func TestHandshakeWrongHeaderValue(t *testing.T) {
 	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Session) error {
 		return nil
 	}))
 	s := httptest.NewServer(mux)

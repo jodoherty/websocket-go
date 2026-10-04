@@ -27,7 +27,7 @@ import (
 
 // pipeConnPair builds two Sessions facing each other over an in-memory
 // pipe — no sockets, no TLS, so the tests are fast and hermetic.
-func pipeConnPair() (server, client *Conn) {
+func pipeConnPair() (server, client *Session) {
 	sr, cr := net.Pipe()
 	return newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil),
 		newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
@@ -35,7 +35,7 @@ func pipeConnPair() (server, client *Conn) {
 
 // drain reads conn until it terminates, then signals done. Use it on a pipe
 // end the test does not read itself, so close-frame writes have a reader.
-func drain(tb testing.TB, conn *Conn) <-chan struct{} {
+func drain(tb testing.TB, conn *Session) <-chan struct{} {
 	tb.Helper()
 	done := make(chan struct{})
 	go func() {
@@ -119,8 +119,8 @@ func TestReadAfterClose(t *testing.T) {
 		drain(t, s)
 		err := c.Close(StatusMessageTooBig, "too big")
 		if err != nil {
-			ce, ok := errors.AsType[*CloseError](err)
-			if !ok || ce.Code != StatusMessageTooBig || ce.Reason != "too big" {
+			var ce *CloseError
+			if ok := errors.As(err, &ce); !ok || ce.Code != StatusMessageTooBig || ce.Reason != "too big" {
 				t.Fatalf("iteration %d: Close: %v", i, err)
 			}
 		}
@@ -192,7 +192,7 @@ func TestReadWhileClosing(t *testing.T) {
 		s, c := pipeConnPair()
 		drain(t, c) // so s's close-frame write has a reader
 		type outcome struct {
-			op  int
+			op  Op
 			err error
 		}
 		out := make(chan outcome, 1)

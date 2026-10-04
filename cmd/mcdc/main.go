@@ -360,7 +360,7 @@ func verify(decisions []decision, tests map[string]map[string]bool) ([]status, [
 		candidates, ok := remaining[entry.expr]
 		if !ok || len(candidates) == 0 {
 			stale = append(stale, status{
-				expr:     entry.expr,
+				decision: decision{expr: entry.expr},
 				stale:    true,
 				problems: []string{"registry entry matches no decision in the source"},
 			})

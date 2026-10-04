@@ -100,6 +100,7 @@ make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
+make multiver    # build + vet + unit tests on go1.25.0 / go1.26.0 / go1.27.1
 make e2e         # Go mTLS + Node `ws` interop both directions + Playwright
 ```
 
@@ -162,6 +163,10 @@ ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
                     plus the stalled-write bounded-write regression
+ws/closeframe_test.go CloseFrame: the close-frame write status (nil on a
+                    live transport, the write failure on a stalled one,
+                    ErrClosed after a normal closure, the code rejection),
+                    plus the wire shape the peer observes
 ws/raw_test.go      the raw API: the ReadEvent contract (control frames are
                     events, no auto-pong, close resolution), the WriteFrame
                     MC/DC matrix (state, control shape, UTF-8, writable set),

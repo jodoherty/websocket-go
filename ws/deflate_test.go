@@ -117,7 +117,7 @@ func offerHeader(offer string) http.Header {
 // echo runs a read/echo loop until the connection ends. It mirrors the
 // helper in the external ws_test package, which this internal test file
 // cannot import.
-func echo(c *Conn) error {
+func echo(c *Session) error {
 	for {
 		op, data, err := c.ReadMessage()
 		if err != nil {
@@ -144,7 +144,7 @@ func startCompressedEchoServer(t *testing.T, upOpts ...Option) *httptest.Server 
 	}, upOpts...)
 	up := NewUpgrader(allOpts...)
 	mux := http.NewServeMux()
-	mux.Handle("/echo", up.Handle(func(_ *http.Request, c *Conn) error {
+	mux.Handle("/echo", up.Handle(func(_ *http.Request, c *Session) error {
 		return echo(c)
 	}))
 	srv := httptest.NewServer(mux)
@@ -205,7 +205,7 @@ func serverExtensionReply(t *testing.T, offer string) (int, string) {
 // Dial outcome. The server ignores the client's offer and answers with
 // whatever ext says, so client-side response verification is exercised
 // against arbitrary (even non-conforming) responses.
-func dialWithServerExtension(t *testing.T, ext string, opts ...Option) (*Conn, error) {
+func dialWithServerExtension(t *testing.T, ext string, opts ...Option) (*Session, error) {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -472,7 +472,7 @@ func TestDeflateFragmentedCompressedMessage(t *testing.T) {
 // checkEmptyEcho verifies that an empty message of each given opcode
 // round-trips through the (compressed) connection: an empty compressed
 // payload must decompress to zero bytes, and an empty message is legal.
-func checkEmptyEcho(t *testing.T, conn *Conn, ops ...int) {
+func checkEmptyEcho(t *testing.T, conn *Session, ops ...Op) {
 	t.Helper()
 	for _, op := range ops {
 		writeErr := conn.WriteMessage(op, []byte{})

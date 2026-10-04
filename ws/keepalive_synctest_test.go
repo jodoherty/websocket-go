@@ -24,7 +24,7 @@ import (
 // boundary (never earlier), a dead peer is killed at exactly 2x the window,
 // and a peer kept alive by frames is never killed.
 //
-// Determinism rule used throughout: after synctest.Sleep crosses a deadline
+// Determinism rule used throughout: after a (faked) time.Sleep crosses a deadline
 // and unblocks the reader, a synctest.Wait() is required before asserting on
 // the reader's side effects (a recorded ping, etc.), to let it reach its
 // next durably-blocked state. Assertions must use control frames (pong) to
@@ -89,7 +89,7 @@ func (g *gatedConn) Read(p []byte) (int, error) {
 }
 
 func (g *gatedConn) Write(p []byte) (int, error) {
-	if len(p) > 0 && (p[0]&0x0f) == OpPing {
+	if len(p) > 0 && Op(p[0]&0x0f) == OpPing {
 		g.pingMu.Lock()
 		g.pings = append(g.pings, time.Now())
 		g.pingMu.Unlock()
@@ -162,7 +162,7 @@ func (g *gatedConn) pingTimes() []time.Time {
 }
 
 // startRead runs ReadMessage in the bubble and reports its result.
-func startRead(t *testing.T, c *Conn) <-chan error {
+func startRead(t *testing.T, c *Session) <-chan error {
 	t.Helper()
 	errc := make(chan error, 1)
 	go func() {
@@ -192,14 +192,14 @@ func TestKeepaliveProbesThenKillsDeadPeer(t *testing.T) {
 		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // the reader is durably blocked with a deadline at idle
 
-		synctest.Sleep(idle - 100*time.Millisecond) // t = idle-100ms
+		time.Sleep(idle - 100*time.Millisecond) // t = idle-100ms
 		synctest.Wait()
 		n := nc.pingCount()
 		if n != 0 {
 			t.Fatalf("%d pings before the idle window elapsed, want 0", n)
 		}
-		synctest.Sleep(100 * time.Millisecond) // t = idle
-		synctest.Wait()                        // the reader has probed (ping #1) and re-blocked at 2*idle
+		time.Sleep(100 * time.Millisecond) // t = idle
+		synctest.Wait()                    // the reader has probed (ping #1) and re-blocked at 2*idle
 		n = nc.pingCount()
 		if n != 1 {
 			t.Fatalf("%d pings at the idle boundary, want 1", n)
@@ -208,7 +208,7 @@ func TestKeepaliveProbesThenKillsDeadPeer(t *testing.T) {
 		if !at.Equal(probeAt) {
 			t.Fatalf("probe ping at %v, want exactly %v", at, probeAt)
 		}
-		synctest.Sleep(idle) // t = 2*idle: the grace window expires
+		time.Sleep(idle) // t = 2*idle: the grace window expires
 		requireTimeout(t, <-errc)
 	})
 }
@@ -225,8 +225,8 @@ func TestKeepaliveAlivePeerSurvives(t *testing.T) {
 		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // deadline at idle
 
-		synctest.Sleep(idle) // t = idle: probe #1
-		synctest.Wait()      // the reader has probed and re-blocked at 2*idle
+		time.Sleep(idle) // t = idle: probe #1
+		synctest.Wait()  // the reader has probed and re-blocked at 2*idle
 		n := nc.pingCount()
 		if n != 1 {
 			t.Fatalf("%d pings at the idle boundary, want 1", n)
@@ -237,7 +237,7 @@ func TestKeepaliveAlivePeerSurvives(t *testing.T) {
 		// The restarted clock means probe #2 lands one full window later;
 		// answering it keeps the connection alive past the point where a
 		// dead peer would be killed.
-		synctest.Sleep(idle) // t = 2*idle: probe #2
+		time.Sleep(idle) // t = 2*idle: probe #2
 		synctest.Wait()
 		n = nc.pingCount()
 		if n != 2 {
@@ -268,11 +268,11 @@ func TestKeepaliveActivityResetsClock(t *testing.T) {
 		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // deadline at idle
 
-		synctest.Sleep(idle / 2)    // t = 0.5*idle
+		time.Sleep(idle / 2)        // t = 0.5*idle
 		nc.push([]byte{0x8a, 0x00}) // a pong: activity, keeps the loop running
 		synctest.Wait()             // reader consumes at t=0.5, deadline now 1.5*idle
 
-		synctest.Sleep(idle / 2) // t = idle
+		time.Sleep(idle / 2) // t = idle
 		synctest.Wait()
 		// Without the reset, the first probe would fire at t=idle; with it,
 		// the clock restarted at 0.5*idle, so no ping yet.
@@ -312,15 +312,15 @@ func TestKeepaliveProbeWriteBounded(t *testing.T) {
 		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // reader durably blocked on the read deadline at idle
 
-		synctest.Sleep(idle) // t = idle: the silence timeout probes with a ping
-		synctest.Wait()      // the ping write is durably blocked on its deadline
+		time.Sleep(idle) // t = idle: the silence timeout probes with a ping
+		synctest.Wait()  // the ping write is durably blocked on its deadline
 		if dl := nc.lastWriteDeadline(); dl.IsZero() {
 			t.Fatal("probe ping was written with no write deadline: a stalled " +
 				"transport would wedge the read loop and the write mutex")
 		}
 
-		synctest.Sleep(writeTimeout) // t = idle+writeTimeout: the ping write fails
-		err := <-errc                // the read loop must have recovered
+		time.Sleep(writeTimeout) // t = idle+writeTimeout: the ping write fails
+		err := <-errc            // the read loop must have recovered
 		var nerr net.Error
 		if err == nil || !errors.As(err, &nerr) || !nerr.Timeout() {
 			t.Fatalf("read loop after failed probe write: %v, want a timeout-classified error", err)

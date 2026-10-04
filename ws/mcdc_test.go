@@ -22,13 +22,10 @@ package ws
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -153,14 +150,14 @@ func TestMCDCWriteMessageOpcode(t *testing.T) {
 	fresh := func() *RawConn {
 		return newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 	}
-	proceeded := func(t *testing.T, opcode int) {
+	proceeded := func(t *testing.T, opcode Op) {
 		t.Helper()
 		err := fresh().WriteMessage(opcode, []byte("x"))
 		if err == nil || strings.Contains(err.Error(), "requires OpText or OpBinary") {
 			t.Fatalf("WriteMessage(%d): %v, want the write to reach the transport", opcode, err)
 		}
 	}
-	rejected := func(t *testing.T, opcode int) {
+	rejected := func(t *testing.T, opcode Op) {
 		t.Helper()
 		err := fresh().WriteMessage(opcode, []byte("x"))
 		if err == nil || !strings.Contains(err.Error(), "requires OpText or OpBinary") {
@@ -262,50 +259,6 @@ func TestMCDCCloseCodePayload(t *testing.T) {
 	})
 }
 
-// TestMCDCRequireClientCert traces
-// "u.requireClientCert && ClientCert(request) == nil".
-func TestMCDCRequireClientCert(t *testing.T) {
-	t.Parallel()
-
-	allowOrigin := func(*http.Request) bool { return true }
-	noCert := &http.Request{Header: http.Header{}, URL: &url.URL{}}
-	withCert := &http.Request{
-		Header: http.Header{}, URL: &url.URL{},
-		TLS: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}},
-	}
-	rejected := func(t *testing.T, require bool, request *http.Request) bool {
-		t.Helper()
-		up := NewUpgrader(WithCheckOrigin(allowOrigin))
-		if require {
-			up = NewUpgrader(WithCheckOrigin(allowOrigin), WithRequireClientCert())
-		}
-
-		return up.checkPolicy(httptest.NewRecorder(), request) != nil
-	}
-
-	t.Run("require", func(t *testing.T) {
-		t.Parallel()
-		// (require=T, cert=nil) flips to (F, cert=nil).
-		if !rejected(t, true, noCert) {
-			t.Fatal("WithRequireClientCert without a certificate must be rejected")
-		}
-		if rejected(t, false, noCert) {
-			t.Fatal("without WithRequireClientCert, a missing certificate must pass")
-		}
-	})
-
-	t.Run("cert", func(t *testing.T) {
-		t.Parallel()
-		// (require=T, cert=nil) flips to (T, cert=present).
-		if rejected(t, true, withCert) {
-			t.Fatal("a presented client certificate must satisfy WithRequireClientCert")
-		}
-		if !rejected(t, true, noCert) {
-			t.Fatal("WithRequireClientCert without a certificate must be rejected")
-		}
-	})
-}
-
 // TestMCDCDialScheme traces
 // "parsed.Scheme != wsScheme && parsed.Scheme != wssScheme". The check
 // runs before any dial, so a refused port is irrelevant: what is
@@ -360,7 +313,7 @@ func TestMCDCHandleCloseCode(t *testing.T) {
 		t.Helper()
 		up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
 		mux := http.NewServeMux()
-		mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Conn) error {
+		mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Session) error {
 			return &CloseError{Code: code, Reason: "probe"}
 		}))
 		s := httptest.NewServer(mux)

@@ -53,7 +53,7 @@ func TestRawEventSequence(t *testing.T) {
 		t.Fatalf("fourth event = (%+v, %v), want close 1001 \"bye\"", ev, err)
 	}
 	// The close was replied to: the reply is a (client-masked) close frame.
-	if len(fc.written) != 2+maskKeyLen+closeCodeBytes+3 || fc.written[0]&opcodeMask != OpClose {
+	if len(fc.written) != 2+maskKeyLen+closeCodeBytes+3 || Op(fc.written[0]&opcodeMask) != OpClose {
 		t.Fatalf("close reply % x, want a masked close frame", fc.written)
 	}
 
@@ -81,7 +81,7 @@ func TestRawPongAnswer(t *testing.T) {
 		t.Fatalf("Pong: %v", err)
 	}
 	// Client frames are masked: opcode, length|mask, key, payload.
-	if len(fc.written) != 2+maskKeyLen+5 || fc.written[0]&opcodeMask != OpPong {
+	if len(fc.written) != 2+maskKeyLen+5 || Op(fc.written[0]&opcodeMask) != OpPong {
 		t.Fatalf("pong frame % x, want a masked pong with the answer", fc.written)
 	}
 
@@ -105,14 +105,14 @@ func TestRawFragmentedWrite(t *testing.T) {
 	client := newRawConn(cr, cr, true, 1<<20, 0, 0)
 
 	out := make(chan struct {
-		op   int
+		op   Op
 		data string
 		err  error
 	}, 1)
 	go func() {
 		op, data, err := server.ReadMessage()
 		out <- struct {
-			op   int
+			op   Op
 			data string
 			err  error
 		}{op, string(data), err}
@@ -336,7 +336,7 @@ func TestMCDCRawWriteFrame(t *testing.T) {
 // exactly as it does for Dial.
 func TestDialRawDefaults(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(Handle(func(_ *http.Request, c *Conn) error {
+	srv := httptest.NewServer(Handle(func(_ *http.Request, c *Session) error {
 		for {
 			_, _, readErr := c.ReadMessage()
 			if readErr != nil {
@@ -361,7 +361,7 @@ func TestDialRawDefaults(t *testing.T) {
 // visible to the raw application — its answer arrives as an OpPong event.
 func TestDialRawIdleTimeoutOptIn(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(Handle(func(_ *http.Request, c *Conn) error {
+	srv := httptest.NewServer(Handle(func(_ *http.Request, c *Session) error {
 		for {
 			_, _, readErr := c.ReadMessage()
 			if readErr != nil {

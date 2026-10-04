@@ -46,7 +46,7 @@ func maskedCloseFrame(payload []byte) []byte {
 // fc, if it wrote one.
 func closeReply(fc *fakeConn) (payload []byte, ok bool) {
 	data := fc.written
-	if len(data) < 2 || data[0]&0x0f != OpClose || data[1]&0x80 != 0 {
+	if len(data) < 2 || Op(data[0]&0x0f) != OpClose || data[1]&0x80 != 0 {
 		return nil, false
 	}
 	ln := int(data[1] & 0x7f)
@@ -222,7 +222,7 @@ func TestMCDCWebSocketKey(t *testing.T) {
 	status := func(t *testing.T, key string) int {
 		t.Helper()
 		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
-		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error { return nil }))
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error { return nil }))
 		t.Cleanup(srv.Close)
 		host := srv.URL[len("http://"):]
 		conn, err := net.Dial("tcp", host)
@@ -279,7 +279,7 @@ func TestSubprotocolEcho(t *testing.T) {
 	// dialEcho answers one handshake with a 101 that carries the given
 	// Sec-WebSocket-Protocol header ("" = no header) and reports the Dial
 	// outcome.
-	dialEcho := func(t *testing.T, offered []string, echo string) (*Conn, error) {
+	dialEcho := func(t *testing.T, offered []string, echo string) (*Session, error) {
 		t.Helper()
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -381,7 +381,7 @@ func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
 	rawStatus := func(t *testing.T, extra string) int {
 		t.Helper()
 		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
-		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error { return nil }))
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error { return nil }))
 		t.Cleanup(srv.Close)
 		host := srv.URL[len("http://"):]
 		conn, err := net.Dial("tcp", host)
@@ -434,7 +434,7 @@ func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
 		// Two Sec-WebSocket-Protocol lines share one 1#token value space
 		// (§1.9): the token on the second line is selectable too.
 		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin), WithSubprotocols("superchat"))
-		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error { return nil }))
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error { return nil }))
 		t.Cleanup(srv.Close)
 		host := srv.URL[len("http://"):]
 		conn, err := net.Dial("tcp", host)
@@ -563,7 +563,7 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 // rejected before the protocol switch.
 func TestRequestWithBodyRejected(t *testing.T) {
 	up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
-	srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error {
+	srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error {
 		t.Error("handler ran despite a request body")
 
 		return nil
@@ -771,7 +771,7 @@ func TestClientRejectsLineBreakHeader(t *testing.T) {
 // headers, or the rejection status).
 func rawUpgrade(t *testing.T, up *Upgrader) *http.Response {
 	t.Helper()
-	srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error {
+	srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error {
 		return nil
 	}))
 	defer srv.Close()
@@ -858,7 +858,7 @@ func TestReservedExtensionHeaderSkipped(t *testing.T) {
 func echoServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
-	srv := httptest.NewServer(up.Handle(func(_ *http.Request, c *Conn) error {
+	srv := httptest.NewServer(up.Handle(func(_ *http.Request, c *Session) error {
 		for {
 			op, data, err := c.ReadMessage()
 			if err != nil {

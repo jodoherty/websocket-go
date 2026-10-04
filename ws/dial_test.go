@@ -1,57 +1,106 @@
 package ws
 
 import (
-	"bytes"
-	"crypto/tls"
-	"crypto/x509"
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
-// TestWithTLSClientChainOption pins the mTLS chain option's plumbing: the
-// leaf and its intermediates land in the tls.Config as one chain, leaf
-// first, and composing the option after WithTLS adds the chain to the
-// existing configuration instead of replacing it.
-func TestWithTLSClientChainOption(t *testing.T) {
+// TestWithDialerOption pins the option's plumbing: the dial function lands
+// in the config, and the server side ignores it (an upgrader's transport is
+// the hijacked connection, never a dialer).
+func TestWithDialerOption(t *testing.T) {
 	t.Parallel()
-	// Raw-only certificates suffice: this test checks what the option
-	// places in the tls.Config, not what x509 verifies.
-	leaf := &x509.Certificate{Raw: []byte("leaf")}
-	intermediates := []*x509.Certificate{
-		{Raw: []byte("intermediate-1")},
-		{Raw: []byte("intermediate-2")},
+	// The recorded dial function is the one the option carried: invoking it
+	// yields its sentinel error.
+	dialErrSentinel := errors.New("marked")
+	dial := func(context.Context, *url.URL) (net.Conn, error) {
+		return nil, dialErrSentinel
 	}
-	key := "private-key"
-
 	cfg := &Config{}
-	WithTLSClientChain(leaf, intermediates, key)(cfg)
-	if len(cfg.tlsConfigClient.Certificates) != 1 {
-		t.Fatalf("chain option: %d certificates, want exactly one", len(cfg.tlsConfigClient.Certificates))
+	WithDialer(dial)(cfg)
+	if cfg.dialer == nil {
+		t.Fatal("WithDialer did not record the dial function")
 	}
-	cert := cfg.tlsConfigClient.Certificates[0]
-	// The entry is the whole chain, leaf first.
-	if len(cert.Certificate) != 3 ||
-		!bytes.Equal(cert.Certificate[0], leaf.Raw) ||
-		!bytes.Equal(cert.Certificate[1], intermediates[0].Raw) ||
-		!bytes.Equal(cert.Certificate[2], intermediates[1].Raw) {
-		t.Fatalf("certificate chain % x, want leaf then the intermediates in order", cert.Certificate)
+	_, dialErr := cfg.dialer(context.Background(), nil)
+	if dialErr == nil || !errors.Is(dialErr, dialErrSentinel) {
+		t.Fatal("WithDialer recorded the wrong dial function")
 	}
-	if cert.PrivateKey != key {
-		t.Fatal("private key not carried into the certificate entry")
-	}
+	NewUpgrader(WithDialer(dial)) // the server side must ignore it
 
-	// Composed after WithTLS, the chain is installed on the existing
-	// configuration without disturbing its other settings.
-	cfg = &Config{}
-	base := &tls.Config{ServerName: "example.com"}
-	WithTLS(base)(cfg)
-	WithTLSClientChain(leaf, nil, key)(cfg)
-	if cfg.tlsConfigClient != base {
-		t.Fatal("chain option replaced the WithTLS configuration")
-	}
-	if base.ServerName != "example.com" || len(base.Certificates) != 1 {
-		t.Fatalf("WithTLS settings or chain lost: serverName=%q certs=%d", base.ServerName, len(base.Certificates))
+	// The option is symmetric in name only: applying it on the server
+	// leaves the server options untouched.
+	serverCfg := &Config{CheckOrigin: defaultCheckOrigin}
+	WithDialer(dial)(serverCfg)
+	if serverCfg.CheckOrigin == nil {
+		t.Fatal("WithDialer disturbed the server options")
 	}
 }
+
+// TestDialWithCustomDialer pins WithDialer end to end: the dialer receives
+// the parsed URL, and its connection is used for the handshake as-is — no
+// TLS is applied by the library, even for a wss:// URL, so the app owns the
+// transport policy.
+func TestDialWithCustomDialer(t *testing.T) {
+	t.Parallel()
+	up := NewUpgrader()
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
+		op, data, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		return c.WriteMessage(op, data)
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var gotURL *url.URL
+	c, err := Dial(context.Background(), "wss://"+srv.Listener.Addr().String()+"/ws",
+		WithDialer(func(_ context.Context, u *url.URL) (net.Conn, error) {
+			gotURL = u
+
+			return net.Dial("tcp", u.Host) // no TLS: the app owns the transport
+		}))
+	if err != nil {
+		t.Fatalf("dial with custom dialer: %v", err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+	if gotURL == nil || gotURL.Scheme != "wss" || gotURL.Path != "/ws" {
+		t.Fatalf("dialer saw %v, want the parsed wss URL with path /ws", gotURL)
+	}
+	writeErr := c.WriteText("hi")
+	if writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	op, data, readErr := c.ReadMessage()
+	if readErr != nil || op != OpText || string(data) != "hi" {
+		t.Fatalf("round trip = (%d, %q, %v), want the echo", op, data, readErr)
+	}
+}
+
+// TestDialerFailure pins the error path: a dialer failure fails the dial
+// with the dialer's error.
+func TestDialerFailure(t *testing.T) {
+	t.Parallel()
+	want := netError{msg: "proxy down"}
+	_, err := Dial(context.Background(), "ws://example.com/ws",
+		WithDialer(func(context.Context, *url.URL) (net.Conn, error) {
+			return nil, want
+		}))
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("dial error = %v, want the dialer's error", err)
+	}
+}
+
+type netError struct{ msg string }
+
+func (e netError) Error() string { return e.msg }
 
 // TestDialTarget pins the URL → dial-target resolution: a plain host gets
 // the scheme's default port, an explicit port is preserved, and a
@@ -76,7 +125,7 @@ func TestDialTarget(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.raw, func(t *testing.T) {
 			t.Parallel()
-			host, _, isTLS, err := dialTarget(tc.raw)
+			host, _, isTLS, _, err := dialTarget(tc.raw)
 			if err != nil {
 				t.Fatalf("dialTarget(%q) error = %v", tc.raw, err)
 			}

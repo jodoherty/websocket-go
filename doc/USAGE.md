@@ -21,10 +21,10 @@ it is.
    `http.Handler`. Anything the stdlib ecosystem does with `http.Handler`
    (routing, middleware, logging, timeouts) works unchanged.
 
-2. **Authentication is middleware.** Bearer tokens, sessions, rate limiting,
-   and mTLS run in plain HTTP code before the upgrade. Client certificates
-   are read with `ws.ClientCert(r)` (wrapping `r.TLS.PeerCertificates`);
-   `ws.WithRequireClientCert()` rejects requests that arrived without one.
+2. **Authentication is middleware.** Bearer tokens, sessions, rate
+   limiting, and mTLS run in plain HTTP code before the upgrade. The
+   result rides on the request context into the message handler, and
+   client certificates are read from `r.TLS.PeerCertificates`.
 
 3. **No callbacks, no pump goroutine.** The goroutine that calls
    `Session.ReadMessage` *is* the connection's goroutine. A session is:
@@ -35,7 +35,8 @@ it is.
        if err != nil {
            return
        }
-       c, err := up.Upgrade(w, r, ws.WithHandshakeData(user))
+       r = withUser(r, user)                // the principal rides on the request context
+       c, err := up.Upgrade(w, r)
        if err != nil {
            return                            // 4xx/5xx already written
        }
@@ -256,19 +257,18 @@ go func() {
 ```go
 // Server
 func NewUpgrader(opts ...Option) *Upgrader
-func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, opts ...HandshakeOption) (*Conn, error)
-func (u *Upgrader) UpgradeRaw(w http.ResponseWriter, r *http.Request, opts ...HandshakeOption) (*RawConn, error)
+func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request) (*Session, error)
+func (u *Upgrader) UpgradeRaw(w http.ResponseWriter, r *http.Request) (*RawConn, error)
 // Handle(fn): on handler return, closes with the *CloseError's code,
 // 1000 for a nil return, or 1011 for any other error (the session did
 // not end normally). HandleRaw is the same contract over a *RawConn.
-func (u *Upgrader) Handle(fn func(r *http.Request, c *Conn) error) http.Handler
-func Handle(fn func(r *http.Request, c *Conn) error) http.Handler
+func (u *Upgrader) Handle(fn func(r *http.Request, c *Session) error) http.Handler
+func Handle(fn func(r *http.Request, c *Session) error) http.Handler
 func (u *Upgrader) HandleRaw(fn func(r *http.Request, c *RawConn) error) http.Handler
 func HandleRaw(fn func(r *http.Request, c *RawConn) error) http.Handler
 
 // Options (shared by server and client where symmetric)
 WithCheckOrigin(f)         // default: same-origin when an Origin header is present
-WithRequireClientCert()    // mTLS gate, 403 without a verified client cert
 WithSubprotocols(...)      // server: select or none (lenient); client: echo is verified
 WithMaxMessageSize(n)      // default 16 MiB; non-positive falls back to the default
 WithIdleTimeout(d)         // default 60 s window: probe at d, dead at 2d; 0 disables
@@ -277,22 +277,25 @@ WithCompression(enabled)   // permessage-deflate (RFC 7692); default true, opt o
 WithCompressionLevel(l)    // flate level for compression; default flate.DefaultCompression
 WithPongHandler(f)         // sessions only: invoked inline by ReadMessage when a pong
                            // arrives; pongs are otherwise invisible (no effect on RawConn)
-WithPreHandshake(f)        // policy hook before the switch; plain error → fixed 403 "forbidden" body;
-                           // *UpgradeError controls status and body
-WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
+// Client-only options (ignored on the server side)
+WithHeader(k, v)           // a request header on the client handshake (e.g. an API key, an Origin)
+WithDialer(f)              // the app owns the transport: f(ctx, url) returns the ready
+                           // connection the handshake runs over (custom roots, client
+                           // certs for mTLS, proxy tunnels); no library TLS when set
+WithDialTimeout(d)         // bounds connect + handshake
 
-// Session (type Conn = Session; the alias exists so old code keeps compiling)
-Session.ReadMessage() (op int, data []byte, err error)
+// Session
+Session.ReadMessage() (op Op, data []byte, err error)
    // a clean end reads as (0, nil, io.EOF); other closes as *CloseError;
    // pings answered automatically, pongs consumed (or WithPongHandler)
-Session.WriteMessage(op int, data []byte) error   // the echo form: the op comes off the wire;
-                                               // on a closed conn: recorded error, or ErrClosed
+Session.WriteMessage(op Op, data []byte) error   // the echo form: the op comes off the wire;
+                                                // on a closed conn: recorded error, or ErrClosed
 Session.WriteText(s string) error                 // OpText; invalid UTF-8 refused before the wire
 Session.WriteBinary(b []byte) error               // OpBinary, bytes untouched
 Session.WriteJSON(v any) error                    // marshal (off-lock) then OpText
 Session.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
 Session.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
-Session.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
+Session.ID() / Subprotocol() / RemoteAddr() / LocalAddr()
 Session.Compressed() bool     // whether permessage-deflate was negotiated on this connection
 Session.SetReadDeadline / SetWriteDeadline
 Session.Closed() bool         // race-free "am I closed?" for background writers
@@ -301,31 +304,30 @@ Session.Closed() bool         // race-free "am I closed?" for background writers
 // every control frame is an event, pings are answered by you, and writes
 // can fragment. No WithPongHandler: pongs are events.
 type Event struct {
-    Op      int     // OpText, OpBinary, OpPing, OpPong, OpClose
+    Op      Op      // OpText, OpBinary, OpPing, OpPong, OpClose
     Payload []byte  // data: the message; ping/pong: the control payload
     Code    int     // OpClose: the resolved close code
     Reason  string  // OpClose: the reason text
 }
 RawConn.ReadEvent() (Event, error)   // the raw read loop: one event per call, in wire order;
                                      // the peer's close is an OpClose event, then the terminal error
-RawConn.WriteFrame(op int, payload []byte, more bool) error  // raw frame; more=true starts/continues
-                                                            // a fragmented message (RFC 6455 §5.4)
+RawConn.WriteFrame(op Op, payload []byte, more bool) error  // raw frame; more=true starts/continues
+                                                           // a fragmented message (RFC 6455 §5.4)
 RawConn.Pong(payload []byte) error   // the answer to a received ping (≤125 B); you are the responder
-RawConn.WriteMessage / WriteText / WriteBinary / WriteJSON / Ping / Close / Closed
-RawConn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr() / Compressed()
+RawConn.WriteMessage / WriteText / WriteBinary / WriteJSON / Ping / Closed
+RawConn.Close(code int, reason string) error      // teardown; returns the recorded terminal error
+RawConn.CloseFrame(code int, reason string) error // the same close; returns the close-frame write status
+RawConn.ID() / Subprotocol() / RemoteAddr() / LocalAddr() / Compressed()
 
 // Sentinels
+type Op int  // OpContinuation, OpText, OpBinary, OpClose, OpPing, OpPong
 var ErrClosed  // returned by WriteMessage after a normal closure (1000)
 io.EOF       // returned by ReadMessage and Close for a clean end
 
 // Client
-func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)        // the session view
-func DialRaw(ctx context.Context, url string, opts ...Option) (*RawConn, error)  // the raw view: keepalive off by
+func Dial(ctx context.Context, url string, opts ...Option) (*Session, error)   // the session view
+func DialRaw(ctx context.Context, url string, opts ...Option) (*RawConn, error) // the raw view: keepalive off by
                                          // default (WithIdleTimeout opts in), pongs are events
-WithHeader(k, v)           // e.g. Authorization: Bearer ...
-WithTLS(cfg) / WithTLSClientCert(cert, key) / WithTLSClientChain(cert, chain, key)  // mTLS
-                                                                  // (chain: leaf + intermediates)
-WithDialTimeout(d)
 ```
 
 Protocol details: masking enforced both directions, fragmentation support on
@@ -358,9 +360,11 @@ below are where they live.
 
 **The library owns (nothing to do):**
 
-- **WSS.** `Dial` uses TLS for `wss://` (`WithTLS` / `WithTLSClientCert`
-  for custom roots or mTLS). Serve behind TLS; never put `ws://` in
-  production.
+- **WSS.** `Dial` uses TLS with the system root store for `wss://` by
+  default; `WithDialer` replaces the transport entirely when you need
+  custom roots, client certificates, or a proxy tunnel (the dialer owns
+  the transport, and the library applies no TLS of its own when one is
+  set). Serve behind TLS; never put `ws://` in production.
 - **RFC 6455 core, plus permessage-deflate (RFC 7692).** Version 13 only;
   the only reserved (RSV) bit used is RSV1, and only when permessage-deflate
   is negotiated. Compression is on by default (matching browsers and the
@@ -372,8 +376,6 @@ below are where they live.
 - **Origin validation on every handshake** (CSWSH). Strict same-origin by
   default — no `CheckOrigin: always true`; override with `WithCheckOrigin`
   as an explicit allowlist, never a denylist.
-- **mTLS gate.** `WithRequireClientCert()` rejects before the protocol
-  switch; `ClientCert(r)` reads the identity.
 - **Message size bound** (DoS). Default 16 MiB; for chat-style traffic the
   cheat sheet's ~64 KiB is a sane cap — set it per endpoint:
   `WithMaxMessageSize(64 << 10)`.
@@ -416,6 +418,11 @@ browser-equivalent policy treatment: `ws.Dial` sends it via
 `ws.WithHeader("Origin", …)`, and the Node `ws` library takes an
 `origin` option — that is how the e2e Node interop passes the demo's
 default same-origin check.
+
+*mTLS gate — middleware in front of the upgrader.* The TLS layer verifies
+the client chain; a plain `http.Handler` wrapper refuses requests that
+arrived without a verified certificate (`r.TLS.PeerCertificates` is the
+identity). This is the pattern the demo's `/ws/mtls` endpoint uses.
 
 *Session lifecycle — re-validate, and close on expiry or logout.*
 WebSocket sessions outlive ordinary ones, so re-check the session in the
