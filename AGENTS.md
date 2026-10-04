@@ -70,8 +70,9 @@ Unlicense (see `LICENSE`).
 
 ## Coverage gates — all of them must pass before committing
 
-The gate is the Makefile; CI (`.github/workflows/ci.yml`) runs the same
-set. Do not commit, push, or declare work done until all pass:
+The gate is the Makefile, run locally (there is no CI). `make gate` runs
+the whole set in one command; the individual targets, shown here, are the
+same. Do not commit, push, or declare work done until all pass:
 
 ```
 make lint        # golangci-lint, every linter enabled (.golangci.yml)
@@ -190,9 +191,9 @@ e2e/            e2e suites:
                                  Go client -> Node ws server)
                 interop-node-{client,server}.mjs
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
-Makefile        the repeatable gate: make lint / staticcheck / all / e2e / fuzz
-.github/workflows/ci.yml runs the gate on every push: lint, staticcheck, race tests,
-                    fuzz, statement + branch coverage, MC/DC audit, browser e2e
+Makefile        the repeatable gate: make gate (the full set) plus the
+                    individual lint / staticcheck / test / race / mcdc /
+                    branchcov / coverage / e2e / fuzz targets
 ```
 
 ## Workflow

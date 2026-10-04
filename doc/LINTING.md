@@ -38,5 +38,5 @@ synctest, table-driven literals) make a blanket strict set there noise.
 several golangci-lint's staticcheck linter does not enable; it is a second
 independent opinion on the same code and also passes clean.
 
-Both gates run on every push in CI (`.github/workflows/ci.yml`), alongside
-the race-detector test suite, a 10-second fuzz run, and the browser e2e.
+Both gates are part of the local gate (`make lint staticcheck`), run
+alongside the race-detector test suite, the fuzz target, and the browser e2e.

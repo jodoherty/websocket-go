@@ -42,7 +42,7 @@ hand-written editing.)
    `-race`.
 8. **Allocation budget** (`ws/memory_test.go`) — pins the per-frame
    allocation cost with `testing.AllocsPerRun` so a regression (an escaped
-   buffer, a fresh copy, a stray slice) fails CI instead of quietly raising
+   buffer, a fresh copy, a stray slice) fails the gate instead of quietly raising
    GC pressure on every message. The budget: a `writeFrame` does **zero**
    allocations in steady state (all per-frame buffers are per-connection
    scratch: the header, the random mask key, and the masked copy are

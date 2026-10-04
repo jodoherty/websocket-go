@@ -7,7 +7,7 @@ import (
 )
 
 // These tests pin the per-frame allocation budget so a regression (an
-// escaped buffer, a fresh copy, a new slice somewhere) fails CI instead of
+// escaped buffer, a fresh copy, a new slice somewhere) fails the gate instead of
 // silently raising GC pressure on every message:
 //
 //   - writeFrame: 0 allocations in steady state. All per-frame buffers are

@@ -1,10 +1,14 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all lint staticcheck test race fuzz bench coverage branchcov mcdc e2e demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc e2e demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
 all: lint staticcheck test
+
+# The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
+# command: there is no CI, so this is the check to run before pushing.
+gate: all race fuzz mcdc branchcov coverage e2e
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
