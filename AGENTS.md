@@ -203,7 +203,7 @@ ws/deflate_test.go   permessage-deflate (RFC 7692): extension negotiation
                     RSV1 state machine, compressed round trips (incl. empty
                     and fragmented messages), decompression error branches,
                     and the compressed-path allocation budget
-ws/protocolerror_test.go RFC 6455 §7.1.7 at the Conn level: a frame-level
+ws/protocolerror_test.go RFC 6455 §7.1.7 at the RawConn level: a frame-level
                     protocol violation is answered with a 1002 close frame
                     before the transport is torn down
 ws/utf8_test.go      RFC 6455 §5.6 UTF-8 enforcement on text frames: read

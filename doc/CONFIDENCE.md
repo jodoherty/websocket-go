@@ -5,7 +5,7 @@ The layers of test evidence for the `ws` package, weakest to strongest.
 hand-written editing.)
 
 1. **Unit tests** (`go test ./ws`) — internal consistency: round-trips,
-   close-code semantics, keepalive, origin policy, auth, upgrade validation.
+   close-code semantics, keepalive, origin policy, upgrade validation.
 2. **RFC test vectors** (`ws/vectors_test.go`) — pins the implementation to
    the spec rather than to itself: the §1.3 handshake example and the §5.7
    frame examples (masked/unmasked, fragmented, 256-byte and 64KiB length
@@ -66,13 +66,15 @@ hand-written editing.)
    allocation (the payload), the masked client write is ~190 ns with zero
    allocations, each side of the handshake is ~3 µs, and the accept key is
    ~130 ns.
-10. **Statement coverage** — the library sits at **97.4% statement
-    coverage** when the unit and e2e suites are combined (97.3% on the unit
-    suite alone). The e2e suite (`go test ./e2e -cover -coverpkg=./ws`) adds
-    the TLS client path, the mTLS handshake, and the real-network `Dial`;
-    the two count-mode profiles are merged (per-block max of the hit
-    counts) for the combined number. `make coverage` prints the unit-only
-    figure.
+10. **Statement coverage** — the library sits at **96.4% statement
+    coverage**, the same figure whether the unit suite alone or the unit
+    and e2e suites are combined. The e2e suite (`go test ./e2e -cover
+    -coverpkg=./ws`) exercises the real-network `Dial` and the mTLS
+    handshake; its count-mode profile merges with the unit profile
+    (per-block max of the hit counts), and the combined figure confirms
+    no statement is reachable only from e2e — the unit suite already
+    covers the TLS client and mTLS paths via `httptest`. `make coverage`
+    prints the unit-only figure.
 11. **Branch coverage** — `go test -cover` counts statements, not the
     outcomes of a condition, so branch coverage is measured separately with
     `cmd/branchcov`: it walks the package AST and, for every `if`/`for`/
@@ -80,7 +82,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.2% branch coverage** (401 of 421
+    no-match). The library sits at **93.7% branch coverage** (449 of 479
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -109,10 +111,10 @@ hand-written editing.)
     observable outcome that only that decision flip produces. The tool
     re-checks every trace against the live source — a new or changed
     compound condition, a renamed test, or a pair that no longer flips the
-    decision fails the gate. Current state: **25 compound decisions, 54
+    decision fails the gate. Current state: **30 compound decisions, 66
     required pairs, all traced** (the permessage-deflate RSV state machine
     and the extension-negotiation parsing contribute 8 of the decisions);
-    the other 173 if/for conditions are single-condition (branch-level, no
+    the other 200 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
