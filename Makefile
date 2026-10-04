@@ -8,7 +8,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz mcdc branchcov coverage e2e
+gate: all race fuzz bench mcdc branchcov coverage e2e
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -27,8 +27,11 @@ race:
 	go test -race ./...
 
 # Ten seconds of the frame-codec fuzzer (run longer for deeper exploration).
+# -run '^$' skips the regular suite (make test already runs it, and
+# -fuzz would run it again); the fuzz engine loads the seed corpus from
+# testdata/fuzz regardless, so no exploration time is lost.
 fuzz:
-	go test -fuzz=FuzzReadFrame -fuzztime=10s ./ws/
+	go test -fuzz=FuzzReadFrame -fuzztime=10s -run '^$$' ./ws/
 
 bench:
 	go test -bench=. -benchmem -run XXX ./ws/

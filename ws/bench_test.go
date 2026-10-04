@@ -3,7 +3,11 @@ package ws
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -102,7 +106,14 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 				return
 			}
 		}
+		<-drain(b, server) // consume the close frame the client sends
 	}()
+	// net.Pipe is bidirectional: a frame written on sr is read from cr, and
+	// vice versa, so every write needs a reader on the other end. Without
+	// this one, the teardown close frames sit out the full closeWriteTimeout
+	// (and the harness re-enters this function per b.N ramp phase, so the
+	// stall would repeat on every phase).
+	_ = drain(b, client)
 	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()
 	for range b.N {
@@ -114,6 +125,93 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 	b.StopTimer()
 	// Let the server finish its last read before the teardown close.
 	// (The synchronous pipe already guarantees each write was consumed.)
+}
+
+// BenchmarkHandshake pins the per-connection open cost on both sides: the
+// server validates the request headers and writes the 101, the client builds
+// the opening request and verifies the 101 (accept key, upgrade headers,
+// subprotocol, extensions). A handshake flood multiplies this cost, so a
+// regression here — a stray allocation, an accidental lock, a quadratic
+// header scan — becomes resource amplification.
+func BenchmarkHandshake(b *testing.B) {
+	b.Run("Server", func(b *testing.B) {
+		req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+		req.Header.Set("Sec-WebSocket-Version", websocketVer)
+		req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+		rec := httptest.NewRecorder()
+		accept := acceptKey(req.Header.Get("Sec-WebSocket-Key"))
+
+		b.ResetTimer()
+		for range b.N {
+			sr, cr := net.Pipe()
+			// net.Pipe writes block until the other end has a reader, so
+			// the 101 write needs one.
+			sinkDone := make(chan struct{})
+			go func() {
+				_, _ = io.Copy(io.Discard, cr)
+				close(sinkDone)
+			}()
+			key, rejection := checkHandshakeHeaders(rec, req)
+			if rejection != nil || key == "" {
+				b.Fatalf("server handshake: %v", rejection)
+			}
+			writeErr := writeSwitchingProtocols(sr, "", accept, "")
+			if writeErr != nil {
+				b.Fatalf("write 101: %v", writeErr)
+			}
+			_ = sr.Close()
+			<-sinkDone
+			_ = cr.Close()
+		}
+	})
+	b.Run("Client", func(b *testing.B) {
+		b.ResetTimer()
+		for range b.N {
+			var reqBuf bytes.Buffer
+			key, err := writeHandshakeRequest(&reqBuf, "/ws", "example.com", nil, false, nil)
+			if err != nil {
+				b.Fatalf("write request: %v", err)
+			}
+			var respBuf bytes.Buffer
+			respBuf.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+			respBuf.WriteString("Upgrade: websocket\r\n")
+			respBuf.WriteString("Connection: Upgrade\r\n")
+			respBuf.WriteString("Sec-WebSocket-Accept: " + acceptKey(key) + "\r\n\r\n")
+			_, _, err = readHandshakeResponse(bufio.NewReader(&respBuf), key, nil, false)
+			if err != nil {
+				b.Fatalf("read response: %v", err)
+			}
+		}
+	})
+}
+
+// BenchmarkClose pins the fast close path: with the peer draining, the close
+// frame and the ack are both consumed immediately, so neither side touches
+// the bounded closeWriteTimeout. The bounded path (a stalled transport) is
+// a correctness bound pinned by TestWriteDeadlineUnsticksClose, not a
+// benchmark — measuring it would cost one full closeWriteTimeout per b.N
+// ramp phase.
+func BenchmarkClose(b *testing.B) {
+	b.ResetTimer()
+	for range b.N {
+		sr, cr := net.Pipe()
+		server := newConn(sr, sr, false, 1<<20, 0, 0)
+		client := newConn(cr, cr, true, 1<<20, 0, 0)
+		// Both directions need a reader (net.Pipe is bidirectional), or
+		// the close frame and the ack each sit out closeWriteTimeout.
+		serverDrain := drain(b, server)
+		clientDrain := drain(b, client)
+		b.StartTimer()
+		closeErr := client.Close(StatusNormalClosure, "")
+		b.StopTimer()
+		<-serverDrain
+		<-clientDrain
+		if !errors.Is(closeErr, io.EOF) {
+			b.Fatalf("close: got %v, want io.EOF", closeErr)
+		}
+	}
 }
 
 // BenchmarkAcceptKey measures the handshake accept-key computation. It is

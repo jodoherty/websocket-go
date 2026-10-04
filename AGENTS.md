@@ -79,6 +79,8 @@ make lint        # golangci-lint, every linter enabled (.golangci.yml)
 make staticcheck # staticcheck -checks=all
 make test        # go test ./...
 make race        # go test -race ./...
+make fuzz        # frame-codec fuzzer, 10 s
+make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage

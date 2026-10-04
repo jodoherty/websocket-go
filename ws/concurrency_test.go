@@ -34,8 +34,8 @@ func pipeConnPair() (server, client *Conn) {
 
 // drain reads conn until it terminates, then signals done. Use it on a pipe
 // end the test does not read itself, so close-frame writes have a reader.
-func drain(t *testing.T, conn *Conn) <-chan struct{} {
-	t.Helper()
+func drain(tb testing.TB, conn *Conn) <-chan struct{} {
+	tb.Helper()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -49,11 +49,11 @@ func drain(t *testing.T, conn *Conn) <-chan struct{} {
 			}
 		}
 	}()
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			t.Errorf("drain on conn %d did not terminate", conn.ID())
+			tb.Errorf("drain on conn %d did not terminate", conn.ID())
 		}
 	})
 	return done

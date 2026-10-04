@@ -48,13 +48,22 @@ hand-written editing.)
    scratch: the header, the random mask key, and the masked copy are
    reused), and a `readFrame` does exactly **one** — the payload, which the
    caller owns and so cannot be pooled.
-9. **Benchmarks** (`go test ./ws -run '^$' -bench . -benchmem`) — pin the
-   per-message cost so a regression is visible: codec write/read on both
-   sides of the masking rule, an end-to-end `WriteMessage`→`ReadMessage`
-   round trip over an in-memory pipe, and the handshake accept key. On a
-   Ryzen 7600X a 1 KiB round trip is ~1.4 µs (~710 MB/s) with a single
+9. **Benchmarks** (`make bench`) — pin the per-message and
+   per-connection cost so a regression is visible: codec write/read on
+   both sides of the masking rule, an end-to-end `WriteMessage`→`ReadMessage`
+   round trip over an in-memory pipe, the handshake on both sides
+   (server header validation + 101 write, client request + response
+   verification), the fast close path, and the handshake accept key. The
+   per-connection entries matter because a handshake or close flood
+   multiplies that cost: a slow open/close is resource amplification. The
+   *bounded* slow paths are deliberately not benchmarked — Close against a
+   stalled transport sits out the full `closeWriteTimeout` per b.N ramp
+   phase; those bounds are correctness properties pinned by deadline
+   tests (`TestWriteDeadlineUnsticksClose`, `TestKeepaliveProbeWriteBounded`).
+   On a Ryzen 7600X a 1 KiB round trip is ~1.4 µs (~710 MB/s) with a single
    allocation (the payload), the masked client write is ~190 ns with zero
-   allocations, and the accept key is ~130 ns.
+   allocations, each side of the handshake is ~3 µs, and the accept key is
+   ~130 ns.
 10. **Statement coverage** — the library sits at **97.4% statement
     coverage** when the unit and e2e suites are combined (97.3% on the unit
     suite alone). The e2e suite (`go test ./e2e -cover -coverpkg=./ws`) adds
