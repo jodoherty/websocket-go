@@ -38,12 +38,12 @@ rather than replace it.
 
        for {
            op, data, err := c.ReadMessage()
-           if err != nil {
-               code, reason, _ := ws.CloseCode(err)
-               log.Printf("session ended: code=%d reason=%q err=%v", code, reason, err)
+           if errors.Is(err, io.EOF) {        // normal close (1000)
                break
            }
-           if op == 0 {                      // normal close (1000)
+           if err != nil {                    // abnormal end or close code
+               code, reason, _ := ws.CloseCode(err)
+               log.Printf("session ended: code=%d reason=%q err=%v", code, reason, err)
                break
            }
            _ = c.WriteMessage(op, data)
@@ -58,7 +58,9 @@ rather than replace it.
    frame, transport error, keepalive timeout, local `Close()` — funnels into
    the same `ReadMessage` return:
 
-   - normal closure (1000) → `(0, nil, nil)`
+   - normal closure (1000, either direction) or a statusless close frame →
+     `(0, nil, io.EOF)` — the clean end; check it with
+     `errors.Is(err, io.EOF)`
    - any other close code (including 1001 "going away") → `*ws.CloseError`
      with code and reason
    - resets, timeouts, protocol violations → the error, directly or wrapped
@@ -113,15 +115,17 @@ WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
 // Conn
 Conn.ReadMessage() (op int, data []byte, err error)
+   // a clean end reads as (0, nil, io.EOF); other closes as *CloseError
 Conn.WriteMessage(op int, data []byte) error   // fails on a closed conn: recorded error, or ErrClosed
-Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns recorded error
+Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
 Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
 Conn.Compressed() bool     // whether permessage-deflate was negotiated on this connection
 Conn.SetReadDeadline / SetWriteDeadline
 Conn.Closed() bool         // race-free "am I closed?" for background writers
 
-// Sentinel
+// Sentinels
 var ErrClosed  // returned by WriteMessage after a normal closure (1000)
+io.EOF       // returned by ReadMessage and Close for a clean end
 
 // Client
 func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)

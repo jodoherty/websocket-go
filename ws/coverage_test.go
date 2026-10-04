@@ -15,6 +15,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -209,10 +210,11 @@ func TestPackageHandle(t *testing.T) {
 	if err != nil || op != ws.OpText || string(data) != "from ws.Handle" {
 		t.Fatalf("ReadMessage = (%d, %q, %v)", op, data, err)
 	}
-	// The handler closed normally; the next read reports the clean close.
+	// The handler closed normally; the next read reports the clean close
+	// as io.EOF.
 	op, _, err = c.ReadMessage()
-	if op != 0 || err != nil {
-		t.Fatalf("after close: op=%d err=%v, want (0, nil)", op, err)
+	if op != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("after close: op=%d err=%v, want (0, io.EOF)", op, err)
 	}
 }
 
@@ -251,8 +253,8 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	defer s.Close()
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/ws")
 	op, _, err := c.ReadMessage()
-	if op != 0 || err != nil {
-		t.Fatalf("pre-handshake pass: ReadMessage = (%d, %v), want clean close", op, err)
+	if op != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("pre-handshake pass: ReadMessage = (%d, %v), want (0, io.EOF)", op, err)
 	}
 
 	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(func(*http.Request) error {

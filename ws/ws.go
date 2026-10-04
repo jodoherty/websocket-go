@@ -29,13 +29,12 @@
 //
 //     for {
 //     op, data, err := c.ReadMessage()
+//     if errors.Is(err, io.EOF) {
+//     break // normal close (1000, either direction)
+//     }
 //     if err != nil {
 //     // abnormal end: transport error, protocol violation, or an
 //     // application close code. See CloseCode for details.
-//     break
-//     }
-//     if op == 0 {
-//     // normal close (1000): ReadMessage returns (0, nil, nil)
 //     break
 //     }
 //     // op is OpText or OpBinary
@@ -289,9 +288,9 @@ const (
 
 // CloseError is returned by [Conn.ReadMessage] when the connection is closed
 // with a status code other than a normal closure (1000, or a close frame
-// with no status). A normal closure returns (0, nil, nil) from
-// ReadMessage instead; expected notices such as 1001 "going away" arrive
-// here so the application can react to them.
+// with no status). A normal closure reads as [io.EOF] from ReadMessage
+// instead; expected notices such as 1001 "going away" arrive here so the
+// application can react to them.
 type CloseError struct {
 	Code   int
 	Reason string
@@ -354,6 +353,19 @@ var (
 // connection: a normal closure (1000, or an absent status) yields nil,
 // everything else yields a *CloseError so callers can see the code and
 // reason (e.g. 1001 "going away").
+// terminalErr maps the recorded terminal error to what the connection's
+// surfaces report: a clean end — a normal closure (1000) in either
+// direction, or a close frame without a status — reads as [io.EOF];
+// anything else is the recorded error, so [errors.Is] on [io.EOF] is the
+// one check that distinguishes a clean end from an abnormal one.
+func terminalErr(closeErr error) error {
+	if closeErr == nil {
+		return io.EOF
+	}
+
+	return closeErr
+}
+
 func closeErrFor(code int, reason string) error {
 	switch code {
 	case StatusNormalClosure, StatusNoStatusReceived:
@@ -870,7 +882,7 @@ func (c *Conn) finish(err error) error {
 		c.state.Store(stClosed)
 		c.closeErr = err
 	}
-	err = c.closeErr
+	err = terminalErr(c.closeErr)
 	c.mu.Unlock()
 	_ = c.nc.Close()
 
@@ -883,12 +895,13 @@ func (c *Conn) finish(err error) error {
 // ReadMessage reads the next complete message from the connection.
 //
 // It returns (op, data, nil) for a complete text or binary message, where op
-// is OpText or OpBinary. It returns (0, nil, nil) when the connection has
-// been closed with a normal closure (code 1000, in either direction).
-// Any other close — including expected ones like 1001 "going away" — is
-// reported as a [*CloseError] carrying the code and reason, so the
-// distinction between a clean end and a notification is visible to the
-// application.
+// is OpText or OpBinary. It returns (0, nil, [io.EOF]) when the connection
+// has ended cleanly — a normal closure (code 1000) in either direction, or
+// a close frame without a status — so [errors.Is] on [io.EOF] is the check
+// for a clean end. Any other close — including expected ones like 1001
+// "going away" — is reported as a [*CloseError] carrying the code and
+// reason, so the distinction between a clean end and a notification is
+// visible to the application.
 //
 // Pings and pongs are handled transparently: incoming pings are answered
 // automatically and pongs are consumed, so neither appears in the return
@@ -905,7 +918,7 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 		closeErr := c.closeErr
 		c.mu.Unlock()
 
-		return 0, nil, closeErr
+		return 0, nil, terminalErr(closeErr)
 	}
 	for {
 		armErr := c.armIdle()
@@ -1285,12 +1298,13 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 //
 // Close codes must be in the range 1000-4999. Codes that cannot appear as a
 // status on the wire — 1005, 1006, 1015 (MUST NOT, RFC 6455 §7.4) plus the
-// reserved 1004 — go out with an empty payload. The return value is the terminal error recorded on the
-// connection — nil for a normal closure (1000), a [*CloseError] otherwise —
-// not the status of the close-frame write, which is best effort: the kernel
-// delivers queued data before the FIN, so the frame reaches the peer in
-// order when the transport allows. Concurrent Close callers all observe the
-// same recorded error, from the first one to close.
+// reserved 1004 — go out with an empty payload. The return value is the
+// terminal error recorded on the connection — [io.EOF] for a normal
+// closure (1000), a [*CloseError] otherwise — not the status of the
+// close-frame write, which is best effort: the kernel delivers queued data
+// before the FIN, so the frame reaches the peer in order when the transport
+// allows. Concurrent Close callers all observe the same recorded error, from
+// the first one to close.
 func (c *Conn) Close(code int, reason string) error {
 	if code < closeCodeMin || code > closeCodeMax {
 		return fmt.Errorf("%w: %d", errBadCloseCode, code)
@@ -1308,7 +1322,7 @@ func (c *Conn) Close(code int, reason string) error {
 		err := c.closeErr
 		c.mu.Unlock()
 
-		return err
+		return terminalErr(err)
 	}
 	c.state.Store(stClosed)
 	c.closeErr = closeErrFor(code, reason)
@@ -1322,7 +1336,7 @@ func (c *Conn) Close(code int, reason string) error {
 	c.mu.Unlock()
 	_ = c.nc.Close()
 
-	return c.closeErr
+	return terminalErr(c.closeErr)
 }
 
 // Closed reports whether the connection has been closed, from any goroutine.

@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -52,10 +53,11 @@ func Example() {
 		for {
 			op, data, err := c.ReadMessage()
 			if err != nil {
+				if errors.Is(err, io.EOF) { // normal close (1000)
+					return nil
+				}
+
 				return err
-			}
-			if op == 0 { // normal close (1000)
-				return nil
 			}
 			fmt.Println("server:", string(data))
 			err = c.WriteMessage(op, data)
@@ -112,7 +114,7 @@ func ExampleUpgrader() {
 		defer c.Close(StatusNormalClosure, "")
 
 		op, data, err := c.ReadMessage()
-		if err != nil || op == 0 {
+		if err != nil {
 			return
 		}
 		fmt.Println(c.Subprotocol(), c.HandshakeData(), "says", string(data))
@@ -158,8 +160,8 @@ func ExampleDial() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
-		op, data, err := c.ReadMessage()
-		if err != nil || op == 0 {
+		_, data, err := c.ReadMessage()
+		if err != nil {
 			return err
 		}
 		fmt.Println("server:", string(data))
@@ -179,7 +181,7 @@ func ExampleDial() {
 		panic(err)
 	}
 	op, _, err := c.ReadMessage()
-	if err != nil {
+	if !errors.Is(err, io.EOF) {
 		panic(err)
 	}
 	if op != 0 {

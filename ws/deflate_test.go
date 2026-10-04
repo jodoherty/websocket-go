@@ -11,6 +11,7 @@ import (
 	"compress/flate"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -66,10 +67,11 @@ func echo(c *Conn) error {
 	for {
 		op, data, err := c.ReadMessage()
 		if err != nil {
+			if errors.Is(err, io.EOF) { // clean close
+				return nil
+			}
+
 			return err
-		}
-		if op == 0 { // clean close
-			return nil
 		}
 		writeErr := c.WriteMessage(op, data)
 		if writeErr != nil {

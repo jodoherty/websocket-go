@@ -8,8 +8,10 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -243,15 +245,16 @@ func validToken(request *http.Request, token string) bool {
 }
 
 // echo runs the read loop: every message is written back until the
-// connection closes (a 1000 close yields a nil error).
+// connection closes (a 1000 close reads as io.EOF).
 func echo(conn *ws.Conn) error {
 	for {
 		opcode, data, err := conn.ReadMessage()
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+
 			return fmt.Errorf("demo: read: %w", err)
-		}
-		if opcode == 0 {
-			return nil
 		}
 		writeErr := conn.WriteMessage(opcode, data)
 		if writeErr != nil {

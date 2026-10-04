@@ -3,6 +3,7 @@ package ws_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,10 +20,11 @@ func echo(c *ws.Conn) error {
 	for {
 		op, data, err := c.ReadMessage()
 		if err != nil {
+			if errors.Is(err, io.EOF) { // clean close
+				return nil
+			}
+
 			return err
-		}
-		if op == 0 { // clean close
-			return nil
 		}
 		err = c.WriteMessage(op, data)
 		if err != nil {
@@ -173,15 +175,15 @@ func TestServerInitiatedClose(t *testing.T) {
 	}
 }
 
-func TestCleanCloseIsNil(t *testing.T) {
+func TestCleanCloseIsEOF(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo")
 	_ = c.Close(ws.StatusNormalClosure, "done")
 	_, _, err := c.ReadMessage()
-	if err != nil {
-		t.Fatalf("clean close should yield nil error, got %v", err)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("clean close should yield io.EOF, got %v", err)
 	}
 }
 

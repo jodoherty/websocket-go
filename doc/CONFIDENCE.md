@@ -69,7 +69,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.1% branch coverage** (372 of 391
+    no-match). The library sits at **94.9% branch coverage** (373 of 393
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and

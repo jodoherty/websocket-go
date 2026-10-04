@@ -40,12 +40,11 @@ func drain(t *testing.T, conn *Conn) <-chan struct{} {
 	go func() {
 		defer close(done)
 		for {
-			op, _, err := conn.ReadMessage()
-			// The documented termination signals are an error (abnormal end)
-			// or (0, nil, nil) — a normal closure, which ReadMessage reports
-			// with a nil error by contract. Checking only err would spin
-			// forever on a 1000 close.
-			if err != nil || op == 0 {
+			_, _, err := conn.ReadMessage()
+			// The documented termination signals are an error — [io.EOF] for a
+			// normal closure, anything else an abnormal end — so checking err
+			// alone is sufficient and the loop cannot spin on a 1000 close.
+			if err != nil {
 				return
 			}
 		}

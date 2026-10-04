@@ -12,7 +12,9 @@ import (
 	"crypto/sha1" //nolint:gosec // RFC 6455 mandates SHA-1 in the handshake
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -101,8 +103,8 @@ func TestMCDCCloseCode(t *testing.T) {
 			t.Fatalf("999: reply %d, want 1002", reply)
 		}
 		errStr, reply = runPeerClose(t, []byte{0x03, 0xe8}) // 1000
-		if errStr != "nil" {
-			t.Fatalf("1000: %q, want clean close", errStr)
+		if errStr != "EOF" {
+			t.Fatalf("1000: %q, want clean close (io.EOF)", errStr)
 		}
 		if reply != StatusNormalClosure {
 			t.Fatalf("1000: reply %d, want 1000", reply)
@@ -160,10 +162,11 @@ func TestMCDCCloseCode(t *testing.T) {
 
 	t.Run("noStatus", func(t *testing.T) {
 		t.Parallel()
-		// An empty payload closes normally; the reply carries no status.
+		// An empty payload closes normally (io.EOF); the reply carries no
+		// status.
 		errStr, reply := runPeerClose(t, nil)
-		if errStr != "nil" {
-			t.Fatalf("no status: %q, want clean close", errStr)
+		if errStr != "EOF" {
+			t.Fatalf("no status: %q, want clean close (io.EOF)", errStr)
 		}
 		if reply != -1 {
 			t.Fatalf("no status: reply code %d, want empty payload", reply)
@@ -580,10 +583,11 @@ func echoServer(t *testing.T) *httptest.Server {
 		for {
 			op, data, err := c.ReadMessage()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+
 				return err
-			}
-			if op == 0 {
-				return nil
 			}
 			err = c.WriteMessage(op, data)
 			if err != nil {
