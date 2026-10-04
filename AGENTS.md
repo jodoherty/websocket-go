@@ -27,8 +27,9 @@ Rules that preserve it:
 
 - All implementation code lives in `ws/ws.go`. Do not create new
   non-test `.go` files in `ws/`. New behavior goes into the existing
-  section structure (10 numbered sections, top to bottom in dependency
-  order; keep the section map in the package doc current).
+  section structure (numbered sections in reading order — the high-level
+  API first, the internals after; Go does not require declaration order,
+  and the section map in the package doc is the index; keep it current).
 - Never add an import that is not in the Go standard library.
 - Never add a dependency in `go.mod` beyond the module itself.
 - `cmd/*` and `e2e/` are tooling and integration tests; they may import
@@ -150,7 +151,8 @@ disables and their why-each, is in `doc/LINTING.md`.
 ```
 ws/ws.go            the entire library in one file — copy it into an
                     existing project (package ws, stdlib only). Organized
-                    in 10 numbered sections, dependency-ordered, with a
+                    in numbered sections, reading-ordered (high-level API
+                    first, internals after), with a file map in the
                     file map in the package doc.
 ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation

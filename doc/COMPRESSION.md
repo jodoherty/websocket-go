@@ -92,7 +92,7 @@ internally; tests reach them via the internal `package ws` tests.
 ## Code layout in `ws/ws.go`
 
 The file stays the single implementation file; new code lands in the
-existing section structure, dependency-ordered, and the package doc's
+existing section structure, and the package doc's
 section map is updated:
 
 1. **Handshake section** — extension negotiation:
