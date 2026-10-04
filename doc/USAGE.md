@@ -282,7 +282,13 @@ offer the server cannot echo is refused, the dial fails if the server
 selects a token the client never offered, or several at once, and a
 server-advertised token that is not a valid token fails its handshake with
 400), close-code semantics per RFC
-6455, and CR/LF rejection in client request headers and subprotocols.
+6455, and CR/LF rejection in client request headers and subprotocols. The
+single-value handshake headers are single-valued on both sides:
+several `Sec-WebSocket-Version` or `Sec-WebSocket-Key` lines fail the
+handshake with 400 (server) / fail the dial (client, for a duplicated
+`Sec-WebSocket-Accept` on the 101), every `Sec-WebSocket-Protocol` line
+shares one token space on both sides, and a `Close` reason that is not
+valid UTF-8 is dropped rather than put on the wire (RFC 6455 §5.5).
 
 ## Security
 
@@ -318,9 +324,12 @@ below are where they live.
   (`WithWriteTimeout`, default 30 s) or hold the close open.
 - **Close-code hygiene.** Invalid or must-not-set codes received fail the
   connection with 1002 and are never echoed; our own forbidden codes go
-  out with an empty payload.
+  out with an empty payload; a non-UTF-8 close reason is dropped (the
+  frame carries the code alone), so only UTF-8 ever goes on the wire.
 - **Request hygiene.** Handshake bodies rejected, pipelined bytes rejected,
-  and client request headers/subprotocols with CR/LF rejected.
+  client request headers/subprotocols with CR/LF rejected, and
+  duplicate single-value handshake headers (Version, Key, Accept) rejected
+  on both sides.
 
 **The application owns** (each item below is a cheat-sheet requirement the
 library deliberately leaves to you, with the seam where it goes):

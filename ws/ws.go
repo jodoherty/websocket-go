@@ -1440,7 +1440,9 @@ func (c *Conn) WriteJSON(v any) error {
 //
 // Close codes must be in the range 1000-4999. Codes that cannot appear as a
 // status on the wire — 1005, 1006, 1015 (MUST NOT, RFC 6455 §7.4) plus the
-// reserved 1004 — go out with an empty payload. The return value is the
+// reserved 1004 — go out with an empty payload. A reason that is not valid
+// UTF-8 is dropped (the frame carries the code alone), because RFC 6455
+// §5.5 says the reason is the UTF-8 of a text message. The return value is the
 // terminal error recorded on the connection — [io.EOF] for a normal
 // closure (1000), a [*CloseError] otherwise — not the status of the
 // close-frame write, which is best effort: the kernel delivers queued data
@@ -1464,6 +1466,12 @@ func (c *Conn) Close(code int, reason string) error {
 	}
 	var payload []byte
 	if !mustNotSetCloseCode(code) {
+		// RFC 6455 §5.5: the reason is the UTF-8 of a text message, so a
+		// non-UTF-8 reason is dropped — the close frame carries the code
+		// alone — rather than putting invalid bytes on the wire.
+		if !utf8.ValidString(reason) {
+			reason = ""
+		}
 		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
 		reason = truncateReason(reason)
 		payload = make([]byte, closeCodeBytes+len(reason))
@@ -1867,9 +1875,12 @@ func rejectOnConn(raw net.Conn, status int, msg string) *UpgradeError {
 
 // checkHandshakeHeaders validates the websocket protocol headers on the
 // request and returns its Sec-WebSocket-Key (RFC 6455 §4.1-§4.2): the
-// Connection and Upgrade tokens, a supported Sec-WebSocket-Version, and a
-// well-formed Sec-WebSocket-Key — the base64 of exactly 16 octets. Each
-// rejection writes the HTTP error response itself; the version-mismatch
+// Connection and Upgrade tokens, exactly one supported
+// Sec-WebSocket-Version, and exactly one well-formed Sec-WebSocket-Key —
+// the base64 of exactly 16 octets. Several header lines for the
+// single-value headers are a malformed handshake: the value would be
+// ambiguous, so they are rejected rather than resolved to the first line.
+// Each rejection writes the HTTP error response itself; the version-mismatch
 // response additionally names the version(s) the server understands, per
 // §4.2.
 func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
@@ -1879,24 +1890,34 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 	if !headerContainsToken(request.Header, "Upgrade", "websocket") {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Upgrade: websocket header")
 	}
-	if request.Header.Get("Sec-WebSocket-Version") != websocketVer {
+	versions := request.Header.Values("Sec-WebSocket-Version")
+	if len(versions) == 0 {
+		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Version header")
+	}
+	if len(versions) > 1 {
+		return "", rejectStatus(writer, http.StatusBadRequest, "multiple Sec-WebSocket-Version headers")
+	}
+	if versions[0] != websocketVer {
 		// RFC 6455 §4.2: the version-mismatch response names the
 		// version(s) the server understands.
 		writer.Header().Add("Sec-WebSocket-Version", websocketVer)
 
 		return "", rejectStatus(writer, http.StatusUpgradeRequired, "unsupported websocket version")
 	}
-	key := request.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
+	keys := request.Header.Values("Sec-WebSocket-Key")
+	if len(keys) == 0 {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Key header")
 	}
+	if len(keys) > 1 {
+		return "", rejectStatus(writer, http.StatusBadRequest, "multiple Sec-WebSocket-Key headers")
+	}
 	// RFC 6455 §4.1: the key must be well-formed — the base64 of 16 octets.
-	raw, decodeErr := base64.StdEncoding.DecodeString(key)
+	raw, decodeErr := base64.StdEncoding.DecodeString(keys[0])
 	if decodeErr != nil || len(raw) != wsKeyBytes {
 		return "", rejectStatus(writer, http.StatusBadRequest, "malformed Sec-WebSocket-Key header")
 	}
 
-	return key, nil
+	return keys[0], nil
 }
 
 // checkPolicy runs the upgrader's authentication and policy gates in order
@@ -2007,7 +2028,10 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 		return nil, rejectOnConn(raw, http.StatusBadRequest, "unconsumed request data")
 	}
 
-	protocol, protoErr := negotiateProtocol(u.subprotocols, request.Header.Get("Sec-WebSocket-Protocol"))
+	// §1.9: every Sec-WebSocket-Protocol line shares one 1#token value
+	// space, so all lines participate in the selection.
+	protocol, protoErr := negotiateProtocol(u.subprotocols,
+		strings.Join(request.Header.Values("Sec-WebSocket-Protocol"), ", "))
 	if protoErr != nil {
 		return nil, rejectOnConn(raw, http.StatusBadRequest, protoErr.Error())
 	}
@@ -2598,11 +2622,20 @@ func readHandshakeResponse(reader *bufio.Reader, key string, offered []string,
 		!headerContainsToken(resp.Header, "Connection", "Upgrade") {
 		return "", false, fmt.Errorf("%w: 101 response missing the upgrade headers", errHandshakeFailed)
 	}
-	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		return "", false, fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, got)
+	// The 101 carries exactly one accept value: a second line would leave
+	// the accept key ambiguous (§4.1).
+	accepts := resp.Header.Values("Sec-WebSocket-Accept")
+	if len(accepts) != 1 {
+		return "", false, fmt.Errorf("%w: 101 response carried %d Sec-WebSocket-Accept values",
+			errHandshakeFailed, len(accepts))
+	}
+	if accepts[0] != acceptKey(key) {
+		return "", false, fmt.Errorf("%w: invalid Sec-WebSocket-Accept %q", errHandshakeFailed, accepts[0])
 	}
 
-	subprotocol := resp.Header.Get("Sec-WebSocket-Protocol")
+	// As on the server, every protocol line shares one 1#token value
+	// space, so all lines count against the §1.9 echo check.
+	subprotocol := strings.Join(resp.Header.Values("Sec-WebSocket-Protocol"), ", ")
 	echoErr := checkSubprotocolEcho(offered, subprotocol)
 	if echoErr != nil {
 		return "", false, echoErr

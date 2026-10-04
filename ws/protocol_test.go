@@ -368,6 +368,197 @@ func TestSubprotocolEcho(t *testing.T) {
 	})
 }
 
+// TestHandshakeDuplicateSingleValueHeaders pins the RFC 6455 §4.1 rule
+// that Sec-WebSocket-Version and Sec-WebSocket-Key appear exactly once:
+// several header lines are a malformed handshake (400), and every
+// Sec-WebSocket-Protocol line participates in the §1.9 selection.
+func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
+	t.Parallel()
+
+	// rawStatus performs a raw handshake; extra is an additional header
+	// line (including its CRLF) or "" for none, and the call reports the
+	// HTTP status of the reply.
+	rawStatus := func(t *testing.T, extra string) int {
+		t.Helper()
+		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error { return nil }))
+		t.Cleanup(srv.Close)
+		host := srv.URL[len("http://"):]
+		conn, err := net.Dial("tcp", host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		req := "GET / HTTP/1.1\r\nHost: " + host + "\r\n" +
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+			"Sec-WebSocket-Version: 13\r\n" +
+			extra + "\r\n"
+		_, _ = conn.Write([]byte(req))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read handshake response: %v", err)
+		}
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+
+		return resp.StatusCode
+	}
+
+	t.Run("duplicateVersion", func(t *testing.T) {
+		t.Parallel()
+		// A second Sec-WebSocket-Version line is a malformed handshake;
+		// with one line the handshake still succeeds.
+		if got := rawStatus(t, "Sec-WebSocket-Version: 13\r\n"); got != http.StatusBadRequest {
+			t.Fatalf("duplicate version: status %d, want 400", got)
+		}
+		if got := rawStatus(t, ""); got != http.StatusSwitchingProtocols {
+			t.Fatalf("single version: status %d, want 101", got)
+		}
+	})
+
+	t.Run("duplicateKey", func(t *testing.T) {
+		t.Parallel()
+		// A second Sec-WebSocket-Key line is a malformed handshake.
+		if got := rawStatus(t, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"); got != http.StatusBadRequest {
+			t.Fatalf("duplicate key: status %d, want 400", got)
+		}
+		if got := rawStatus(t, ""); got != http.StatusSwitchingProtocols {
+			t.Fatalf("single key: status %d, want 101", got)
+		}
+	})
+
+	t.Run("protocolLinesShared", func(t *testing.T) {
+		t.Parallel()
+		// Two Sec-WebSocket-Protocol lines share one 1#token value space
+		// (§1.9): the token on the second line is selectable too.
+		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin), WithSubprotocols("superchat"))
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Conn) error { return nil }))
+		t.Cleanup(srv.Close)
+		host := srv.URL[len("http://"):]
+		conn, err := net.Dial("tcp", host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\n"+
+			"Upgrade: websocket\r\nConnection: Upgrade\r\n"+
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
+			"Sec-WebSocket-Version: 13\r\n"+
+			"Sec-WebSocket-Protocol: chat\r\n"+
+			"Sec-WebSocket-Protocol: superchat\r\n\r\n", host)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read handshake response: %v", err)
+		}
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("status %d, want 101", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "superchat" {
+			t.Fatalf("Sec-WebSocket-Protocol = %q, want superchat (second line selectable)", got)
+		}
+	})
+}
+
+// TestClientDuplicate101Headers pins the client-side twin of the
+// single-value rule: a 101 with two Sec-WebSocket-Accept lines fails the
+// dial (the accept key is ambiguous), and every Sec-WebSocket-Protocol
+// line counts against the §1.9 echo check.
+func TestClientDuplicate101Headers(t *testing.T) {
+	t.Parallel()
+
+	t.Run("duplicateAccept", func(t *testing.T) {
+		t.Parallel()
+		// dialAgainst101 appends its own correct accept after the extra
+		// headers: a wrong first accept line makes two values → fail.
+		err := dialAgainst101(t, []string{"Upgrade: websocket", "Connection: Upgrade",
+			"Sec-WebSocket-Accept: C2FsdCB0YW50aQ=="})
+		if err == nil || !strings.Contains(err.Error(), "Sec-WebSocket-Accept values") {
+			t.Fatalf("duplicate accept: %v, want duplicate-accept rejection", err)
+		}
+	})
+
+	t.Run("protocolLines", func(t *testing.T) {
+		t.Parallel()
+		// dupProto dials a listener that answers with the two given
+		// Sec-WebSocket-Protocol lines and reports the Dial outcome.
+		dupProto := func(t *testing.T, line1, line2 string) error {
+			t.Helper()
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			go func() {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				req, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					return
+				}
+				sum := sha1.Sum([]byte(req.Header.Get("Sec-WebSocket-Key") + wsGUID)) //nolint:gosec // RFC 6455 mandates SHA-1
+				accept := base64.StdEncoding.EncodeToString(sum[:])
+				var b strings.Builder
+				b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+				b.WriteString("Upgrade: websocket\r\nConnection: Upgrade\r\n")
+				fmt.Fprintf(&b, "Sec-WebSocket-Protocol: %s\r\n", line1)
+				fmt.Fprintf(&b, "Sec-WebSocket-Protocol: %s\r\n", line2)
+				fmt.Fprintf(&b, "Sec-WebSocket-Accept: %s\r\n\r\n", accept)
+				_, _ = conn.Write([]byte(b.String()))
+				time.Sleep(time.Second) // hold the connection while the client verifies
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c, dialErr := Dial(ctx, "ws://"+l.Addr().String(), WithSubprotocols("chat.v1"))
+			if dialErr != nil {
+				return dialErr
+			}
+			_ = c.Close(StatusNormalClosure, "")
+
+			return nil
+		}
+		// Two lines selecting two tokens — even offered ones — is several
+		// selections at once: the dial fails.
+		err := dupProto(t, "chat.v1", "chat.v1")
+		if err == nil || !strings.Contains(err.Error(), "multiple subprotocols") {
+			t.Fatalf("duplicate protocol lines: %v, want multiple subprotocols rejection", err)
+		}
+	})
+}
+
+// TestCloseReasonDropsInvalidUTF8 pins RFC 6455 §5.5 at the local close:
+// a non-UTF-8 reason never reaches the wire — the close frame carries the
+// code alone — while a valid reason goes out in full.
+func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	fc := &fakeConn{}
+	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	_ = c.Close(StatusGoingAway, "bad\xffreason")
+	reply, ok := closeReply(fc)
+	if !ok {
+		t.Fatal("no close frame written")
+	}
+	if len(reply) != closeCodeBytes {
+		t.Fatalf("close payload % x, want the 2-byte code only (non-UTF-8 reason dropped)", reply)
+	}
+	if replyCode(reply) != StatusGoingAway {
+		t.Fatalf("reply code %d, want 1001", replyCode(reply))
+	}
+	fc = &fakeConn{}
+	c = newConn(fc, fc, false, 1<<20, 0, 0)
+	_ = c.Close(StatusGoingAway, "bye")
+	if reply, ok := closeReply(fc); !ok || !bytes.Equal(reply[closeCodeBytes:], []byte("bye")) {
+		t.Fatalf("valid reason: payload %q, want code + \"bye\"", reply)
+	}
+}
+
 // TestRequestWithBodyRejected: RFC 6455 §4.1 — a GET with a body must be
 // rejected before the protocol switch.
 func TestRequestWithBodyRejected(t *testing.T) {
@@ -406,48 +597,6 @@ func TestRequestWithBodyRejected(t *testing.T) {
 // "Upgrade").
 func TestMCDCUpgrade101(t *testing.T) {
 	t.Parallel()
-
-	// dialAgainst101 listens once, answers any handshake with a 101 that
-	// carries exactly the given extra headers (plus the correct
-	// Sec-WebSocket-Accept), and reports the Dial outcome.
-	dialAgainst101 := func(t *testing.T, headers []string) error {
-		t.Helper()
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer l.Close()
-		go func() {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			req, err := http.ReadRequest(bufio.NewReader(conn))
-			if err != nil {
-				return
-			}
-			sum := sha1.Sum([]byte(req.Header.Get("Sec-WebSocket-Key") + wsGUID)) //nolint:gosec // RFC 6455 mandates SHA-1
-			accept := base64.StdEncoding.EncodeToString(sum[:])
-			var b strings.Builder
-			b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
-			for _, h := range headers {
-				b.WriteString(h + "\r\n")
-			}
-			fmt.Fprintf(&b, "Sec-WebSocket-Accept: %s\r\n\r\n", accept)
-			_, _ = conn.Write([]byte(b.String()))
-			time.Sleep(time.Second) // hold the connection while the client verifies
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		c, dialErr := Dial(ctx, "ws://"+l.Addr().String())
-		if dialErr != nil {
-			return dialErr
-		}
-		_ = c.Close(StatusNormalClosure, "")
-
-		return nil
-	}
 
 	t.Run("upgrade", func(t *testing.T) {
 		t.Parallel()
@@ -554,6 +703,48 @@ func TestSubprotocolSeparators(t *testing.T) {
 			t.Fatalf("%q rejected, want accepted", s)
 		}
 	}
+}
+
+// dialAgainst101 listens once, answers any handshake with a 101 that
+// carries exactly the given extra headers (plus the correct
+// Sec-WebSocket-Accept), and reports the Dial outcome.
+func dialAgainst101(t *testing.T, headers []string) error {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		sum := sha1.Sum([]byte(req.Header.Get("Sec-WebSocket-Key") + wsGUID)) //nolint:gosec // RFC 6455 mandates SHA-1
+		accept := base64.StdEncoding.EncodeToString(sum[:])
+		var b strings.Builder
+		b.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+		for _, h := range headers {
+			b.WriteString(h + "\r\n")
+		}
+		fmt.Fprintf(&b, "Sec-WebSocket-Accept: %s\r\n\r\n", accept)
+		_, _ = conn.Write([]byte(b.String()))
+		time.Sleep(time.Second) // hold the connection while the client verifies
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, dialErr := Dial(ctx, "ws://"+l.Addr().String())
+	if dialErr != nil {
+		return dialErr
+	}
+	_ = c.Close(StatusNormalClosure, "")
+
+	return nil
 }
 
 // TestClientRejectsLineBreakHeader: a header value containing CR or LF
