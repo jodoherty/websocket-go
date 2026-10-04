@@ -84,10 +84,11 @@ make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
+make e2e         # Go mTLS + Node `ws` interop both directions + Playwright
 ```
 
-For protocol or browser-facing changes also run `make e2e` (Go mTLS +
-Node `ws` interop both directions + Playwright).
+`e2e` is already in the gate, but run it early and often on protocol or
+browser-facing changes: it is the slowest target.
 
 ## MC/DC rule (know this before writing any boolean condition)
 
@@ -144,7 +145,11 @@ ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
                     plus the stalled-write bounded-write regression
-ws/longrunning_test.go write-deadline wedge regression + Closed() signal
+ws/dial_test.go       Dial URL→target resolution: default ports, explicit
+                    ports, bracketed IPv6 literals
+ws/longrunning_test.go write-deadline wedge regression + Closed() signal,
+                    transport-write failure failing the connection, Close's
+                    write-deadline bound
 ws/concurrency_test.go close state machine under concurrent stress (-race)
 ws/bench_test.go    codec + round-trip benchmarks
 ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
@@ -169,6 +174,13 @@ ws/deflate_test.go   permessage-deflate (RFC 7692): extension negotiation
                     RSV1 state machine, compressed round trips (incl. empty
                     and fragmented messages), decompression error branches,
                     and the compressed-path allocation budget
+ws/protocolerror_test.go RFC 6455 §7.1.7 at the Conn level: a frame-level
+                    protocol violation is answered with a 1002 close frame
+                    before the transport is torn down
+ws/utf8_test.go      RFC 6455 §5.6 UTF-8 enforcement on text frames: read
+                    and write paths, fragmented messages, the MC/DC pair
+ws/writehelpers_test.go WriteText/WriteBinary/WriteJSON wire format and
+                    WriteJSON marshal failure
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
@@ -194,8 +206,8 @@ e2e/            e2e suites:
                 interop-node-{client,server}.mjs
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make gate (the full set) plus the
-                    individual lint / staticcheck / test / race / mcdc /
-                    branchcov / coverage / e2e / fuzz targets
+                    individual lint / staticcheck / test / race / fuzz /
+                    bench / mcdc / branchcov / coverage / e2e targets
 ```
 
 ## Workflow
@@ -208,7 +220,6 @@ Makefile        the repeatable gate: make gate (the full set) plus the
    public API).
 3. If the change touches a compound decision: update the MC/DC registry
    and add the proving subtest.
-4. Run the full gate (all `make` targets above, plus `make e2e` for
-   protocol changes).
+4. Run `make gate` — all targets, including e2e.
 5. Commit with an imperative subject describing the behavior, not the
    files.
