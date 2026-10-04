@@ -43,9 +43,11 @@ reference-only (see the table in `doc/USAGE.md`).
    32 KiB window, so honoring `client_max_window_bits=N` for N < 15 would
    require a non-stdlib compressor. If a client requests an explicit
    value < 15, we simply do not answer the extension (the connection
-   works uncompressed — exactly what the RFC allows). Browsers send the
-   parameter with no value (max window = default 15), so this path is
-   theoretical in browser traffic; it is still implemented and tested.
+   works uncompressed — exactly what the RFC allows). Measured browser
+   traffic never uses an explicit value: Chromium sends the parameter
+   without a value (max window = default 15) and Firefox sends no
+   parameters at all, so this path is theoretical in browser traffic; it
+   is still implemented and tested.
 
 5. **Size guards on the expanded payload.** `WithMaxMessageSize` (default
    16 MiB) bounds the **decompressed** payload; the compressed frame must
@@ -211,10 +213,15 @@ directions; all run in the e2e gate (`make e2e`):
   the Go client offers the extension and the Node server accepts it; the test
   asserts `Conn.Compressed()` and round-trips 512 KiB through Node's
   decompressor.
-- **Real browsers** (Playwright, Chromium + Firefox): every major browser
-  offers `permessage-deflate` by default, so the echo tests (including a
-  1 MiB binary round-trip) exercise the negotiated read and write paths
-  without any extra option.
+- **Real browsers** (Playwright, Chromium + Firefox): both engines offer
+  `permessage-deflate` by default — measured handshakes show Chromium
+  sending `permessage-deflate; client_max_window_bits` and Firefox the bare
+  token — and the suite *asserts* the negotiation rather than assuming it:
+  `/ws/info` reports the server's view (`Conn.Compressed()`), because the
+  browser `WebSocket` API exposes no negotiated-extensions property. If a
+  browser ever stops offering the extension, the assertion fails instead
+  of this evidence line going stale. The echo tests (including a 1 MiB
+  binary round-trip) exercise the negotiated read and write paths.
 
 Implementation details the interop forced (all in `ws/ws.go`):
 

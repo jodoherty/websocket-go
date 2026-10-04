@@ -108,9 +108,24 @@ func buildMux() http.Handler {
 
 	// Plain upgrader sugar: the handler itself is the session.
 	mux.Handle("/ws/echo", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
-		log.Printf("echo session %d from %s (subprotocol %q)", conn.ID(), conn.RemoteAddr(), conn.Subprotocol())
+		log.Printf("echo session %d from %s (subprotocol %q, compressed=%v)",
+			conn.ID(), conn.RemoteAddr(), conn.Subprotocol(), conn.Compressed())
 
 		return echo(conn)
+	}))
+
+	// Connection report: the browser WebSocket API exposes no negotiated
+	// extensions, so the Playwright permessage-deflate assertion reads the
+	// server-side view here.
+	mux.Handle("/ws/info", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+		info := fmt.Sprintf(`{"compressed":%v,"subprotocol":%q}`,
+			conn.Compressed(), conn.Subprotocol())
+		writeErr := conn.WriteMessage(ws.OpText, []byte(info))
+		if writeErr != nil {
+			return fmt.Errorf("demo: write connection report: %w", writeErr)
+		}
+
+		return nil
 	}))
 
 	// Self-upgrading handler: ordinary HTTP auth first, then the upgrade.

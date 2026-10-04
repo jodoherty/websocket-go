@@ -167,6 +167,36 @@ test("mtls: websocket without client certificate is refused before the upgrade",
   expect(opened).toBe(false);
 });
 
+/**
+ * permessage-deflate is negotiated by browsers with no client-side option
+ * (Chromium offers "permessage-deflate; client_max_window_bits", Firefox the
+ * bare token). The browser WebSocket API exposes no negotiated-extensions
+ * property, so the assertion reads the server's own view via /ws/info —
+ * if a browser stops offering the extension, this test fails instead of the
+ * doc/COMPRESSION.md interop-evidence claim going stale silently.
+ */
+test("compression: browser negotiated permessage-deflate (server-side report)", async ({ page }) => {
+  await sameOriginPage(page);
+  const report = await page.evaluate(
+    async ({ base }) =>
+      await new Promise<string>((resolve, reject) => {
+        const ws = new WebSocket(base + "/ws/info");
+        const timer = setTimeout(() => reject(new Error("timed out waiting for the connection report")), 5_000);
+        ws.onmessage = (e) => {
+          clearTimeout(timer);
+          ws.close();
+          resolve(String(e.data));
+        };
+        ws.onerror = () => {
+          clearTimeout(timer);
+          reject(new Error("websocket failed to open /ws/info"));
+        };
+      }),
+    { base: BASE }
+  );
+  expect(JSON.parse(report).compressed).toBe(true);
+});
+
 test("goodbye: server sends a message then closes with 1001 going away", async ({ page }) => {
   await sameOriginPage(page);
   const result = await page.evaluate(
