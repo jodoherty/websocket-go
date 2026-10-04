@@ -71,6 +71,34 @@
 //     visibility concerns: handler-local state modified in one iteration is
 //     plainly visible in the next.
 //
+// # Real-world interop
+//
+// A few wire details are fixed by observation of real peers (browsers, Node
+// ws) rather than by the RFCs alone; each fact below is pinned by the e2e
+// interop suites so it fails loudly instead of drifting.
+//
+//   - Extension header spelling. The RFC 6455 and RFC 7692 examples use the
+//     plural Sec-WebSocket-Extensions, while the IANA registration is
+//     singular, and real handshakes carry both (Node's ws reads only the
+//     plural in a 101 response). Input accepts both spellings; output uses
+//     the RFC plural.
+//   - Browser offers differ (measured, Chromium and Firefox): Chromium
+//     sends "permessage-deflate; client_max_window_bits" (the parameter
+//     without a value, i.e. no client-window limit), Firefox sends the bare
+//     token. Both are accepted; RFC 7692 §7.1 makes every parameter
+//     optional.
+//   - Decompression tail (deviation from RFC 7692 §7.2.2). The RFC prescribes
+//     appending four octets (00 00 ff ff) to complete the truncated stream.
+//     Real peers additionally end the stream with an empty BFINAL=0 block,
+//     which Go's strict compress/flate reader would run past into EOF and
+//     report "unexpected EOF". This package therefore appends the four RFC
+//     octets plus the BFINAL empty block (01 00 00 ff ff) — nine octets
+//     total; see deflateTailBytes.
+//   - Compression wire shape (RFC 7692 §7.2.1). The truncated stream is
+//     produced from the stdlib flate writer by Flush (not Close, which would
+//     emit a BFINAL=1 Huffman block, not the RFC wire encoding) and dropping
+//     the final four octets of the BFINAL=0 empty block that Flush appends.
+//
 // # File map
 //
 // This is a single-file implementation, organized in dependency order so a

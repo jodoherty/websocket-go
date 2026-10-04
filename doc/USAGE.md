@@ -196,6 +196,12 @@ up := ws.NewUpgrader(ws.WithCheckOrigin(func(r *http.Request) bool {
 }))
 ```
 
+A programmatic client is free to *present* an Origin to receive
+browser-equivalent policy treatment: `ws.Dial` sends it via
+`ws.WithHeader("Origin", …)`, and the Node `ws` library takes an
+`origin` option — that is how the e2e Node interop passes the demo's
+default same-origin check.
+
 *Session lifecycle — re-validate, and close on expiry or logout.*
 WebSocket sessions outlive ordinary ones, so re-check the session in the
 read loop (every 30 minutes is the cheat sheet's figure) and, on logout,
@@ -256,6 +262,15 @@ go run ./cmd/certgen -dir e2e/certs
 DEMO_TOKEN=secret go run ./cmd/demo -addr :8443 -certs e2e/certs
 # open https://localhost:8443/ in a browser; console shows the echo test
 ```
+
+`/ws/bearer` accepts the token two ways: the `Authorization: Bearer …`
+header, or `?token=…` on the URL. The query-param channel exists because
+browsers cannot set custom request headers on a `WebSocket` handshake, so
+the browser-facing demo (and the Playwright suite) authenticates with
+`?token=`; header-based bearer is exercised by the Node interop suite.
+`/ws/info` reports the server-side view of a connection (whether
+permessage-deflate was negotiated — the browser `WebSocket` API exposes no
+such property) and is what the browser compression assertion reads.
 
 ### E2E tests
 
