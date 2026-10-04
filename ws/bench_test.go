@@ -7,6 +7,10 @@ import (
 	"testing"
 )
 
+// benchPayload is a 1 KiB ASCII payload: these benchmarks exercise the
+// text path, so it must stay valid UTF-8 (RFC 6455 §5.6).
+func benchPayload() []byte { return bytes.Repeat([]byte("0123456789abcdef"), 64) }
+
 // discardW is a writer that throws data away; it lets the write benchmarks
 // measure framing, not the sink.
 type discardW struct{}
@@ -30,10 +34,7 @@ func encodeOneFrame(b *testing.B, isClient bool, payload []byte) []byte {
 // sides of the masking rule (the client side does a random mask + XOR copy,
 // the server side writes the payload directly).
 func BenchmarkFrameCodecWrite(b *testing.B) {
-	payload := make([]byte, 1024)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
+	payload := benchPayload()
 	for name, isClient := range map[string]bool{
 		"ClientMasked": true,
 		"ServerPlain":  false,
@@ -55,10 +56,7 @@ func BenchmarkFrameCodecWrite(b *testing.B) {
 // BenchmarkFrameCodecRead measures decoding one 1 KiB text frame, again on
 // both sides of the masking rule.
 func BenchmarkFrameCodecRead(b *testing.B) {
-	payload := make([]byte, 1024)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
+	payload := benchPayload()
 	for name, isClient := range map[string]bool{
 		"ClientReadsPlain":  true,  // we are the client: peer frames are unmasked
 		"ServerReadsMasked": false, // we are the server: peer frames are masked
@@ -89,10 +87,7 @@ func BenchmarkFrameCodecRead(b *testing.B) {
 // server has read it, so the loop is a true round trip without any
 // bookkeeping channel; one pipe pair serves the whole benchmark.
 func BenchmarkConnRoundTrip(b *testing.B) {
-	payload := make([]byte, 1024)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
+	payload := benchPayload()
 	sr, cr := net.Pipe()
 	server := newConn(sr, sr, false, 1<<20, 0, 0)
 	client := newConn(cr, cr, true, 1<<20, 0, 0)

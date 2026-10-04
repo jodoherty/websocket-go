@@ -52,8 +52,8 @@ hand-written editing.)
    per-message cost so a regression is visible: codec write/read on both
    sides of the masking rule, an end-to-end `WriteMessage`→`ReadMessage`
    round trip over an in-memory pipe, and the handshake accept key. On a
-   Ryzen 7600X a 1 KiB round trip is ~1.8 µs (~570 MB/s) with a single
-   allocation (the payload), the masked client write is ~420 ns with zero
+   Ryzen 7600X a 1 KiB round trip is ~1.4 µs (~710 MB/s) with a single
+   allocation (the payload), the masked client write is ~190 ns with zero
    allocations, and the accept key is ~130 ns.
 10. **Statement coverage** — the library sits at **97.4% statement
     coverage** when the unit and e2e suites are combined (97.3% on the unit
@@ -69,14 +69,16 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.1% branch coverage** (389 of 409
+    no-match). The library sits at **95.2% branch coverage** (395 of 415
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
     decoder do not fail on well-formed input), a guard against an unexpected
     compressor stream tail, a closed-state check the write mutex makes dead,
     and mid-handshake write/hijack failures that need a live connection to
-    fail at exactly the wrong instant. `make branchcov` reproduces the number;
+    fail at exactly the wrong instant, plus a few defensive guards their
+    callers make moot (an empty subprotocol group or token, a nil response
+    body). `make branchcov` reproduces the number;
     `cmd/branchcov` also documents two limits shared with every
     standard-profile tool (operand-level short-circuiting inside a boolean
     expression, and break-versus-condition-false loop exits).
