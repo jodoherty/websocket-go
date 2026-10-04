@@ -123,8 +123,10 @@ connections instead of keeping them alive.
 Security-relevant invariants baked into the design: clients must mask
 (enforced both directions — RFC §10.3), message size limits (DoS bound —
 and, with permessage-deflate, the bound is enforced on the *decompressed*
-size during inflate, so a high-ratio payload cannot inflate past it,
-failing with 1009), strict same-origin default, constant-time token
+size during inflate, so a high-ratio payload cannot inflate past it — an
+oversized frame header is closed with 1002 per §7.1.7, and a message that
+overruns the limit while fragmenting or inflating terminates the
+connection at the bound), strict same-origin default, constant-time token
 comparison in the demo, TLS-only client-cert trust (verification is the
 TLS layer's, the library only checks presence), strict subprotocol token
 validation (RFC 6455 §1.9: 1#token over U+0021..U+007E minus the RFC 2616

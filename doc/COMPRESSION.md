@@ -53,8 +53,9 @@ reference-only (see the table in `doc/USAGE.md`).
    16 MiB) bounds the **decompressed** payload; the compressed frame must
    also pass the existing bound before we inflate anything (deflate
    compresses ~1000:1, so the compressed bound alone does not stop a
-   decompression bomb — the expanded size is enforced during/after
-   inflate and the connection fails with 1009).
+   decompression bomb — the expanded size is enforced during inflate, and
+   the connection terminates at the bound, before the inflate buffer can
+   grow unboundedly).
 
 6. **Allocation budget holds.** Read side: one heap allocation per
    message as before — the returned (decompressed) payload; the flate
@@ -147,8 +148,8 @@ New `ws/deflate_test.go` (internal `package ws`, using `newTestConn`/
   that inflates to zero bytes is the legal empty message — it round-trips),
   MaxMessageSize enforcement on the
   expanded payload, decompression-bomb-shaped payload (compresses small,
-  inflates past the bound → 1009 before the inflate buffer can grow
-  unboundedly — the inflate stops at the bound).
+  inflates past the bound → the connection terminates at the bound — the
+  inflate stops before the buffer can grow unboundedly).
 - **Options:** `WithCompression(false)` on server and client leaves RSV
   enforcement at today's strictness; `WithCompressionLevel` accepted.
 - **Vectors:** RFC 7692 ships no official test vectors; interop is the
