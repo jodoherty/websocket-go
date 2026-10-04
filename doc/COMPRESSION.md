@@ -85,8 +85,9 @@ WithCompression(enabled bool)      // default true; opt out per upgrader or dial
 WithCompressionLevel(l flate.Level) // default flate.DefaultCompression
 ```
 
-No new `Conn` accessors. Negotiated parameters live on the connection
+No new accessors. Negotiated parameters live on the connection
 internally; tests reach them via the internal `package ws` tests.
+`Compressed()` reports the outcome on both faces.
 
 ## Code layout in `ws/ws.go`
 
@@ -111,7 +112,7 @@ section map is updated:
    inflate into the per-connection scratch, enforce the expanded size
    bound, return the payload. Write path: deflate into scratch, emit one
    frame with RSV1.
-4. **Conn struct** — two scratch sets:
+4. **RawConn struct** — two scratch sets:
    read side: flate reader + window + inflate buffer (owned by the
    pumping goroutine, same ownership argument as `frameCodec.in`);
    write side: flate writer + output buffer (owned by whichever
@@ -214,13 +215,13 @@ directions; all run in the e2e gate (`make e2e`):
   binary through compression in both directions.
 - **Go `Dial` → Node `ws` server** (`TestInteropGoClientAgainstNodeServer`):
   the Go client offers the extension and the Node server accepts it; the test
-  asserts `Conn.Compressed()` and round-trips 512 KiB through Node's
+  asserts `Session.Compressed()` and round-trips 512 KiB through Node's
   decompressor.
 - **Real browsers** (Playwright, Chromium + Firefox): both engines offer
   `permessage-deflate` by default — measured handshakes show Chromium
   sending `permessage-deflate; client_max_window_bits` and Firefox the bare
   token — and the suite *asserts* the negotiation rather than assuming it:
-  `/ws/info` reports the server's view (`Conn.Compressed()`), because the
+  `/ws/info` reports the server's view (`Session.Compressed()`), because the
   browser `WebSocket` API exposes no negotiated-extensions property. If a
   browser ever stops offering the extension, the assertion fails instead
   of this evidence line going stale. The echo tests (including a 1 MiB

@@ -10,10 +10,12 @@ package ws
 //   - Example:         ws.Handle + Dial — an echo round trip
 //   - ExampleUpgrader:  auth middleware + WithHandshakeData + Upgrade
 //   - ExampleDial:      programmatic client, bearer token via WithHeader
+//   - ExampleDialRaw:   the raw face — events, answering pings, a two-frame
+//                       write, and the peer's close as an OpClose event
 //   - ExampleCloseCode: application close codes, end to end
 //   - ExampleWithCheckOrigin: origin allowlist, per-endpoint size cap, and
 //                             per-action authorization (1008)
-//   - ExampleConn_WriteText: the text-frame UTF-8 rule — a refused write
+//   - ExampleSession_WriteText: the text-frame UTF-8 rule — a refused write
 //                             leaves the connection open
 //
 // Note the // Output: block sits inside each function body: since Go 1.27
@@ -52,7 +54,7 @@ func Example() {
 	up := NewUpgrader()
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
 		for {
 			op, data, err := c.ReadMessage()
 			if err != nil {
@@ -162,7 +164,7 @@ func ExampleDial() {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
 		_, data, err := c.ReadMessage()
 		if err != nil {
 			return err
@@ -214,7 +216,7 @@ func ExampleWithCheckOrigin() {
 	)
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
 		_, data, err := c.ReadMessage()
 		if err != nil {
 			return err
@@ -253,6 +255,84 @@ func ExampleWithCheckOrigin() {
 	// 1008 forbidden
 }
 
+// ExampleDialRaw shows the raw face: the protocol as an event stream, with
+// the application as the responder. The server answers the client's ping
+// with Pong, reassembles the client's two-frame message, echoes it, and
+// closes with 1001; the client sees the pong, the echoed text, and the
+// peer's close as an OpClose event carrying the resolved code, followed by
+// the terminal error.
+func ExampleDialRaw() {
+	up := NewUpgrader()
+
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.HandleRaw(func(_ *http.Request, c *RawConn) error {
+		for {
+			event, readErr := c.ReadEvent()
+			if readErr != nil {
+				return readErr
+			}
+			switch event.Op {
+			case OpPing:
+				// The application is the responder: no auto-pong in raw mode.
+				pingErr := c.Pong(event.Payload)
+				if pingErr != nil {
+					return pingErr
+				}
+			case OpText:
+				writeErr := c.WriteFrame(OpText, event.Payload, false)
+				if writeErr != nil {
+					return writeErr
+				}
+				return c.Close(StatusGoingAway, "done")
+			}
+		}
+	}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c, err := DialRaw(context.Background(), wsURL(srv.URL)+"/ws")
+	if err != nil {
+		panic(err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+
+	pingErr := c.Ping([]byte("hi"))
+	if pingErr != nil {
+		panic(pingErr)
+	}
+	// One message, two frames: a start frame with more=true, then the
+	// continuation that ends the message (RFC 6455 §5.4).
+	startErr := c.WriteFrame(OpText, []byte("frag-"), true)
+	if startErr != nil {
+		panic(startErr)
+	}
+	contErr := c.WriteFrame(OpContinuation, []byte("ed"), false)
+	if contErr != nil {
+		panic(contErr)
+	}
+	for {
+		event, readErr := c.ReadEvent()
+		if readErr != nil {
+			code, reason, ok := CloseCode(readErr)
+			fmt.Println("terminal:", code, reason, ok)
+			break
+		}
+		switch event.Op {
+		case OpPong:
+			fmt.Println("pong:", string(event.Payload))
+		case OpText:
+			fmt.Println("text:", string(event.Payload))
+		case OpClose:
+			fmt.Println("close event:", event.Code, event.Reason)
+		}
+	}
+	// Output:
+	// pong: hi
+	// text: frag-ed
+	// close event: 1001 done
+	// terminal: 1001 done true
+}
+
 // ExampleCloseCode shows application-level close codes end to end: the
 // handler returns a *CloseError, Handle closes the connection with its
 // code, and the peer extracts the code with CloseCode.
@@ -260,7 +340,7 @@ func ExampleCloseCode() {
 	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
 
 	mux := http.NewServeMux()
-	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Conn) error {
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {
 		_, _, _ = c.ReadMessage() // consume the client's message
 		return &CloseError{Code: StatusPolicyViolation, Reason: "token expired"}
 	}))
@@ -284,12 +364,12 @@ func ExampleCloseCode() {
 	// 1008 token expired true
 }
 
-// ExampleConn_WriteText demonstrates the text-frame rule (RFC 6455 §5.6):
+// ExampleSession_WriteText demonstrates the text-frame rule (RFC 6455 §5.6):
 // an OpText payload that is not valid UTF-8 is refused before anything
 // reaches the wire, the refusal does not close the connection, and a valid
 // message immediately after is delivered. Applications that move raw byte
 // sequences should use OpBinary — it passes through with no validation.
-func ExampleConn_WriteText() {
+func ExampleSession_WriteText() {
 	sr, cr := net.Pipe()
 	server := newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil)
 	client := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)

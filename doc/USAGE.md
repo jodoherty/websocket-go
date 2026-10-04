@@ -7,8 +7,8 @@ A WebSocket (RFC 6455) implementation for Go, stdlib only, designed to slot
 into `net/http` — `http.ServeMux`, `http.Handler`, `http.HandlerFunc` —
 rather than replace it.
 
-**Requirements:** Go 1.25 or newer — the code uses `errors.AsType`,
-`strings.SplitSeq`, and `slices`, which arrived in 1.24–1.25. The
+**Requirements:** Go 1.27.1 or newer (the `go.mod` floor) — the code uses
+`errors.AsType` (new in 1.26) and `strings.SplitSeq` (new in 1.24). The
 stdlib-only *import* invariant holds on any Go; the language floor is what
 it is.
 
@@ -113,6 +113,32 @@ it is.
    payload `ReadMessage` returns, which the caller owns. Writes allocate
    nothing. This is pinned by the allocation-budget tests, not just
    benchmarked.
+
+## Two faces
+
+The session is the default view, and everything above describes it. The
+same protocol core is also available raw, for applications that implement a
+protocol *on* WebSockets and want to drive the control traffic themselves:
+
+- **Everything is an event.** `RawConn.ReadEvent` delivers each data message
+  with its op-type, each ping, each pong, and the peer's close as an
+  `OpClose` event carrying the resolved code and reason — then the
+  terminal error. There is no auto-pong: the application answers with
+  `Pong`. `WithPongHandler` does not exist for raw.
+- **Writes can fragment.** `WriteFrame(op, payload, more)` sends one frame;
+  `more=true` starts or continues a multi-frame message (RFC 6455 §5.4),
+  which no session method can express.
+- **Compliance below, policy above.** The raw face still enforces what the
+  RFC requires — masking, the close-code table, UTF-8, the size limit,
+  reassembly, the mandatory 1002 on protocol violation — because that
+  lives in the core. What it drops is the session's policy: auto-pong, the
+  pong handler, the close-to-terminal-error mapping, and keepalive probes
+  (`DialRaw` sends none unless `WithIdleTimeout` is set).
+
+The entry points are symmetric: `Dial` → `*Session`, `DialRaw` → `*RawConn`;
+server-side `Upgrade`/`Handle` produce a session, `UpgradeRaw`/`HandleRaw`
+the raw connection. A session never exposes its raw connection — two read
+loops over one transport would race.
 
 ## Usage: good and bad
 
@@ -303,7 +329,9 @@ WithDialTimeout(d)
 ```
 
 Protocol details: masking enforced both directions, fragmentation support on
-read, control-frame validation, ping/pong handled transparently (auto-pong),
+read, control-frame validation, ping/pong answered transparently in the
+session (auto-pong; in raw mode pings and pongs are events the application
+answers),
 UTF-8 validation on text frames (RFC 6455 §5.6 — a non-UTF-8 text message
 fails the connection with 1007, the close Node's ws and browsers use for
 exactly this; `WriteMessage(OpText, …)` with invalid UTF-8 is refused before
@@ -393,8 +421,7 @@ default same-origin check.
 WebSocket sessions outlive ordinary ones, so re-check the session in the
 read loop (every 30 minutes is the cheat sheet's figure) and, on logout,
 close every connection for that session through a session →
-`Session.ID()`
-map. Pair with `SameSite=Lax` (or `Strict`) cookies so a cross-site
+`Session.ID()` map. Pair with `SameSite=Lax` (or `Strict`) cookies so a cross-site
 handshake cannot carry the session at all:
 
 ```go
@@ -434,9 +461,10 @@ per-user target resolution before the byte bridge.
 ## Running
 
 ```sh
-go test ./...        # library unit tests
+go test ./...        # library unit tests (the Examples are part of this run)
 go vet ./...
-make all             # the full gate: strict lint + staticcheck + tests
+make gate            # the full gate: lint + staticcheck + tests + race + fuzz
+                     # + bench + MC/DC + branch coverage + e2e
 make coverage        # statement coverage (unit suite)
 make branchcov       # branch coverage (cmd/branchcov, unit + e2e merged)
 make mcdc            # MC/DC audit (cmd/mcdc: required pairs traced to tests)
@@ -537,7 +565,7 @@ mux.Handle("/vnc", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request)
 func bridge(c *ws.Session, target string) error {
     vnc, err := net.Dial("tcp", target)
     if err != nil {
-        _ = c.Close(ws.StatusServiceUnavailable, "backend unreachable")
+        _ = c.Close(ws.StatusUnexpectedCondition, "backend unreachable")
         return err
     }
     defer vnc.Close()
