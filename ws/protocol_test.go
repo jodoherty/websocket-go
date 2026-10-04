@@ -475,7 +475,8 @@ func TestMCDCUpgrade101(t *testing.T) {
 }
 
 // TestMCDCSubprotocol traces
-// "r <= 0x20 || r >= 0x7f || r == '\"'" in validSubprotocol.
+// "r <= 0x20 || r >= 0x7f || strings.ContainsRune(subprotocolSeparators, r)"
+// in validSubprotocol.
 func TestMCDCSubprotocol(t *testing.T) {
 	t.Parallel()
 
@@ -504,7 +505,8 @@ func TestMCDCSubprotocol(t *testing.T) {
 
 	t.Run("quote", func(t *testing.T) {
 		t.Parallel()
-		// A double quote is rejected; a printable token is accepted.
+		// A double quote (a separator) is rejected; a printable token
+		// is accepted.
 		if validSubprotocol("\"") {
 			t.Fatal(`"\"" accepted, want rejected`)
 		}
@@ -529,6 +531,25 @@ func TestMCDCSubprotocol(t *testing.T) {
 			t.Fatalf("valid subprotocol: %v, want success", err)
 		}
 	})
+}
+
+// TestSubprotocolSeparators pins the RFC 2616 separator rejection in
+// validSubprotocol (RFC 6455 §1.9: 1#token): each separator in a token is
+// rejected; printable non-separators are accepted.
+func TestSubprotocolSeparators(t *testing.T) {
+	t.Parallel()
+
+	for _, s := range []string{"a;b", "a=b", "a,b", "a:b", "a/b", `a\b`,
+		"a(b", "a[b", "a?b", "a@b", "a<b", "a>b", "a{b", "a}b", "a\"b"} {
+		if validSubprotocol(s) {
+			t.Fatalf("%q accepted, want rejected", s)
+		}
+	}
+	for _, s := range []string{"vnc1", "chat-v2", "a_b", "chat.v2"} {
+		if !validSubprotocol(s) {
+			t.Fatalf("%q rejected, want accepted", s)
+		}
+	}
 }
 
 // TestClientRejectsLineBreakHeader: a header value containing CR or LF

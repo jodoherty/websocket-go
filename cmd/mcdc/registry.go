@@ -216,18 +216,24 @@ func handshakeTraces() []decisionTrace {
 				{1, []bool{false, true}, []bool{false, false}, testMCDCWebSocketKey, "len"},
 			},
 		},
-		// ws.go: r <= 0x20 || r >= 0x7f || r == '"' (validSubprotocol)
+		// ws.go: r <= 0x20 || r >= 0x7f ||
+		// strings.ContainsRune(subprotocolSeparators, r) (validSubprotocol)
 		{
-			expr:       `r <= 0x20 || r >= 0x7f || r == '"'`,
-			conditions: []string{"r <= 0x20", "r >= 0x7f", `r == '"'`},
+			expr: "r <= 0x20 || r >= 0x7f || " +
+				"strings.ContainsRune(subprotocolSeparators, r)",
+			conditions: []string{
+				"r <= 0x20",
+				"r >= 0x7f",
+				"strings.ContainsRune(subprotocolSeparators, r)",
+			},
 			pairs: []pairTrace{
 				// A control character is rejected; the printable "a" is
 				// accepted.
 				{0, []bool{true, false, false}, []bool{false, false, false}, testMCDCSubprotocol, "low"},
 				// DEL (0x7f) is rejected; the printable "a" is accepted.
 				{1, []bool{false, true, false}, []bool{false, false, false}, testMCDCSubprotocol, "high"},
-				// A double quote is rejected; the printable "a" is
-				// accepted.
+				// A double quote (a separator) is rejected; the
+				// printable "a" is accepted.
 				{2, []bool{false, false, true}, []bool{false, false, false}, testMCDCSubprotocol, "quote"},
 			},
 		},

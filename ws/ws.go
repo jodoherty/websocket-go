@@ -1672,6 +1672,10 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Upgrade: websocket header")
 	}
 	if request.Header.Get("Sec-WebSocket-Version") != websocketVer {
+		// RFC 6455 §4.2: the version-mismatch response names the
+		// version(s) the server understands.
+		writer.Header().Add("Sec-WebSocket-Version", websocketVer)
+
 		return "", rejectStatus(writer, http.StatusUpgradeRequired, "unsupported websocket version")
 	}
 	key := request.Header.Get("Sec-WebSocket-Key")
@@ -2111,14 +2115,23 @@ func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 	return true, nil
 }
 
+// subprotocolSeparators are the RFC 2616 separator characters a subprotocol
+// token may not contain (RFC 6455 §1.9 defines the header value as 1#token).
+// Control characters, space, and DEL fall outside the token's U+0021..U+007E
+// range and are checked separately.
+const subprotocolSeparators = "()<>@,;:\"/[]?{}=\\"
+
 // validSubprotocol reports whether s is a valid subprotocol token: printable
-// US-ASCII excluding space and double quote (RFC 6455 §1.9).
+// US-ASCII (U+0021..U+007E) minus the RFC 2616 separator characters
+// (RFC 6455 §1.9, 1#token). A token containing one of them would corrupt
+// the Sec-WebSocket-Protocol header — a comma would split the value into
+// several tokens.
 func validSubprotocol(s string) bool {
 	if s == "" {
 		return false
 	}
 	for _, r := range s {
-		if r <= 0x20 || r >= 0x7f || r == '"' {
+		if r <= 0x20 || r >= 0x7f || strings.ContainsRune(subprotocolSeparators, r) {
 			return false
 		}
 	}

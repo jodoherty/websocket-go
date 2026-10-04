@@ -297,9 +297,15 @@ func TestUpgradeRejectBranches(t *testing.T) {
 
 	req = upgradeReq()
 	req.Header.Set("Sec-WebSocket-Version", "8")
-	_, err = up.Upgrade(httptest.NewRecorder(), req)
+	rec := httptest.NewRecorder()
+	_, err = up.Upgrade(rec, req)
 	if !errors.As(err, &ue) || ue.Status != http.StatusUpgradeRequired {
 		t.Fatalf("bad version: %v, want 426", err)
+	}
+	// RFC 6455 §4.2: the version-mismatch response names the version(s)
+	// the server understands.
+	if got := rec.Header().Get("Sec-WebSocket-Version"); got != "13" {
+		t.Fatalf("version-mismatch response: Sec-WebSocket-Version = %q, want \"13\"", got)
 	}
 
 	req = upgradeReq()
