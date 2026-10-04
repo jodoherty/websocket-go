@@ -266,11 +266,17 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	}
 
 	up = ws.NewUpgrader(openOrigin, ws.WithPreHandshake(func(*http.Request) error {
-		return errors.New("nope")
+		return errors.New("nope: internal detail")
 	}))
-	_, err = up.Upgrade(httptest.NewRecorder(), upgradeReq())
+	hookRec := httptest.NewRecorder()
+	_, err = up.Upgrade(hookRec, upgradeReq())
 	if !errors.As(err, &ue) || ue.Status != http.StatusForbidden {
 		t.Fatalf("pre-handshake plain error: %v, want 403", err)
+	}
+	// The hook's error detail must not reach the client: the body is a
+	// fixed string, not err.Error(); only a *UpgradeError carries detail.
+	if body := hookRec.Body.String(); body != "forbidden\n" {
+		t.Fatalf("plain-error body %q, want the fixed \"forbidden\" body", body)
 	}
 
 	// The protocol-header rejections. Each drops exactly one required

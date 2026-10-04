@@ -1734,11 +1734,13 @@ func WithRequireClientCert() Option {
 	return func(cfg *Config) { cfg.RequireClientCert = true }
 }
 
-// WithPreHandshake runs check on the request after protocol and origin
-// checks, before the protocol switch. Return an error to reject the upgrade
-// with 403, or a [*UpgradeError] to control the status code. Use it for
-// policy checks that need the full request (rate limiting, per-path checks,
-// logging).
+// WithPreHandshake runs check on the request after the method, origin, and
+// client-certificate checks, before the protocol headers are validated and
+// the switch happens. Return an error to reject the upgrade with 403 — the
+// response body is a fixed "forbidden", so the hook's error detail never
+// reaches the client — or a [*UpgradeError] to control the status code and
+// body. Use it for policy checks that need the full request (rate
+// limiting, per-path checks, logging).
 func WithPreHandshake(check func(r *http.Request) error) Option {
 	return func(cfg *Config) { cfg.PreHandshake = append(cfg.PreHandshake, check) }
 }
@@ -2006,7 +2008,7 @@ func (u *Upgrader) checkPolicy(writer http.ResponseWriter, request *http.Request
 				return rejectStatus(writer, ue.Status, ue.Msg)
 			}
 
-			return rejectStatus(writer, http.StatusForbidden, err.Error())
+			return rejectStatus(writer, http.StatusForbidden, "forbidden")
 		}
 	}
 

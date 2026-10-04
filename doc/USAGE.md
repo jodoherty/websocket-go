@@ -244,7 +244,8 @@ WithWriteTimeout(d)        // default 30 s write bound; 0 disables; negatives fa
 WithCompression(enabled)   // permessage-deflate (RFC 7692); default true, opt out per upgrader or dial
 WithCompressionLevel(l)    // flate level for compression; default flate.DefaultCompression
 WithPongHandler(f)         // invoked inline by ReadMessage when a pong arrives; pongs are otherwise invisible
-WithPreHandshake(f)        // policy hook before the switch; *UpgradeError controls status
+WithPreHandshake(f)        // policy hook before the switch; plain error → fixed 403 "forbidden" body;
+                           // *UpgradeError controls status and body
 WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
 // Conn
