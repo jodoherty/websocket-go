@@ -26,8 +26,8 @@ import (
 // deadlineConn is a net.Conn whose Write blocks until either the test closes
 // its stuck channel (a write that "succeeds") or the write deadline set by
 // the library fires (a write that fails). Once the first deadline has fired
-// the conn is marked dead and later writes fail immediately, so a best-effort
-// close-frame write does not also block for its own 5 s bound.
+// the conn is marked dead and later writes fail immediately, so teardown
+// after the failed write never blocks a second time.
 type deadlineConn struct {
 	mu         sync.Mutex
 	deadline   time.Time
@@ -198,6 +198,104 @@ func TestWriteDeadlineClearedAfterSuccess(t *testing.T) {
 		t.Fatalf("second write: %v", err)
 	}
 }
+
+// TestWriteTransportFailureFailsConnection pins the transport-failure
+// contract: a write that reaches the transport and fails marks the
+// connection dead with the error recorded — later writes and Close return
+// that error at once, Closed() reports it, and the transport is closed so
+// a reader blocked in ReadMessage wakes now and a hijacked conn cannot
+// leak if the read path is not currently in a read.
+func TestWriteTransportFailureFailsConnection(t *testing.T) {
+	nc := &closedConn{inner: failWriteConn{}, closed: make(chan struct{})}
+	c := newConn(nc, nc, true, 1<<20, 0, 0)
+
+	writeErr := c.WriteMessage(OpBinary, []byte("gone"))
+	if writeErr == nil {
+		t.Fatal("write to a failing transport succeeded")
+	}
+	if !c.Closed() {
+		t.Fatal("connection not closed after a transport write failure")
+	}
+	select {
+	case <-nc.closed:
+	default:
+		t.Fatal("transport was not closed by the failed write")
+	}
+	second := c.WriteMessage(OpBinary, []byte("again"))
+	if !errors.Is(second, writeErr) {
+		t.Fatalf("second write = %v, want the recorded %v", second, writeErr)
+	}
+	err := c.Close(StatusNormalClosure, "")
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("Close = %v, want the recorded %v", err, writeErr)
+	}
+	_, _, err = c.ReadMessage()
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("ReadMessage = %v, want the recorded %v", err, writeErr)
+	}
+}
+
+// closedConn wraps a net.Conn, recording when the transport was closed.
+type closedConn struct {
+	inner  net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closedConn) Read(p []byte) (int, error)         { return c.inner.Read(p) }
+func (c *closedConn) Write(p []byte) (int, error)        { return c.inner.Write(p) }
+func (c *closedConn) LocalAddr() net.Addr                { return c.inner.LocalAddr() }
+func (c *closedConn) RemoteAddr() net.Addr               { return c.inner.RemoteAddr() }
+func (c *closedConn) SetDeadline(t time.Time) error      { return c.inner.SetDeadline(t) }
+func (c *closedConn) SetReadDeadline(t time.Time) error  { return c.inner.SetReadDeadline(t) }
+func (c *closedConn) SetWriteDeadline(t time.Time) error { return c.inner.SetWriteDeadline(t) }
+func (c *closedConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.inner.Close()
+}
+
+// TestWriteFailureAfterConcurrentClose pins the ordering when a Close wins
+// the race against an in-flight write: the transport write then fails, but
+// the closer's recorded error must survive — the transport error must not
+// overwrite what the concurrent Close recorded.
+func TestWriteFailureAfterConcurrentClose(t *testing.T) {
+	var c *Conn
+	nc := hookWriteConn{hook: func() {
+		// Simulate a Close that completed while this write was in flight:
+		// state and closeErr are set exactly as [Conn.Close] would set
+		// them. Same goroutine, so no synchronization is needed.
+		c.state.Store(stClosed)
+		c.closeErr = closeErrFor(StatusGoingAway, "bye")
+	}}
+	c = newConn(nc, nc, true, 1<<20, 0, 0)
+
+	err := c.WriteMessage(OpBinary, []byte("x"))
+	if err == nil {
+		t.Fatal("write to a failing transport succeeded")
+	}
+	var ce *CloseError
+	if !errors.As(c.closedWriteErr(), &ce) || ce.Code != StatusGoingAway {
+		t.Fatalf("recorded error = %v, want the closer's 1001 CloseError", c.closedWriteErr())
+	}
+}
+
+// hookWriteConn is a net.Conn whose Write runs a hook before failing — a
+// deterministic stand-in for a concurrent Close winning mid-write.
+type hookWriteConn struct{ hook func() }
+
+func (h hookWriteConn) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (h hookWriteConn) Write(_ []byte) (int, error) {
+	h.hook()
+	return 0, errors.New("simulated write failure")
+}
+func (h hookWriteConn) Close() error                { return nil }
+func (h hookWriteConn) LocalAddr() net.Addr         { return fakeAddr{} }
+func (h hookWriteConn) RemoteAddr() net.Addr        { return fakeAddr{} }
+func (h hookWriteConn) SetDeadline(time.Time) error { return nil }
+func (h hookWriteConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (h hookWriteConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestCloseRespectsWriteTimeout pins the close-frame write bound for a
 // connection with [WithWriteTimeout]: the close must arm the connection's

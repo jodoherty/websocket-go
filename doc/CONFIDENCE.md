@@ -80,7 +80,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.2% branch coverage** (397 of 417
+    no-match). The library sits at **95.2% branch coverage** (401 of 421
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -172,4 +172,14 @@ pins the pumping goroutine only until that bound fires and the connection
 dies (the bound is the defense against the ping stall, which is also the
 per-connection cost it lets an attacker buy), and `Close`'s close-frame
 write obeys the same bound (with a fixed fallback when the caller set
-none), so teardown of a stalled connection is always finite.
+none), so teardown of a stalled connection is always finite. A
+transport-level write failure fails the connection with the error
+recorded — the same verdict the read path gives a failed pong or
+keepalive probe — so an unchecked writer cannot keep re-stalling a broken
+transport: the first failed write costs the bound once, and every later
+write or `Close` fast-fails with the recorded error, `Closed()` turns true
+for background writers, and the transport is closed so a blocked reader
+wakes and a hijacked conn cannot leak (pinned by
+`TestWriteTransportFailureFailsConnection` and
+`TestWriteFailureAfterConcurrentClose`, the latter also pinning that a
+concurrent `Close` that wins the race keeps its own recorded error).

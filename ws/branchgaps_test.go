@@ -222,6 +222,15 @@ func TestWriteFramePayloadFailure(t *testing.T) {
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "payload") {
 		t.Fatalf("unmasked writeFrame over failing transport = %v, want a payload write error", writeErr)
 	}
+
+	// A second frame on the same codec hits bufio's sticky error at the
+	// header write, reaching the header-error branch: once a flush has
+	// failed, the buffered writer refuses every later write, starting
+	// with the next frame's header.
+	writeErr = clientFC.writeFrame(OpBinary, payload, false)
+	if writeErr == nil || !strings.Contains(writeErr.Error(), "header") {
+		t.Fatalf("second writeFrame on the same codec = %v, want a header write error", writeErr)
+	}
 }
 
 // TestReadFrameTruncatedLength64 pins the 64-bit length read failure: a

@@ -1313,6 +1313,19 @@ func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 // error, or [ErrClosed] after a normal closure (1000) — never a silent
 // success for a frame that will not be sent.
 //
+// A transport-level write failure fails the connection. A write that
+// reaches the transport and fails — the write deadline fires, or the
+// connection resets — means the pipe is broken, so the connection is
+// marked closed with the error recorded, exactly as the read path reacts
+// to a failed pong or keepalive probe. Later writes and [Close] then
+// return the recorded error at once instead of re-stalling, [Closed]
+// turns true so background writers can stop, and the transport is closed
+// (as [Close] does) so a reader blocked in [ReadMessage] wakes instead of
+// waiting for keepalive. The write timeout therefore bounds the
+// connection, not just a single write. Validation failures (opcode,
+// size, UTF-8, JSON) are not transport failures: they are returned
+// without touching the connection.
+//
 // The write lock is held for the whole transport write, so a writer stuck
 // at the [WithWriteTimeout] bound delays by that bound the automatic pong
 // the read path answers to a peer ping. A peer whose keepalive window is
@@ -1363,6 +1376,20 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	}
 	writeErr := c.fc.writeFrame(opcode, frame, compressed)
 	_ = c.nc.SetWriteDeadline(time.Time{})
+	if writeErr != nil {
+		// The transport write failed, so the pipe is broken: no later
+		// write on this connection can succeed. Fail the connection with
+		// the error recorded — the same verdict the read path gives a
+		// failed pong or keepalive probe — and close the transport, as
+		// [Conn.Close] does, so a reader blocked in ReadMessage wakes
+		// now instead of on keepalive, and the hijacked conn cannot
+		// leak if the read path is not currently in a read.
+		if c.state.Load() == stOpen {
+			c.state.Store(stClosed)
+			c.closeErr = writeErr
+			_ = c.nc.Close()
+		}
+	}
 	c.mu.Unlock()
 
 	return writeErr

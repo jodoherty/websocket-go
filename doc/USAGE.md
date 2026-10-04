@@ -47,9 +47,9 @@ rather than replace it.
                break
            }
            if werr := c.WriteMessage(op, data); werr != nil {
-               // The peer stopped reading: writes into a stalled
-               // transport fail on the write timeout, so stop trying
-               // and let the loop (and the deferred Close) clean up.
+               // The transport write failed, so the connection is
+               // already marked dead with the error recorded — log the
+               // reason and let the loop (and the deferred Close) exit.
                log.Printf("session write failed: %v", werr)
                break
            }
@@ -93,6 +93,11 @@ rather than replace it.
      so a blackholed transport cannot hold the write mutex forever and
      wedge `Close`; `Conn.Closed()` gives a background writer a race-free
      signal to stop. `WithWriteTimeout(0)` restores unbounded writes.
+   - A transport-level write failure closes the connection with the
+     error recorded — the same verdict the read path gives a failed pong
+     or keepalive probe. The write timeout therefore bounds the
+     connection, not just one write; validation rejections (bad opcode,
+     oversize, non-UTF-8) do not.
 
 6. **One allocation per message.** The frame codec keeps its per-frame
    buffers (header, mask key, masked copy) as per-connection scratch, so the
@@ -111,19 +116,27 @@ rest of the application is written, shown as paired examples.
 A write succeeding does not prove the peer is alive: a stalled transport
 (peer stopped reading, NAT entry expired, link blackholed) absorbs many
 writes into the kernel buffer before it starts failing, and the failure
-arrives on the write timeout, not on the first lost message.
+arrives on the write timeout, not on the first lost message. The failure
+is also terminal: a transport-level write failure closes the connection
+with the error recorded, so later writes fast-fail, `Closed()` turns true
+for background writers, and a blocked `ReadMessage` wakes. Even an
+unchecked write is therefore bounded by a single write timeout — but the
+error is still the only place the application learns *why* the session
+ended, and discarding it turns a diagnosable failure into a mystery.
 
 ```go
-// good: a failed write means the peer stopped reading — stop sending
-// and let the loop exit; the deferred Close tears the session down.
+// good: a failed write means the transport is broken — the connection
+// is already marked dead; log the reason and let the loop exit.
 if err := c.WriteMessage(op, data); err != nil {
     log.Printf("session write failed: %v", err)
     break
 }
 
-// bad: the write silently fails on a stalled transport, the loop keeps
-// "working", and messages are lost until keepalive declares the peer
-// dead — possibly minutes later.
+// bad: the write fails on a stalled transport and the connection dies —
+// the failure is bounded, but the application threw away the only
+// evidence of why, and the handler reports a bare transport error
+// where "peer stopped reading after N messages" would have pointed at
+// the real problem.
 _ = c.WriteMessage(op, data)
 ```
 
