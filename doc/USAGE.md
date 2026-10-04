@@ -243,6 +243,7 @@ WithIdleTimeout(d)         // default 60 s window: probe at d, dead at 2d; 0 dis
 WithWriteTimeout(d)        // default 30 s write bound; 0 disables; negatives fall back
 WithCompression(enabled)   // permessage-deflate (RFC 7692); default true, opt out per upgrader or dial
 WithCompressionLevel(l)    // flate level for compression; default flate.DefaultCompression
+WithPongHandler(f)         // invoked inline by ReadMessage when a pong arrives; pongs are otherwise invisible
 WithPreHandshake(f)        // policy hook before the switch; *UpgradeError controls status
 WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
@@ -254,6 +255,7 @@ Conn.WriteMessage(op int, data []byte) error   // the echo form: the op comes of
 Conn.WriteText(s string) error                 // OpText; invalid UTF-8 refused before the wire
 Conn.WriteBinary(b []byte) error               // OpBinary, bytes untouched
 Conn.WriteJSON(v any) error                    // marshal (off-lock) then OpText
+Conn.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
 Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
 Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
 Conn.Compressed() bool     // whether permessage-deflate was negotiated on this connection
@@ -267,7 +269,8 @@ io.EOF       // returned by ReadMessage and Close for a clean end
 // Client
 func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)
 WithHeader(k, v)           // e.g. Authorization: Bearer ...
-WithTLS(cfg) / WithTLSClientCert(cert, key)   // mTLS
+WithTLS(cfg) / WithTLSClientCert(cert, key) / WithTLSClientChain(cert, chain, key)  // mTLS
+                                                                  // (chain: leaf + intermediates)
 WithDialTimeout(d)
 ```
 

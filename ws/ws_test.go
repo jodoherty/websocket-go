@@ -90,6 +90,118 @@ func mustDial(t *testing.T, url string, opts ...ws.Option) *ws.Conn {
 	return c
 }
 
+// TestAppPingPongRoundTrip pins the application-level ping/pong pair on
+// both sides: a client Ping is answered by the server's automatic pong
+// that the client's WithPongHandler (dial-side wiring) observes, and a
+// server Ping's pong is observed by the upgrader's WithPongHandler
+// (server-side wiring) in the server's pumping goroutine.
+func TestAppPingPongRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	t.Run("client observes the pong", func(t *testing.T) {
+		t.Parallel()
+		srv := startServer(t)
+		defer srv.Close()
+		pong := make(chan []byte, 1)
+		c := mustDial(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/echo",
+			ws.WithPongHandler(func(payload []byte) {
+				pong <- append([]byte(nil), payload...)
+			}))
+		defer c.Close(ws.StatusNormalClosure, "")
+		done := make(chan error, 1)
+		go func() { _, _, err := c.ReadMessage(); done <- err }()
+
+		err := c.Ping([]byte("rtt-probe"))
+		if err != nil {
+			t.Fatalf("Ping: %v", err)
+		}
+		select {
+		case payload := <-pong:
+			if string(payload) != "rtt-probe" {
+				t.Fatalf("pong payload %q, want the ping's payload", payload)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("pong handler never fired")
+		}
+		_ = c.Close(ws.StatusNormalClosure, "")
+		err = <-done
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("pump after close: %v, want io.EOF", err)
+		}
+	})
+
+	t.Run("server observes the pong", func(t *testing.T) {
+		t.Parallel()
+		// The session pings the client before its read loop starts; the
+		// client's automatic pong is consumed by the pump, which invokes
+		// the upgrader's handler inline.
+		pong := make(chan []byte, 1)
+		up := ws.NewUpgrader(
+			ws.WithCheckOrigin(func(*http.Request) bool { return true }),
+			ws.WithPongHandler(func(payload []byte) { pong <- append([]byte(nil), payload...) }),
+		)
+		srv := httptest.NewServer(up.Handle(func(_ *http.Request, c *ws.Conn) error {
+			_ = c.Ping([]byte("srv-probe"))
+			return echo(c)
+		}))
+		defer srv.Close()
+		c := mustDial(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/")
+		// The client's pump is what auto-pongs the server's probe.
+		clientDone := make(chan struct{})
+		go func() {
+			defer close(clientDone)
+			for {
+				_, _, err := c.ReadMessage()
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		select {
+		case payload := <-pong:
+			if string(payload) != "srv-probe" {
+				t.Fatalf("server pong payload %q, want the ping's payload", payload)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("server pong handler never fired")
+		}
+		_ = c.Close(ws.StatusNormalClosure, "")
+		<-clientDone
+	})
+}
+
+// TestAppPingValidation pins Ping's local rejections: an over-limit
+// control payload is refused before the wire and leaves the connection
+// open, the 125-byte limit is accepted, and a closed connection reports
+// the close, never a silent success.
+func TestAppPingValidation(t *testing.T) {
+	t.Parallel()
+	srv := startServer(t)
+	defer srv.Close()
+	c := mustDial(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/echo")
+
+	err := c.Ping(make([]byte, 126))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("126-byte ping: %v, want a size refusal", err)
+	}
+	err = c.Ping(make([]byte, 125))
+	if err != nil {
+		t.Fatalf("125-byte ping: %v, want success", err)
+	}
+	// The connection is still open after the refusal: a normal write goes
+	// through.
+	err = c.WriteText("still here")
+	if err != nil {
+		t.Fatalf("write after a refused ping: %v", err)
+	}
+	_ = c.Close(ws.StatusNormalClosure, "")
+	err = c.Ping(nil)
+	if !errors.Is(err, ws.ErrClosed) {
+		t.Fatalf("ping on a closed connection: %v, want ErrClosed", err)
+	}
+}
+
 func TestEchoTextAndBinary(t *testing.T) {
 	s := startServer(t)
 	defer s.Close()

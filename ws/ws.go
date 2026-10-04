@@ -64,8 +64,8 @@
 // # Concurrency
 //
 //  1. [Conn.WriteMessage] and its natural-typed forms ([Conn.WriteText],
-//     [Conn.WriteBinary], [Conn.WriteJSON]) — plus [Conn.Close] — are safe
-//     to call from any goroutine.
+//     [Conn.WriteBinary], [Conn.WriteJSON]), [Conn.Ping] — plus
+//     [Conn.Close] — are safe to call from any goroutine.
 //  2. [Conn.ReadMessage] is not: read state is owned by the goroutine that
 //     pumps the connection. Never call ReadMessage from two goroutines.
 //  3. Between sequential ReadMessage calls in the same goroutine there are no
@@ -115,7 +115,7 @@
 //  3. wire format (the frame codec: readFrame, writeFrame)
 //  4. Conn (state, constructor, terminal handling)
 //  5. reading (ReadMessage, keepalive probe)
-//  6. writing and closing (WriteMessage, Close, Closed)
+//  6. writing and closing (WriteMessage, Ping, Close, Closed)
 //  7. connection accessors (ID, addresses, deadlines)
 //  8. options (Option/Config and every With* function)
 //  9. server (Upgrader.Upgrade, Handle)
@@ -657,6 +657,7 @@ type Conn struct {
 
 	id          uint64
 	subprotocol string
+	pongHandler func([]byte) // invoked inline by ReadMessage (the pumping goroutine)
 
 	state         atomic.Int32 // stOpen or stClosed
 	closeErr      error        // valid once state == stClosed; guarded by c.mu
@@ -982,6 +983,9 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 
 			continue
 		case OpPong:
+			if c.pongHandler != nil {
+				c.pongHandler(frm.payload)
+			}
 
 			continue
 		case OpClose:
@@ -1406,6 +1410,29 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	return writeErr
 }
 
+// Ping sends an application-level ping frame carrying the given payload
+// (RFC 6455 §5.5). It is safe to call from any goroutine, exactly as
+// [Conn.WriteMessage]: the write takes the write mutex, obeys the
+// connection's write bound, and on a closed connection yields the recorded
+// close error — [ErrClosed] after a normal closure — never a silent
+// success.
+//
+// The peer answers with a pong carrying the same payload. Pongs are
+// consumed transparently unless a [WithPongHandler] was set, which is the
+// half that makes the pair useful for round-trip-time measurement: ping,
+// and time the handler's wake. Any frame — the pong included — resets the
+// keepalive idle clock, so an application ping also proves liveness.
+//
+// A ping is a control frame, so its payload is at most 125 bytes.
+func (c *Conn) Ping(payload []byte) error {
+	if len(payload) > maxControlPayload {
+		return fmt.Errorf("%w: ping payload of %d bytes exceeds the %d byte control-frame limit",
+			errProtocol, len(payload), maxControlPayload)
+	}
+
+	return c.writeFrame(OpPing, payload, false)
+}
+
 // WriteText writes s as a text message. If s is not valid UTF-8 it is
 // rejected before reaching the wire, exactly as any OpText write
 // (RFC 6455 §5.6).
@@ -1517,8 +1544,8 @@ func (c *Conn) Closed() bool {
 // ─────────────────────────────────────────────────────────────────────────────
 // 7 · Connection accessors
 
-// ID returns a unique identifier for the connection, useful as a key in
-// session registries.
+// ID returns a unique identifier for the connection (unique within this
+// process), useful as a key in session registries.
 func (c *Conn) ID() uint64 { return c.id }
 
 // Subprotocol returns the negotiated subprotocol, or "" if none.
@@ -1574,6 +1601,9 @@ type Config struct {
 	// Unexported client-only state.
 	tlsConfigClient *tls.Config
 	dialTimeout     time.Duration
+
+	// Unexported shared state.
+	pongHandler func([]byte)
 }
 
 // Options shared by server and client.
@@ -1650,6 +1680,17 @@ func WithIdleTimeout(d time.Duration) Option {
 // the default, never by "unbounded".
 func WithWriteTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.WriteTimeout = d }
+}
+
+// WithPongHandler sets a handler for pong frames received on the
+// connection; pongs are otherwise consumed transparently and never reach
+// the application. The handler is invoked inline by [Conn.ReadMessage], in
+// the pumping goroutine itself, so it must be fast and non-blocking — the
+// usual use is recording the arrival of the answer to an application
+// [Conn.Ping]. It is never invoked from any other goroutine, and never
+// after ReadMessage has returned a terminal error.
+func WithPongHandler(handler func(payload []byte)) Option {
+	return func(cfg *Config) { cfg.pongHandler = handler }
 }
 
 // sanitizeLimits repairs non-sensical limits so a misconfiguration can
@@ -1742,6 +1783,32 @@ func WithTLSClientCert(cert *x509.Certificate, key any) Option {
 	}
 }
 
+// WithTLSClientChain enables mTLS with a full client certificate: cert
+// plus its intermediate chain, presented leaf-first. Server certificate
+// verification uses the system root store (or
+// tls.Config.InsecureSkipVerify, set via [WithTLS]). For a single
+// certificate, [WithTLSClientCert] suffices. When combining [WithTLS] with
+// this option, pass [WithTLS] first: options apply in order and [WithTLS]
+// replaces the whole configuration.
+func WithTLSClientChain(cert *x509.Certificate, chain []*x509.Certificate, key any) Option {
+	return func(cfg *Config) {
+		clientTLS := cfg.tlsConfigClient
+		if clientTLS == nil {
+			clientTLS = &tls.Config{}
+		}
+		// A tls.Certificate is the whole chain, leaf first.
+		fullChain := make([][]byte, 0, len(chain)+1)
+		fullChain = append(fullChain, cert.Raw)
+		for _, intermediate := range chain {
+			fullChain = append(fullChain, intermediate.Raw)
+		}
+		clientTLS.Certificates = []tls.Certificate{
+			{Certificate: fullChain, PrivateKey: key},
+		}
+		cfg.tlsConfigClient = clientTLS
+	}
+}
+
 // WithDialTimeout bounds the connect + handshake time (default: the context
 // deadline, if any).
 func WithDialTimeout(d time.Duration) Option {
@@ -1763,6 +1830,7 @@ type Upgrader struct {
 	preHandshake      []func(r *http.Request) error
 	compressEnabled   bool
 	compressLevel     int // flate level, as configured
+	pingHandler       func([]byte)
 }
 
 // NewUpgrader creates an Upgrader with sensible defaults: strict same-origin
@@ -1796,6 +1864,7 @@ func NewUpgrader(opts ...Option) *Upgrader {
 		preHandshake:      cfg.PreHandshake,
 		compressEnabled:   cfg.Compression,
 		compressLevel:     cfg.CompressionLevel,
+		pingHandler:       cfg.pongHandler,
 	}
 }
 
@@ -2046,15 +2115,25 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
 
+	return u.finishSession(raw, buf, protocol, sessionOpts.data, extension), nil
+}
+
+// finishSession assembles the upgraded connection: the frame codec on the
+// hijacked stream, the negotiated session state, and the permessage-deflate
+// switch when the extension was granted.
+func (u *Upgrader) finishSession(raw net.Conn, buf *bufio.ReadWriter, protocol string,
+	data any, extension string,
+) *Conn {
 	conn := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
-	conn.handshakeData = sessionOpts.data
+	conn.handshakeData = data
+	conn.pongHandler = u.pingHandler
 	if extension != "" {
 		conn.applyCompression()
 		conn.compressLevel = u.compressLevel
 	}
 
-	return conn, nil
+	return conn
 }
 
 // negotiateExtensions runs permessage-deflate negotiation when compression is
@@ -2076,7 +2155,11 @@ func (u *Upgrader) negotiateExtensions(request *http.Request) (string, error) {
 // error, a keepalive timeout — closes with 1011 (unexpected condition),
 // because the session did not end normally. An out-of-range code on a
 // returned *CloseError is remapped to 1002 so the connection is always torn
-// down. When the handler's error already tore the connection down (the
+// down. An application close code must be a usable one — in 1000-4999 and
+// not one of the codes that cannot appear on the wire (1004, 1005, 1006,
+// 1015): a must-not-set code goes out as an empty payload, which the peer
+// reads as a clean close (io.EOF from ReadMessage), so the application's
+// code is lost. When the handler's error already tore the connection down (the
 // common case for transport errors: ReadMessage fails and records the
 // error), the recorded close wins and nothing more goes on the wire.
 //
@@ -2533,6 +2616,7 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 
 	session := newConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
 	session.subprotocol = subprotocol
+	session.pongHandler = cfg.pongHandler
 	if compressed {
 		session.applyCompression()
 		session.compressLevel = cfg.CompressionLevel
