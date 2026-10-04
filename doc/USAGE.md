@@ -136,10 +136,13 @@ WithDialTimeout(d)
 
 Protocol details: masking enforced both directions, fragmentation support on
 read, control-frame validation, ping/pong handled transparently (auto-pong),
-subprotocol negotiation with client-side echo verification (RFC 6455 §1.9 —
-the dial fails if the server selects a token the client never offered, or
-several at once), close-code semantics per RFC 6455, and CR/LF rejection in
-client request headers and subprotocols.
+UTF-8 validation on text frames (RFC 6455 §5.6 — a non-UTF-8 text message
+fails the connection with 1007, the close Node's ws and browsers use for
+exactly this; `WriteMessage(OpText, …)` with invalid UTF-8 is refused before
+it reaches the wire), subprotocol negotiation with client-side echo
+verification (RFC 6455 §1.9 — the dial fails if the server selects a token
+the client never offered, or several at once), close-code semantics per RFC
+6455, and CR/LF rejection in client request headers and subprotocols.
 
 ## Security
 

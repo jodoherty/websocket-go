@@ -69,7 +69,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **94.9% branch coverage** (373 of 393
+    no-match). The library sits at **95.0% branch coverage** (377 of 397
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -135,7 +135,11 @@ one the client offered, and only one; `checkSubprotocolEcho`), the
 permessage-deflate RSV state machine (RSV1 is legal only on the first
 frame of a negotiated compressed data message; RSV1 on a control or
 continuation frame, or RSV1 without the extension, is a 1002 protocol
-error; RSV2/RSV3 are always errors), client-side verification of the
+error; RSV2/RSV3 are always errors), UTF-8 validation on text frames
+(RFC 6455 §5.6 — a non-UTF-8 text message, whole, reassembled from
+fragments, or compressed, fails the connection with 1007, the close Node's
+ws and browsers use; an OpText write that is not valid UTF-8 is refused
+before it reaches the wire), client-side verification of the
 server's permessage-deflate response (the extension must be one the client
 offered, at most once, and must not demand more of the client's compressor
 than it allows), and option limits that fall back to the defaults rather

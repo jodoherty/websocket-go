@@ -98,6 +98,11 @@
 //     produced from the stdlib flate writer by Flush (not Close, which would
 //     emit a BFINAL=1 Huffman block, not the RFC wire encoding) and dropping
 //     the final four octets of the BFINAL=0 empty block that Flush appends.
+//   - Close code for non-UTF-8 text. RFC 6455 §5.6 mandates closing on a
+//     non-UTF-8 text frame but names no code; Node's ws receiver fails such
+//     frames with 1007 (WS_ERR_INVALID_UTF8), as do browsers per the WHATWG
+//     spec, so this package fails with 1007 (invalid data type) — the
+//     interop-correct choice for §7.4.
 //
 // # File map
 //
@@ -324,6 +329,7 @@ var errProtocol = errors.New("ws: protocol violation")
 
 // errMessageTooBig marks a frame or message that exceeds maxMessageSize.
 var errMessageTooBig = errors.New("ws: message exceeds size limit")
+var errInvalidUTF8 = errors.New("ws: text message is not valid UTF-8")
 
 // Static error bases, wrapped with context where the detail varies.
 var (
@@ -905,11 +911,16 @@ func (c *Conn) finish(err error) error {
 //
 // Pings and pongs are handled transparently: incoming pings are answered
 // automatically and pongs are consumed, so neither appears in the return
-// values. When the idle timeout is enabled and a blocking read has been
-// silent for the window, a ping is sent inline and the read re-arms; if
-// the peer is still silent after a second window the read fails with a
-// timeout. All of this is inline — no background goroutine — so a
-// silently dead peer is detected within about two windows.
+// values. Text messages must be valid UTF-8 (RFC 6455 §5.6): a text
+// message that is not — whole or reassembled from fragments — fails the
+// connection with 1007 (invalid data type), the close the browser
+// implementations use for exactly this. Binary messages are never checked.
+//
+// When the idle timeout is enabled and a blocking read has been silent for
+// the window, a ping is sent inline and the read re-arms; if the peer is
+// still silent after a second window the read fails with a timeout. All of
+// this is inline — no background goroutine — so a silently dead peer is
+// detected within about two windows.
 //
 // ReadMessage must only be called from one goroutine at a time.
 func (c *Conn) ReadMessage() (int, []byte, error) {
@@ -998,6 +1009,7 @@ func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
 	if !complete {
 		return 0, nil, false, nil
 	}
+	out := payload
 	if compressed {
 		c.fragCompressed = false
 		expanded, err := c.decompress(payload)
@@ -1005,10 +1017,19 @@ func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
 			return 0, nil, false, err
 		}
 
-		return msgOp, expanded, true, nil
+		out = expanded
+	}
+	if msgOp == OpText && !utf8.Valid(out) {
+		// RFC 6455 §5.6: a peer MUST close on a non-UTF-8 text frame; 1007
+		// is the close the browser implementations assign to exactly this.
+		// Close records the error, so the finish in the read loop reports
+		// it.
+		_ = c.Close(StatusInvalidDataType, "text message is not valid UTF-8")
+
+		return 0, nil, false, fmt.Errorf("%w: text message is not valid UTF-8", errProtocol)
 	}
 
-	return msgOp, payload, true, nil
+	return msgOp, out, true, nil
 }
 
 // keepaliveTimeout processes a read error against the keepalive clock. It
@@ -1238,6 +1259,10 @@ func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 // from any goroutine. Writes do not fragment: the message is sent in a
 // single frame, so messages must fit within maxMessageSize.
 //
+// OpText payloads must be valid UTF-8 (RFC 6455 §5.6): an OpText write that
+// is not fails before anything reaches the wire, and the connection stays
+// open; OpBinary payloads pass through untouched.
+//
 // On a closed connection WriteMessage always fails: with the recorded close
 // error, or [ErrClosed] after a normal closure (1000) — never a silent
 // success for a frame that will not be sent.
@@ -1250,6 +1275,11 @@ func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	if opcode != OpText && opcode != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
+	}
+	if opcode == OpText && !utf8.Valid(data) {
+		// RFC 6455 §5.6: text frames must be valid UTF-8. Refused before
+		// anything reaches the wire; the connection stays open.
+		return fmt.Errorf("%w: %d bytes", errInvalidUTF8, len(data))
 	}
 	if int64(len(data)) > c.fc.maxMsg {
 		return fmt.Errorf("%w: message of %d bytes exceeds the %d byte limit",

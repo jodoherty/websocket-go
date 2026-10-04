@@ -22,6 +22,7 @@ const (
 	testMCDCCloseCode           = "TestMCDCCloseCode"
 	testMCDCWebSocketKey        = "TestMCDCWebSocketKey"
 	testMCDCSubprotocol         = "TestMCDCSubprotocol"
+	testMCDCTextUTF8            = "TestMCDCTextUTF8"
 	testMCDCUpgrade101          = "TestMCDCUpgrade101"
 	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
 	testMCDCTruncateReason      = "TestMCDCTruncateReason"
@@ -62,6 +63,7 @@ func registry() []decisionTrace {
 	traces := frameTraces()
 	traces = append(traces, closeTraces()...)
 	traces = append(traces, handshakeTraces()...)
+	traces = append(traces, textUTF8Traces()...)
 	traces = append(traces, compressionTraces()...)
 
 	return append(traces, serverTraces()...)
@@ -268,6 +270,40 @@ func handshakeTraces() []decisionTrace {
 				// A 101 without "Connection: Upgrade" is rejected; with both
 				// tokens it is accepted.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCUpgrade101, "connection"},
+			},
+		},
+	}
+}
+
+// textUTF8Traces covers the RFC 6455 §5.6 text-UTF-8 decisions on both
+// sides of the wire.
+func textUTF8Traces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go: opcode == OpText && !utf8.Valid(data) (WriteMessage)
+		{
+			expr:       "opcode == OpText && !utf8.Valid(data)",
+			conditions: []string{"opcode == OpText", "!utf8.Valid(data)"},
+			pairs: []pairTrace{
+				// An OpText write of invalid UTF-8 fails; the same bytes
+				// as OpBinary succeed (the opcode flips the check on).
+				{0, []bool{true, true}, []bool{false, true}, testMCDCTextUTF8, "write-opcode"},
+				// An OpText write of invalid UTF-8 fails; valid text
+				// succeeds (the validity flips the outcome).
+				{1, []bool{true, true}, []bool{true, false}, testMCDCTextUTF8, "write-utf8"},
+			},
+		},
+		// ws.go: msgOp == OpText && !utf8.Valid(out) (Conn.readData)
+		{
+			expr:       "msgOp == OpText && !utf8.Valid(out)",
+			conditions: []string{"msgOp == OpText", "!utf8.Valid(out)"},
+			pairs: []pairTrace{
+				// Invalid bytes in a text frame fail with 1007; the same
+				// bytes in a binary frame are delivered (the opcode flips
+				// the check on).
+				{0, []bool{true, true}, []bool{false, true}, testMCDCTextUTF8, "read-opcode"},
+				// Invalid text fails with 1007; valid text is delivered
+				// (the validity flips the outcome).
+				{1, []bool{true, true}, []bool{true, false}, testMCDCTextUTF8, "read-utf8"},
 			},
 		},
 	}
