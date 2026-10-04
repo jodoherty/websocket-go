@@ -8,14 +8,18 @@ import (
 	"time"
 )
 
-// This file hammers the Conn state machine from multiple goroutines to find
-// data races, lost close codes, and deadlocks. Run with:
+// This file hammers the session and raw state machines from multiple
+// goroutines to find data races, lost close codes, and deadlocks. Run with:
 //
-//	go test ./ws -race -run TestConcurrent -count=5
+//	go test ./ws -race -count=5 -run
+//	'TestConcurrent|TestAutoPong|TestPongConcurrent|TestRawConcurrent|TestRead|TestWrite'
 //
 // The documented contract under test:
-//   - WriteMessage and Close are safe from any goroutine.
-//   - ReadMessage is single-goroutine, but may race with a concurrent Close.
+//   - WriteMessage, WriteFrame, Pong, and Close are safe from any goroutine.
+//   - ReadMessage / ReadEvent is single-goroutine, but may race with a
+//     concurrent Close — and the read goroutine may itself write (session
+//     auto-pong, the raw application's pong answer), so the write path
+//     must survive reader-goroutine writes interleaved with app writes.
 //   - The first close wins; every other caller observes the same recorded
 //     error, and closeErr is stable once state becomes stClosed.
 //
@@ -285,6 +289,216 @@ func TestWriteAfterCloseErrors(t *testing.T) {
 		err = c2.WriteMessage(OpText, []byte("x"))
 		if !errors.Is(err, ErrClosed) {
 			t.Fatalf("iteration %d: write after normal close = %v, want ErrClosed", i, err)
+		}
+	}
+}
+
+// TestAutoPongInterleavesWithAppWrites is the production interleaving the
+// other tests in this file do not create: the session read goroutine
+// answers pings with pongs inline, so it writes on the very write path the
+// app's writer goroutines use. The write mutex and the write scratch must
+// survive reader-goroutine writes interleaved with app writes; the race
+// detector is the judge.
+func TestAutoPongInterleavesWithAppWrites(t *testing.T) {
+	for i := range stressIters(t) {
+		sr, cr := net.Pipe()
+		peer := newRawConn(sr, sr, false, 1<<20, 0, 0)
+		c := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
+
+		// peer's read loop consumes c's app text and c's auto-pongs.
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			for {
+				_, eventErr := peer.ReadEvent()
+				if eventErr != nil {
+					return
+				}
+			}
+		}()
+
+		// c's read loop: auto-pongs every ping and stays alive until
+		// close — pings are consumed inline, data frames never arrive.
+		cTerm := make(chan error, 1)
+		go func() {
+			for {
+				_, _, err := c.ReadMessage()
+				if err != nil {
+					cTerm <- err
+					return
+				}
+			}
+		}()
+
+		const writers = 4
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Go(func() {
+				for {
+					writeErr := c.WriteMessage(OpText, []byte("app-write"))
+					if writeErr != nil {
+						return
+					}
+				}
+			})
+		}
+
+		// Feed c pings so its read goroutine auto-pongs — writes — while
+		// the app writers run.
+		for k := range 16 {
+			pingErr := peer.WriteFrame(OpPing, []byte{byte(k)}, false)
+			if pingErr != nil {
+				break
+			}
+		}
+
+		_ = c.Close(StatusNormalClosure, "")
+		wg.Wait()
+		select {
+		case err := <-cTerm:
+			if err == nil {
+				t.Fatalf("iteration %d: c's read loop ended with nil error", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: c's read loop did not terminate", i)
+		}
+		select {
+		case <-peerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: peer's read loop did not terminate", i)
+		}
+	}
+}
+
+// TestPongConcurrentWithWrites pins the "Pong is safe from any goroutine"
+// half of the contract on the raw face, where Pong lives (the session
+// surface does not expose it): dedicated Pong goroutines and WriteFrame
+// goroutines hammer the same write path, ending in a Close.
+func TestPongConcurrentWithWrites(t *testing.T) {
+	for i := range stressIters(t) {
+		sr, cr := net.Pipe()
+		peer := newRawConn(sr, sr, false, 1<<20, 0, 0)
+		c := newRawConn(cr, cr, true, 1<<20, 0, 0)
+
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			for {
+				_, eventErr := peer.ReadEvent()
+				if eventErr != nil {
+					return
+				}
+			}
+		}()
+
+		const writers = 4
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Go(func() {
+				for {
+					writeErr := c.WriteFrame(OpText, []byte("x"), false)
+					if writeErr != nil {
+						return
+					}
+				}
+			})
+		}
+		for range 2 {
+			wg.Go(func() {
+				for {
+					pongErr := c.Pong([]byte("probe"))
+					if pongErr != nil {
+						return
+					}
+				}
+			})
+		}
+		_ = c.Close(StatusNormalClosure, "")
+		wg.Wait()
+		select {
+		case <-peerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: peer's read loop did not terminate", i)
+		}
+	}
+}
+
+// TestRawConcurrentReadWriteClose is the raw face under the same stress:
+// a ReadEvent loop that answers pings with Pong — the documented raw
+// pattern, the application is the responder — while app writers hammer
+// WriteFrame and a final Close lands. Raw mode has no auto-pong, so this
+// is the only way the read goroutine writes here.
+func TestRawConcurrentReadWriteClose(t *testing.T) {
+	for i := range stressIters(t) {
+		sr, cr := net.Pipe()
+		peer := newRawConn(sr, sr, false, 1<<20, 0, 0)
+		c := newRawConn(cr, cr, true, 1<<20, 0, 0)
+
+		peerDone := make(chan struct{})
+		go func() {
+			defer close(peerDone)
+			for {
+				_, eventErr := peer.ReadEvent()
+				if eventErr != nil {
+					return
+				}
+			}
+		}()
+
+		// c's read loop answers pings itself, exactly as the raw
+		// examples do — the read goroutine writes the pong.
+		cTerm := make(chan error, 1)
+		go func() {
+			for {
+				ev, err := c.ReadEvent()
+				if err != nil {
+					cTerm <- err
+					return
+				}
+				if ev.Op == OpPing {
+					pingErr := c.Pong(ev.Payload)
+					if pingErr != nil {
+						cTerm <- pingErr
+						return
+					}
+				}
+			}
+		}()
+
+		const writers = 4
+		var wg sync.WaitGroup
+		for range writers {
+			wg.Go(func() {
+				for {
+					writeErr := c.WriteFrame(OpText, []byte("raw-write"), false)
+					if writeErr != nil {
+						return
+					}
+				}
+			})
+		}
+
+		for k := range 16 {
+			pingErr := peer.WriteFrame(OpPing, []byte{byte(k)}, false)
+			if pingErr != nil {
+				break
+			}
+		}
+
+		_ = c.Close(StatusNormalClosure, "")
+		wg.Wait()
+		select {
+		case err := <-cTerm:
+			if err == nil {
+				t.Fatalf("iteration %d: raw read loop ended with nil error", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: raw read loop did not terminate", i)
+		}
+		select {
+		case <-peerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: peer's read loop did not terminate", i)
 		}
 	}
 }

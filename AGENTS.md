@@ -176,7 +176,10 @@ ws/dial_test.go       Dial URL→target resolution: default ports, explicit
 ws/longrunning_test.go write-deadline wedge regression + Closed() signal,
                     transport-write failure failing the connection, Close's
                     write-deadline bound
-ws/concurrency_test.go close state machine under concurrent stress (-race)
+ws/concurrency_test.go concurrent-stress suite (-race): the close state
+                    machine, writer-vs-close, read-vs-close, and the
+                    reader-goroutine write paths (session auto-pong and
+                    raw application pong interleaved with app writes)
 ws/bench_test.go    codec + round-trip benchmarks
 ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
 ws/branches_test.go error-branch coverage: malformed frames, control/fragment
