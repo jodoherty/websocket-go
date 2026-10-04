@@ -45,9 +45,10 @@
 //  4. Close detection covers all four classes of death, funneled into the
 //     single ReadMessage return: a close frame from the peer, a transport
 //     error, a keepalive timeout (a silent peer is probed with a ping once
-//     silence reaches Upgrader.idleTimeout, and the connection is considered
-//     dead if it is still silent after a second window — all inline in the
-//     read path, no background goroutines), and a local [Conn.Close] call.
+//     silence reaches the idle timeout, [WithIdleTimeout], and the
+//     connection is considered dead if it is still silent after a second
+//     window — all inline in the read path, no background goroutines), and
+//     a local [Conn.Close] call.
 //
 // # Extensions
 //
@@ -172,11 +173,13 @@ const (
 	closeCodeMax = 4999
 )
 
-// Status codes that must (or should) not be set as a status in a close
-// frame payload (RFC 6455 §7.4).
+// Close codes this package never places in a close frame payload.
+// 1004 is reserved by RFC 6455 §7.4, and 1015 is reserved there as well —
+// designated for use by libraries to report a TLS handshake failure, not
+// for transmission.
 const (
-	closeCodeUnexpected = 1004 // received an unexpected or unsupported status
-	closeCodeTLSFailure = 1015 // TLS handshake failure
+	closeCodeUnexpected = 1004 // RFC 6455 §7.4: reserved, no assigned meaning
+	closeCodeTLSFailure = 1015 // library-designated: TLS handshake failure
 )
 
 // Frame opcodes (RFC 6455 §5.2).
@@ -299,8 +302,9 @@ func (e *CloseError) Error() string {
 }
 
 // CloseCode extracts the close code and reason from an error returned by
-// [Conn.ReadMessage] or stored on a connection. ok is false if the error
-// does not carry a close code.
+// [Conn.ReadMessage], by a write that failed with the connection's
+// recorded close error, or from [Conn.Close] itself. ok is false if the
+// error does not carry a close code.
 func CloseCode(err error) (int, string, bool) {
 	closeErr, ok := errors.AsType[*CloseError](err)
 	if ok {
@@ -888,10 +892,11 @@ func (c *Conn) finish(err error) error {
 //
 // Pings and pongs are handled transparently: incoming pings are answered
 // automatically and pongs are consumed, so neither appears in the return
-// values. When the idle timeout is enabled and no frame has been received
-// within the window, a ping is sent inline before the blocking read, which
-// bounds detection of a silently dead peer to the idle timeout without any
-// background goroutine.
+// values. When the idle timeout is enabled and a blocking read has been
+// silent for the window, a ping is sent inline and the read re-arms; if
+// the peer is still silent after a second window the read fails with a
+// timeout. All of this is inline — no background goroutine — so a
+// silently dead peer is detected within about two windows.
 //
 // ReadMessage must only be called from one goroutine at a time.
 func (c *Conn) ReadMessage() (int, []byte, error) {
@@ -1020,9 +1025,9 @@ func (c *Conn) keepaliveTimeout(err error) (bool, error) {
 // code, tear down, and report the outcome.
 //
 // A close frame without a payload closes normally (1005 "no status"). A
-// payload must carry a usable status code — in 1000-4999 and none of the
-// codes that must or should not be set as a status on the wire (1004, 1005,
-// 1006, 1015; RFC 6455 §7.4) — or the connection is failed with 1002
+// payload must carry a usable status code — in 1000-4999, not one of the
+// codes that MUST NOT be set on the wire (1005, 1006, 1015), and not the
+// reserved 1004 (RFC 6455 §7.4) — or the connection is failed with 1002
 // (§7.1.5); an unusable code is never echoed back.
 func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
 	if len(payload) == 1 {
@@ -1054,10 +1059,11 @@ func (c *Conn) failProtocol(what string) error {
 	return c.finish(err)
 }
 
-// mustNotSetCloseCode reports whether code must (or should) not appear as a
-// status code in a close frame payload (RFC 6455 §7.4): 1004 (SHOULD NOT),
-// and 1005, 1006, 1015 (MUST NOT). Such codes go out with an empty payload,
-// and a close frame received with one is a protocol error.
+// mustNotSetCloseCode reports whether code may not appear as a status code
+// in a close frame payload. 1005, 1006, and 1015 MUST NOT be set (RFC 6455
+// §7.4); 1004 is reserved there and is treated as unusable as well. Such
+// codes go out with an empty payload, and a close frame received with one
+// is a protocol error.
 func mustNotSetCloseCode(code int) bool {
 	switch code {
 	case closeCodeUnexpected, StatusNoStatusReceived, StatusAbnormalClosure, closeCodeTLSFailure:
@@ -1068,7 +1074,8 @@ func mustNotSetCloseCode(code int) bool {
 }
 
 // usableCloseCode reports whether code is a usable status code in a close
-// frame payload: in 1000-4999 and not reserved (see mustNotSetCloseCode).
+// frame payload: in 1000-4999 and not must-not-set or reserved (see
+// mustNotSetCloseCode).
 func usableCloseCode(code int) bool {
 	return code >= closeCodeMin && code <= closeCodeMax && !mustNotSetCloseCode(code)
 }
@@ -1276,9 +1283,9 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 // reason before tearing down the transport. It is idempotent and safe to
 // call from any goroutine, including the pumping goroutine.
 //
-// Close codes must be in the range 1000-4999. Codes that must (or should)
-// not be set as a status on the wire — 1004, 1005, 1006, 1015 — go out with
-// an empty payload. The return value is the terminal error recorded on the
+// Close codes must be in the range 1000-4999. Codes that cannot appear as a
+// status on the wire — 1005, 1006, 1015 (MUST NOT, RFC 6455 §7.4) plus the
+// reserved 1004 — go out with an empty payload. The return value is the terminal error recorded on the
 // connection — nil for a normal closure (1000), a [*CloseError] otherwise —
 // not the status of the close-frame write, which is best effort: the kernel
 // delivers queued data before the FIN, so the frame reaches the peer in
@@ -1420,15 +1427,16 @@ func WithCompression(enabled bool) Option {
 // intermediate tiers, flate.BestCompression; the default is
 // flate.DefaultCompression). It only has an effect when [WithCompression] is
 // enabled. Compressed messages trade CPU for bandwidth; on high-throughput
-// byte tunnels (the VNC-shaped example in doc/USAGE.md) flate.BestSpeed or
+// byte tunnels (a screen stream, a file relay) flate.BestSpeed or
 // flate.DefaultCompression is usually the right call.
 func WithCompressionLevel(level int) Option {
 	return func(cfg *Config) { cfg.CompressionLevel = level }
 }
 
 // WithMaxMessageSize sets the maximum size of a single message (default
-// 16 MiB) on either side. Frames and fragmented messages beyond the limit
-// terminate the connection. For chat-style traffic the OWASP WebSocket
+// 16 MiB) on either side. Frames and fragmented messages received beyond
+// the limit terminate the connection; a local WriteMessage over the limit
+// simply returns an error. For chat-style traffic the OWASP WebSocket
 // guidance is far lower — 64 KiB is a sane cap; set it per endpoint.
 // A non-positive limit is not meaningful and is replaced by the default.
 func WithMaxMessageSize(n int64) Option {
@@ -1534,8 +1542,10 @@ func WithTLS(tlsConfig *tls.Config) Option {
 
 // WithTLSClientCert enables mTLS by presenting the given client certificate
 // and key. Server certificate verification uses the system root store
-// (or cfg.InsecureSkipVerify if you say so via [WithTLS]). For custom root
-// stores or SNI control, use [WithTLS] directly.
+// (or tls.Config.InsecureSkipVerify, set via [WithTLS]). For custom root
+// stores or SNI control, use [WithTLS] directly. When combining [WithTLS]
+// with this option, pass [WithTLS] first: options apply in order and
+// [WithTLS] replaces the whole configuration.
 func WithTLSClientCert(cert *x509.Certificate, key any) Option {
 	return func(cfg *Config) {
 		clientTLS := cfg.tlsConfigClient
@@ -1662,8 +1672,12 @@ func rejectStatus(writer http.ResponseWriter, status int, msg string) *UpgradeEr
 }
 
 // checkHandshakeHeaders validates the websocket protocol headers on the
-// request and returns its Sec-WebSocket-Key. Rejections write the HTTP
-// error response themselves.
+// request and returns its Sec-WebSocket-Key (RFC 6455 §4.1-§4.2): the
+// Connection and Upgrade tokens, a supported Sec-WebSocket-Version, and a
+// well-formed Sec-WebSocket-Key — the base64 of exactly 16 octets. Each
+// rejection writes the HTTP error response itself; the version-mismatch
+// response additionally names the version(s) the server understands, per
+// §4.2.
 func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
 	if !headerContainsToken(request.Header, "Connection", "Upgrade") {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Connection: Upgrade header")
@@ -1715,7 +1729,9 @@ func (u *Upgrader) checkPolicy(writer http.ResponseWriter, request *http.Request
 	return nil
 }
 
-// writeSwitchingProtocols writes the 101 handshake response.
+// writeSwitchingProtocols writes the 101 Switching Protocols response with
+// the accept key and, when negotiated, the selected subprotocol and
+// extension header (RFC 6455 §4.1).
 func writeSwitchingProtocols(conn net.Conn, protocol, accept, extension string) error {
 	var resp bytes.Buffer
 	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
@@ -1904,6 +1920,9 @@ func defaultCheckOrigin(request *http.Request) bool {
 	return origin == scheme+"://"+request.Host
 }
 
+// headerContainsToken reports whether header key holds token in any of its
+// (comma-separated) values, case-insensitively, per the RFC 6455 handshake
+// token checks.
 func headerContainsToken(h http.Header, key, token string) bool {
 	for _, value := range h[key] {
 		for part := range strings.SplitSeq(value, ",") {
@@ -1916,6 +1935,11 @@ func headerContainsToken(h http.Header, key, token string) bool {
 	return false
 }
 
+// negotiateProtocol selects the subprotocol for a handshake from the
+// server's advertised list and the client's Sec-WebSocket-Protocol request
+// (RFC 6455 §1.9): the first advertised token the client also requested,
+// or "" when there is no overlap — a handshake with no subprotocol is
+// legal.
 func negotiateProtocol(server []string, clientHeader string) string {
 	for _, advertised := range server {
 		for requested := range strings.SplitSeq(clientHeader, ",") {
@@ -1946,7 +1970,7 @@ type deflateParams struct {
 
 // splitExtensionGroups splits every extension header value into extension
 // groups (one per extension, comma-separated within a value), reading both
-// the RFC singular and the common plural header spellings (see
+// the RFC plural and the IANA singular header spellings (see
 // extHeaderSingular). Whitespace around a group is trimmed; empty groups
 // are dropped.
 func splitExtensionGroups(header http.Header) []string {

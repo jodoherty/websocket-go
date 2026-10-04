@@ -69,7 +69,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **94.9% branch coverage** (371 of 391
+    no-match). The library sits at **95.1% branch coverage** (372 of 391
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -126,7 +126,10 @@ and, with permessage-deflate, the bound is enforced on the *decompressed*
 size during inflate, so a high-ratio payload cannot inflate past it,
 failing with 1009), strict same-origin default, constant-time token
 comparison in the demo, TLS-only client-cert trust (verification is the
-TLS layer's, the library only checks presence), client-side verification
+TLS layer's, the library only checks presence), strict subprotocol token
+validation (RFC 6455 §1.9: 1#token over U+0021..U+007E minus the RFC 2616
+separators — a token containing a comma or similar could not corrupt or
+split the Sec-WebSocket-Protocol header), client-side verification
 of the server's subprotocol selection (RFC §1.9 — an echoed token must be
 one the client offered, and only one; `checkSubprotocolEcho`), the
 permessage-deflate RSV state machine (RSV1 is legal only on the first
