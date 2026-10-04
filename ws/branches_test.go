@@ -109,7 +109,7 @@ func TestKeepaliveProbeSequence(t *testing.T) {
 	sr, cr := net.Pipe()
 	defer cr.Close()
 	defer sr.Close()
-	c := newConn(cr, cr, true, 1<<20, 100*time.Millisecond, 0)
+	c := newSession(newRawConn(cr, cr, true, 1<<20, 100*time.Millisecond, 0), nil)
 
 	// Drain everything the conn sends (probe pings).
 	pings := make(chan int, 8)
@@ -154,7 +154,7 @@ func TestArmIdleDisabled(t *testing.T) {
 	sr, cr := net.Pipe()
 	defer cr.Close()
 	defer sr.Close()
-	c := newConn(cr, cr, true, 1<<20, 0, 0)
+	c := newRawConn(cr, cr, true, 1<<20, 0, 0)
 	c.lastActivity = time.Time{} // arbitrarily stale
 	armErr := c.armIdle()
 	if armErr != nil {
@@ -191,7 +191,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	})
 	t.Run("ping gets an automatic pong", func(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x89, 0x00, 0x81, 0x02, 'H', 'i'}}
-		c := newConn(fc, fc, true, 1<<20, 0, 0)
+		c := newSession(newRawConn(fc, fc, true, 1<<20, 0, 0), nil)
 		op, data, err := c.ReadMessage()
 		if err != nil || op != OpText || string(data) != "Hi" {
 			t.Fatalf("ReadMessage = (%d, %q, %v)", op, data, err)
@@ -233,7 +233,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 	})
 	t.Run("fragment overflow", func(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x01, 0x02, 'a', 'b', 0x80, 0x02, 'c', 'd'}}
-		c := newConn(fc, fc, true, 3, 0, 0) // maxMsg 3 < 2+2 total
+		c := newSession(newRawConn(fc, fc, true, 3, 0, 0), nil) // maxMsg 3 < 2+2 total
 		_, _, err := c.ReadMessage()
 		if err == nil || !errors.Is(err, errMessageTooBig) {
 			t.Fatalf("err = %v, want errMessageTooBig", err)
@@ -245,7 +245,7 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 // broken pipe must fail the write, and the codec must surface bufio errors.
 func TestWriteErrorPaths(t *testing.T) {
 	sr, cr := net.Pipe()
-	c := newConn(cr, cr, true, 1<<20, 0, 0)
+	c := newRawConn(cr, cr, true, 1<<20, 0, 0)
 	// Closing the peer's end breaks our writes: a synchronous pipe fails
 	// in-flight writes once the other end goes away.
 	_ = sr.Close() // intentional: break the peer's writes
@@ -269,7 +269,7 @@ func TestWriteErrorPaths(t *testing.T) {
 	// The codec itself must surface a failing underlying writer.
 	fw := &failWriter{}
 	fc := frameCodec{bw: bufio.NewWriter(fw), isClient: false, maxMsg: 1 << 20}
-	err := fc.writeFrame(OpText, []byte("x"), false)
+	err := fc.writeFrame(OpText, []byte("x"), false, true)
 	if err == nil {
 		t.Fatal("writeFrame over a failing writer returned nil")
 	}

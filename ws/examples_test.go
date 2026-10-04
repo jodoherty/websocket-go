@@ -291,8 +291,8 @@ func ExampleCloseCode() {
 // sequences should use OpBinary — it passes through with no validation.
 func ExampleConn_WriteText() {
 	sr, cr := net.Pipe()
-	server := newConn(sr, sr, false, 1<<20, 0, 0)
-	client := newConn(cr, cr, true, 1<<20, 0, 0)
+	server := newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil)
+	client := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
 	// net.Pipe is bidirectional, so both ends need readers; without them
 	// the teardown close frames would wait out the close-write deadline.
 	serverDone := make(chan struct{})

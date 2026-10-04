@@ -158,7 +158,7 @@ func buildMux() http.Handler {
 	)
 
 	// Plain upgrader sugar: the handler itself is the session.
-	mux.Handle("/ws/echo", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+	mux.Handle("/ws/echo", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
 		log.Printf("echo session %d from %s (subprotocol %q, compressed=%v)",
 			conn.ID(), conn.RemoteAddr(), conn.Subprotocol(), conn.Compressed())
 
@@ -168,7 +168,7 @@ func buildMux() http.Handler {
 	// Connection report: the browser WebSocket API exposes no negotiated
 	// extensions, so the Playwright permessage-deflate assertion reads the
 	// server-side view here.
-	mux.Handle("/ws/info", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+	mux.Handle("/ws/info", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
 		info := fmt.Sprintf(`{"compressed":%v,"subprotocol":%q}`,
 			conn.Compressed(), conn.Subprotocol())
 		writeErr := conn.WriteMessage(ws.OpText, []byte(info))
@@ -184,7 +184,7 @@ func buildMux() http.Handler {
 
 	// mTLS: the TLS layer verifies the client cert; RequireClientCert
 	// rejects any request that arrived without one.
-	mux.Handle("/ws/mtls", mtlsUp.Handle(func(request *http.Request, conn *ws.Conn) error {
+	mux.Handle("/ws/mtls", mtlsUp.Handle(func(request *http.Request, conn *ws.Session) error {
 		if cert := ws.ClientCert(request); cert != nil {
 			greeting := "hello, " + cert.Subject.CommonName
 			_ = conn.WriteMessage(ws.OpText, []byte(greeting))
@@ -194,7 +194,7 @@ func buildMux() http.Handler {
 	}))
 
 	// Controlled close: one message, then 1001 "going away".
-	mux.Handle("/ws/goodbye", echoUp.Handle(func(_ *http.Request, conn *ws.Conn) error {
+	mux.Handle("/ws/goodbye", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
 		_ = conn.WriteMessage(ws.OpText, []byte("hello"))
 		time.Sleep(goodbyeDelay)
 		_ = conn.Close(ws.StatusGoingAway, "going away")
@@ -295,7 +295,7 @@ func validToken(request *http.Request, token string) bool {
 
 // echo runs the read loop: every message is written back until the
 // connection closes (a 1000 close reads as io.EOF).
-func echo(conn *ws.Conn) error {
+func echo(conn *ws.Session) error {
 	for {
 		opcode, data, err := conn.ReadMessage()
 		if err != nil {

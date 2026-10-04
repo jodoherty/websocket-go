@@ -57,13 +57,20 @@ func (f *fakeConn) SetDeadline(time.Time) error      { return nil }
 func (f *fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
 
-// newTestConn builds a Conn whose read side is served from data. isClient
-// selects which side of the masking rule applies: as the client we expect
-// unmasked frames from the (server) peer; as the server we expect masked
-// frames from the (client) peer.
+// newTestConn builds a Session whose underlying read side is served from
+// data. isClient selects which side of the masking rule applies: as the
+// client we expect unmasked frames from the (server) peer; as the server
+// we expect masked frames from the (client) peer. Tests that need the raw
+// connection's internals use newTestRawConn.
 func newTestConn(data []byte, isClient bool) *Conn {
+	return newSession(newTestRawConn(data, isClient), nil)
+}
+
+// newTestRawConn is the pump-level equivalent of newTestConn: the raw
+// connection, no policy layer.
+func newTestRawConn(data []byte, isClient bool) *RawConn {
 	fc := &fakeConn{data: data}
-	return newConn(fc, fc, isClient, 1<<20, 0, 0)
+	return newRawConn(fc, fc, isClient, 1<<20, 0, 0)
 }
 
 // newTestCodec is the codec-level equivalent: decode frames from data with
@@ -159,7 +166,7 @@ func TestFrameCodecRoundtrip(t *testing.T) {
 
 				var sink bytes.Buffer
 				wc := frameCodec{bw: bufio.NewWriterSize(&sink, 16), isClient: isClient, maxMsg: 1 << 20}
-				err := wc.writeFrame(op, payload, false)
+				err := wc.writeFrame(op, payload, false, true)
 				if err != nil {
 					t.Fatalf("write (%v, %d, %d): %v", isClient, op, n, err)
 				}

@@ -23,7 +23,7 @@ hand-written editing.)
    directions** (the negotiated extension is asserted, and a 512 KiB binary
    round-trips compressed). Go client ↔ Node server verifies the same in
    reverse, including a custom 4001 close code and compressed traffic
-   (`Conn.Compressed()` asserted). See `doc/COMPRESSION.md` for the details
+   (`Session.Compressed()` asserted). See `doc/COMPRESSION.md` for the details
    the interop forced (header spelling, the decompression tail, the
    compressor's Flush-then-truncate shape).
 5. **Browser e2e** (`npm test`) — the user-visible surface in two real
@@ -32,9 +32,9 @@ hand-written editing.)
 6. **Race detector** (`go test -race ./...`) — the concurrency guarantees
    (write/close from any goroutine, single reader) hold under the
    scheduler's stress.
-7. **Concurrency stress tests** (`ws/concurrency_test.go`) — the `Conn`
-   state machine is hammered from many goroutines against the documented
-   contract: N simultaneous `Close` calls must all observe the same
+7. **Concurrency stress tests** (`ws/concurrency_test.go`) — the `Session`
+   (and `RawConn`) state machine is hammered from many goroutines against the
+   documented contract: N simultaneous `Close` calls must all observe the same
    winner's recorded error; `ReadMessage` racing a local `Close` must
    terminate consistently; many writers racing a `Close` must each get
    either success or the recorded error, never a torn state; and writes

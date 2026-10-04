@@ -14,7 +14,7 @@ func encodeDataFrame(t *testing.T, isClient bool, fin bool, opcode int, payload 
 	t.Helper()
 	var buf bytes.Buffer
 	fc := frameCodec{bw: bufio.NewWriter(&buf), isClient: isClient, maxMsg: 1 << 20}
-	err := fc.writeFrame(opcode, payload, false)
+	err := fc.writeFrame(opcode, payload, false, true)
 	if err != nil {
 		t.Fatalf("encodeDataFrame: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestTextUTF8Validation(t *testing.T) {
 		t.Parallel()
 		stream := deflateStream(t, bad)
 		frame := append([]byte{0xC1, byte(len(stream))}, stream...) //nolint:gosec // tiny stream, 7-bit length
-		c := deflateTestConn(frame, true)
+		c := newSession(deflateTestConn(frame, true), nil)
 		_, _, err := c.ReadMessage()
 		var cerr *CloseError
 		if !errors.As(err, &cerr) || cerr.Code != StatusInvalidDataType {

@@ -57,7 +57,7 @@ func (errDeadlineConn) Close() error                     { return nil }
 func TestWriteMessageValidationBranches(t *testing.T) {
 	// Validation fires before any I/O, so a never-writable transport is
 	// fine (and proves no frame was written).
-	c := newConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
+	c := newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 
 	writeErr := c.WriteMessage(OpPing, nil)
 	if writeErr == nil || !errors.Is(writeErr, errProtocol) {
@@ -66,7 +66,7 @@ func TestWriteMessageValidationBranches(t *testing.T) {
 
 	// A message one byte over the limit must be rejected before any
 	// frame is written.
-	limited := newConn(failWriteConn{}, failWriteConn{}, true, 16, 0, 0)
+	limited := newRawConn(failWriteConn{}, failWriteConn{}, true, 16, 0, 0)
 	writeErr = limited.WriteMessage(OpText, make([]byte, 17))
 	if writeErr == nil || !errors.Is(writeErr, errMessageTooBig) {
 		t.Fatalf("WriteMessage over MaxMessageSize = %v, want errMessageTooBig", writeErr)
@@ -100,7 +100,7 @@ func (d *deadlineRecordConn) Close() error                  { return nil }
 // operation starts with a clean deadline state.
 func TestWriteMessageClearsDeadlineOnCompressFailure(t *testing.T) {
 	rec := &deadlineRecordConn{}
-	c := newConn(rec, rec, true, 1<<20, 0, time.Second)
+	c := newRawConn(rec, rec, true, 1<<20, 0, time.Second)
 	// Force the compressor to fail at creation: an out-of-range flate
 	// level makes flate.NewWriter reject, so compress returns before any
 	// frame is written.
@@ -122,7 +122,7 @@ func TestWriteMessageClearsDeadlineOnCompressFailure(t *testing.T) {
 // TestCloseRejectsOutOfRangeCode pins the close-code range check in
 // Close: codes outside 1000-4999 are rejected before any I/O.
 func TestCloseRejectsOutOfRangeCode(t *testing.T) {
-	c := newConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
+	c := newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 
 	for _, code := range []int{999, 5000, 0} {
 		closeErr := c.Close(code, "bad")
@@ -211,14 +211,14 @@ func TestWriteFramePayloadFailure(t *testing.T) {
 
 	// Client side (masked payload).
 	clientFC := &frameCodec{bw: bufio.NewWriterSize(failWriteConn{}, bufSize), isClient: true, maxMsg: 1 << 20}
-	writeErr := clientFC.writeFrame(OpBinary, payload, false)
+	writeErr := clientFC.writeFrame(OpBinary, payload, false, true)
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "payload") {
 		t.Fatalf("masked writeFrame over failing transport = %v, want a payload write error", writeErr)
 	}
 
 	// Server side (unmasked payload).
 	serverFC := &frameCodec{bw: bufio.NewWriterSize(failWriteConn{}, bufSize), isClient: false, maxMsg: 1 << 20}
-	writeErr = serverFC.writeFrame(OpBinary, payload, false)
+	writeErr = serverFC.writeFrame(OpBinary, payload, false, true)
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "payload") {
 		t.Fatalf("unmasked writeFrame over failing transport = %v, want a payload write error", writeErr)
 	}
@@ -227,7 +227,7 @@ func TestWriteFramePayloadFailure(t *testing.T) {
 	// header write, reaching the header-error branch: once a flush has
 	// failed, the buffered writer refuses every later write, starting
 	// with the next frame's header.
-	writeErr = clientFC.writeFrame(OpBinary, payload, false)
+	writeErr = clientFC.writeFrame(OpBinary, payload, false, true)
 	if writeErr == nil || !strings.Contains(writeErr.Error(), "header") {
 		t.Fatalf("second writeFrame on the same codec = %v, want a header write error", writeErr)
 	}
@@ -250,7 +250,7 @@ func TestReadFrameTruncatedLength64(t *testing.T) {
 // TestArmIdleDeadlineFailure pins the armIdle error branch: a transport
 // that refuses SetReadDeadline must fail the read, not panic or retry.
 func TestArmIdleDeadlineFailure(t *testing.T) {
-	c := newConn(errDeadlineConn{}, errDeadlineConn{}, true, 1<<20, time.Second, 0)
+	c := newSession(newRawConn(errDeadlineConn{}, errDeadlineConn{}, true, 1<<20, time.Second, 0), nil)
 
 	_, _, err := c.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "simulated deadline failure") {
@@ -262,7 +262,7 @@ func TestArmIdleDeadlineFailure(t *testing.T) {
 // whose pong cannot be written must end the session with that error.
 func TestPongReplyFailure(t *testing.T) {
 	nc := &firstPingThenEOFConn{}
-	c := newConn(nc, nc, true, 1<<20, 0, 0)
+	c := newSession(newRawConn(nc, nc, true, 1<<20, 0, 0), nil)
 
 	_, _, err := c.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "simulated write failure") {
@@ -335,7 +335,7 @@ func (p *probePingConn) Close() error                     { return nil }
 // the session ends with that error (not a hang and not a kill).
 func TestProbePingWriteFailure(t *testing.T) {
 	pc := &probePingConn{}
-	c := newConn(pc, pc, true, 1<<20, 40*time.Millisecond, 0)
+	c := newSession(newRawConn(pc, pc, true, 1<<20, 40*time.Millisecond, 0), nil)
 
 	_, _, err := c.ReadMessage()
 	if err == nil || !strings.Contains(err.Error(), "simulated write failure") {

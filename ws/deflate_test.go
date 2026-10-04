@@ -41,10 +41,11 @@ func deflateStream(t *testing.T, data []byte) []byte {
 	return buf.Bytes()
 }
 
-// deflateTestConn builds a Conn served from data with permessage-deflate
-// pre-negotiated, so frame-level tests skip the handshake.
-func deflateTestConn(data []byte, isClient bool) *Conn {
-	c := newTestConn(data, isClient)
+// deflateTestConn builds a raw Conn served from data with permessage-deflate
+// pre-negotiated, so frame-level tests skip the handshake. It returns the
+// pump-level connection: tests that read messages wrap it in newSession.
+func deflateTestConn(data []byte, isClient bool) *RawConn {
+	c := newTestRawConn(data, isClient)
 	c.fc.deflate = true
 
 	return c
@@ -58,7 +59,7 @@ func deflateTestConn(data []byte, isClient bool) *Conn {
 // the connection must stay open for a later, smaller write.
 func TestWriteCompressedMessageOverLimitIsRefused(t *testing.T) {
 	fc := &fakeConn{}
-	c := newConn(fc, fc, true, 100, 0, 0)
+	c := newRawConn(fc, fc, true, 100, 0, 0)
 	c.fc.deflate = true
 	c.deflateNegotiated = true
 	c.compressLevel = flate.DefaultCompression
@@ -92,7 +93,7 @@ func TestWriteCompressedMessageOverLimitIsRefused(t *testing.T) {
 // message at the limit stays under it once compressed and is accepted.
 func TestWriteCompressedMessageAtLimitSucceeds(t *testing.T) {
 	fc := &fakeConn{}
-	c := newConn(fc, fc, true, 100, 0, 0)
+	c := newRawConn(fc, fc, true, 100, 0, 0)
 	c.fc.deflate = true
 	c.deflateNegotiated = true
 	c.compressLevel = flate.DefaultCompression
@@ -394,7 +395,7 @@ func TestDeflateFrameRSVRules(t *testing.T) {
 	t.Run("rsv1 data frame accepted when negotiated", func(t *testing.T) {
 		t.Parallel()
 		frm := append([]byte{0xC1, byte(len(stream))}, stream...) //nolint:gosec // small test stream, 7-bit length
-		c := deflateTestConn(frm, true)
+		c := newSession(deflateTestConn(frm, true), nil)
 		op, data, err := c.ReadMessage()
 		if err != nil || op != OpText || string(data) != "Hello" {
 			t.Fatalf("compressed text = (%d, %q, %v), want text \"Hello\"", op, data, err)
@@ -413,7 +414,7 @@ func TestDeflateFrameRSVRules(t *testing.T) {
 
 	t.Run("rsv1 on ping rejected", func(t *testing.T) {
 		t.Parallel()
-		c := deflateTestConn([]byte{0xC9, 0x01, 'x'}, true)
+		c := newSession(deflateTestConn([]byte{0xC9, 0x01, 'x'}, true), nil)
 		_, _, err := c.ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "control frame") {
 			t.Fatalf("RSV1 ping: %v, want control-frame protocol error", err)
@@ -422,7 +423,7 @@ func TestDeflateFrameRSVRules(t *testing.T) {
 
 	t.Run("rsv1 on continuation rejected", func(t *testing.T) {
 		t.Parallel()
-		c := deflateTestConn([]byte{0x01, 0x01, 'a', 0x40, 0x01, 'b'}, true)
+		c := newSession(deflateTestConn([]byte{0x01, 0x01, 'a', 0x40, 0x01, 'b'}, true), nil)
 		_, _, err := c.ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "continuation frame") {
 			t.Fatalf("RSV1 continuation: %v, want continuation-frame protocol error", err)
@@ -431,7 +432,7 @@ func TestDeflateFrameRSVRules(t *testing.T) {
 
 	t.Run("rsv2 rejected even when negotiated", func(t *testing.T) {
 		t.Parallel()
-		c := deflateTestConn([]byte{0xA1, 0x00}, true)
+		c := newSession(deflateTestConn([]byte{0xA1, 0x00}, true), nil)
 		_, _, err := c.ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "reserved bits 2 or 3") {
 			t.Fatalf("RSV2: %v, want reserved-bits protocol error", err)
@@ -440,7 +441,7 @@ func TestDeflateFrameRSVRules(t *testing.T) {
 
 	t.Run("rsv3 rejected even when negotiated", func(t *testing.T) {
 		t.Parallel()
-		c := deflateTestConn([]byte{0x91, 0x00}, true)
+		c := newSession(deflateTestConn([]byte{0x91, 0x00}, true), nil)
 		_, _, err := c.ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "reserved bits 2 or 3") {
 			t.Fatalf("RSV3: %v, want reserved-bits protocol error", err)
@@ -459,7 +460,7 @@ func TestDeflateFragmentedCompressedMessage(t *testing.T) {
 	frm = append(frm, stream[:mid]...)
 	frm = append(frm, 0x80, byte(len(stream)-mid)) //nolint:gosec // tiny test stream
 	frm = append(frm, stream[mid:]...)
-	c := deflateTestConn(frm, true)
+	c := newSession(deflateTestConn(frm, true), nil)
 	op, data, err := c.ReadMessage()
 	if err != nil || op != OpText || string(data) != "Hello fragmented world" {
 		t.Fatalf("fragmented compressed = (%d, %q, %v), want the full text", op, data, err)
@@ -689,7 +690,7 @@ func TestCompressedAllocationBudget(t *testing.T) {
 	}
 
 	t.Run("compress and write", func(t *testing.T) {
-		c := newTestConn(nil, false) // server side: unmasked frames
+		c := newTestRawConn(nil, false) // server side: unmasked frames
 		c.deflateNegotiated = true
 		c.compressLevel = flate.DefaultCompression
 		for range 3 { // warm up the compressor and grow the scratch
@@ -697,7 +698,7 @@ func TestCompressedAllocationBudget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = c.fc.writeFrame(OpBinary, c.compressBuf.Bytes(), true)
+			err = c.fc.writeFrame(OpBinary, c.compressBuf.Bytes(), true, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -707,7 +708,7 @@ func TestCompressedAllocationBudget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = c.fc.writeFrame(OpBinary, c.compressBuf.Bytes(), true)
+			err = c.fc.writeFrame(OpBinary, c.compressBuf.Bytes(), true, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -751,7 +752,7 @@ func TestCompressTailCheck(t *testing.T) {
 
 	// The wire form compress() actually emits, restored to the full flushed
 	// stream: the body plus the trailing four octets it trims off.
-	c := newTestConn(nil, false)
+	c := newTestRawConn(nil, false)
 	err := c.compress([]byte("hello, world"))
 	if err != nil {
 		t.Fatalf("compress: %v", err)

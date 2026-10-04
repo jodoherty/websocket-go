@@ -25,6 +25,7 @@ const (
 	testMCDCTextUTF8            = "TestMCDCTextUTF8"
 	testMCDCUpgrade101          = "TestMCDCUpgrade101"
 	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
+	testMCDCRawWriteFrame       = "TestMCDCRawWriteFrame"
 	testMCDCTruncateReason      = "TestMCDCTruncateReason"
 	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
 	testMCDCDeflateControl      = "TestMCDCDeflateControl"
@@ -36,9 +37,15 @@ const (
 
 // Subtest names reused across more than one trace.
 const (
-	subtestDecode = "decode"
-	subtestBelow  = "below"
-	subtestAbove  = "above"
+	subtestDecode           = "decode"
+	subtestBelow            = "below"
+	subtestAbove            = "above"
+	subtestCloseNotWritable = "close-not-writable"
+)
+
+// Condition strings reused across more than one trace.
+const (
+	condOpcodeText = "opcode == OpText"
 )
 
 // pairTrace is one traced MC/DC independence pair.
@@ -65,8 +72,106 @@ func registry() []decisionTrace {
 	traces = append(traces, handshakeTraces()...)
 	traces = append(traces, textUTF8Traces()...)
 	traces = append(traces, compressionTraces()...)
+	traces = append(traces, rawWriteFrameTraces()...)
 
 	return append(traces, serverTraces()...)
+}
+
+// rawWriteFrameTraces covers the raw frame-write decisions in
+// RawConn.WriteFrame: the writable opcode set, the control-frame shape,
+// the standalone-continuation guard, and the fragment-aware UTF-8 rule.
+func rawWriteFrameTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (WriteFrame): op == OpPing || op == OpPong
+		{
+			expr:       "opcode == OpPing || opcode == OpPong",
+			conditions: []string{"opcode == OpPing", "opcode == OpPong"},
+			pairs: []pairTrace{
+				// A 126-byte ping is refused by the control limit; the same
+				// size as a text frame passes (the ping condition flips the
+				// case selection on).
+				{0, []bool{false, false}, []bool{true, false}, testMCDCRawWriteFrame, "oversized-ping"},
+				// A 126-byte pong is refused; the same size as a binary
+				// frame passes (the pong condition flips the selection on).
+				{1, []bool{false, false}, []bool{false, true}, testMCDCRawWriteFrame, "oversized-pong"},
+			},
+		},
+		// ws.go (WriteFrame): op == OpText && !more
+		{
+			expr:       "opcode == OpText && !more",
+			conditions: []string{condOpcodeText, "!more"},
+			pairs: []pairTrace{
+				// Invalid bytes as a single-frame OpText are refused; the
+				// same bytes as OpBinary pass (the opcode condition flips).
+				{0, []bool{true, true}, []bool{false, true}, testMCDCRawWriteFrame, "binary-passes-invalid-bytes"},
+				// Invalid bytes in a text fragment pass — a boundary may
+				// split a rune — while the same bytes single-framed are
+				// refused (the more condition flips).
+				{1, []bool{true, true}, []bool{true, false}, testMCDCRawWriteFrame, "text-fragment-passes"},
+			},
+		},
+		// ws.go (WriteFrame): op == OpText && !more && !utf8.Valid(payload)
+		{
+			expr:       "opcode == OpText && !more && !utf8.Valid(payload)",
+			conditions: []string{condOpcodeText, "!more", "!utf8.Valid(payload)"},
+			pairs: []pairTrace{
+				// Invalid single-frame text is refused; the same bytes as
+				// OpBinary pass (the opcode condition flips).
+				{0, []bool{true, true, true}, []bool{false, true, true}, testMCDCRawWriteFrame, "binary-passes-invalid-bytes"},
+				// Invalid single-frame text is refused; invalid bytes in a
+				// text fragment pass (the more condition flips).
+				{1, []bool{true, true, true}, []bool{true, false, true}, testMCDCRawWriteFrame, "text-fragment-passes"},
+				// Invalid single-frame text is refused; valid text passes
+				// (the validity condition flips).
+				{2, []bool{true, true, true}, []bool{true, true, false}, testMCDCRawWriteFrame, "valid-text"},
+			},
+		},
+		// ws.go (WriteFrame): op == OpText || op == OpBinary || op == OpContinuation
+		{
+			expr:       "opcode == OpText || opcode == OpBinary || opcode == OpContinuation",
+			conditions: []string{condOpcodeText, "opcode == OpBinary", "opcode == OpContinuation"},
+			pairs: []pairTrace{
+				// A text frame goes out; a close frame is refused (the
+				// text condition flips the case selection).
+				{0, []bool{true, false, false}, []bool{false, false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+				// A binary frame goes out; a close frame is refused (the
+				// binary condition flips the selection).
+				{1, []bool{false, true, false}, []bool{false, false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+				// A continuation after a start goes out; a close frame is
+				// refused (the continuation condition flips the selection).
+				{2, []bool{false, false, true}, []bool{false, false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+			},
+		},
+		// ws.go (WriteFrame, nested sub-decision of the writable set):
+		// op == OpText || op == OpBinary
+		{
+			expr:       "opcode == OpText || opcode == OpBinary",
+			conditions: []string{condOpcodeText, "opcode == OpBinary"},
+			pairs: []pairTrace{
+				// A text frame goes out; a close frame is refused (the
+				// text condition flips the sub-decision on).
+				{0, []bool{true, false}, []bool{false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+				// A binary frame goes out; a close frame is refused (the
+				// binary condition flips the sub-decision on).
+				{1, []bool{false, true}, []bool{false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+			},
+		},
+		// ws.go (WriteFrame, write-state guard): op == OpContinuation && !c.fragWriting
+		{
+			expr:       "opcode == OpContinuation && !c.fragWriting",
+			conditions: []string{"opcode == OpContinuation", "!c.fragWriting"},
+			pairs: []pairTrace{
+				// A continuation with no start in flight is refused; a
+				// text frame without a start goes out (the opcode
+				// condition flips the guard off).
+				{0, []bool{false, true}, []bool{true, true}, testMCDCRawWriteFrame, "standalone-continuation"},
+				// A continuation with no start is refused; the same frame
+				// after a start goes out (the fragWriting condition flips
+				// the guard off).
+				{1, []bool{true, true}, []bool{true, false}, testMCDCRawWriteFrame, "continuation-after-text-start"},
+			},
+		},
+	}
 }
 
 // frameTraces covers the frame codec and message paths.
@@ -282,7 +387,7 @@ func textUTF8Traces() []decisionTrace {
 		// ws.go: opcode == OpText && !utf8.Valid(data) (WriteMessage)
 		{
 			expr:       "opcode == OpText && !utf8.Valid(data)",
-			conditions: []string{"opcode == OpText", "!utf8.Valid(data)"},
+			conditions: []string{condOpcodeText, "!utf8.Valid(data)"},
 			pairs: []pairTrace{
 				// An OpText write of invalid UTF-8 fails; the same bytes
 				// as OpBinary succeed (the opcode flips the check on).

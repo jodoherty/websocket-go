@@ -150,8 +150,8 @@ func TestMCDCWriteMessageOpcode(t *testing.T) {
 
 	// A fresh connection whose transport never writes: an accepted
 	// opcode fails in the flush, a rejected opcode fails in validation.
-	fresh := func() *Conn {
-		return newConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
+	fresh := func() *RawConn {
+		return newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 	}
 	proceeded := func(t *testing.T, opcode int) {
 		t.Helper()
@@ -188,8 +188,8 @@ func TestMCDCWriteMessageOpcode(t *testing.T) {
 func TestMCDCCloseCodeRange(t *testing.T) {
 	t.Parallel()
 
-	fresh := func() *Conn {
-		return newConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
+	fresh := func() *RawConn {
+		return newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 	}
 	badCode := func(code int) bool {
 		err := fresh().Close(code, "probe")
@@ -230,7 +230,7 @@ func TestMCDCCloseCodePayload(t *testing.T) {
 	// inspection.
 	closeFrame := func(code int, reason string) []byte {
 		transport := &fakeConn{}
-		c := newConn(transport, transport, false, 1<<20, 0, 0)
+		c := newRawConn(transport, transport, false, 1<<20, 0, 0)
 		_ = c.Close(code, reason)
 
 		return transport.written
@@ -471,7 +471,7 @@ func TestMCDCDeflateRSV(t *testing.T) {
 		t.Parallel()
 		// (rsv1Set=T, !deflate=F) flips to (T, T): the same RSV1 frame passes
 		// when negotiated and fails when not.
-		_, _, err := deflateTestConn(rsv1Frame, true).ReadMessage()
+		_, _, err := newSession(deflateTestConn(rsv1Frame, true), nil).ReadMessage()
 		if err != nil {
 			t.Fatalf("negotiated RSV1 frame: %v, want success", err)
 		}
@@ -492,11 +492,11 @@ func TestMCDCDeflateControl(t *testing.T) {
 		t.Parallel()
 		// (compressed=T, isControl=T) flips to (F, T): an RSV1 ping is a
 		// protocol error, a plain ping is answered with a pong.
-		_, _, err := deflateTestConn([]byte{0xC9, 0x01, 'x'}, true).ReadMessage()
+		_, _, err := newSession(deflateTestConn([]byte{0xC9, 0x01, 'x'}, true), nil).ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "control frame") {
 			t.Fatalf("RSV1 ping: %v, want control-frame protocol error", err)
 		}
-		_, _, err = deflateTestConn([]byte{0x89, 0x01, 'x'}, true).ReadMessage()
+		_, _, err = newSession(deflateTestConn([]byte{0x89, 0x01, 'x'}, true), nil).ReadMessage()
 		if err != nil && !errors.Is(err, io.EOF) {
 			t.Fatalf("plain ping: %v, want pong-then-EOF", err)
 		}
@@ -506,13 +506,13 @@ func TestMCDCDeflateControl(t *testing.T) {
 		t.Parallel()
 		// (compressed=T, isControl=T) flips to (T, F): an RSV1 ping is a
 		// protocol error; an RSV1 data frame is a valid compressed message.
-		_, _, err := deflateTestConn([]byte{0xC9, 0x01, 'x'}, true).ReadMessage()
+		_, _, err := newSession(deflateTestConn([]byte{0xC9, 0x01, 'x'}, true), nil).ReadMessage()
 		if err == nil || !strings.Contains(err.Error(), "control frame") {
 			t.Fatalf("RSV1 ping: %v, want control-frame protocol error", err)
 		}
 		stream := deflateStream(t, []byte("x"))
 		frm := append([]byte{0xC1, byte(len(stream))}, stream...) //nolint:gosec // tiny test stream, 7-bit length
-		_, _, err = deflateTestConn(frm, true).ReadMessage()
+		_, _, err = newSession(deflateTestConn(frm, true), nil).ReadMessage()
 		if err != nil {
 			t.Fatalf("RSV1 data frame: %v, want success", err)
 		}

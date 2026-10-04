@@ -73,7 +73,7 @@ func replyCode(payload []byte) int {
 func runPeerClose(t *testing.T, payload []byte) (string, int) {
 	t.Helper()
 	fc := &fakeConn{data: maskedCloseFrame(payload)}
-	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	c := newSession(newRawConn(fc, fc, false, 1<<20, 0, 0), nil)
 	_, _, err := c.ReadMessage()
 	errStr := "nil"
 	if err != nil {
@@ -194,7 +194,7 @@ func TestLocalCloseForbiddenCodes(t *testing.T) {
 	t.Parallel()
 	for _, code := range []int{1004, StatusNoStatusReceived, StatusAbnormalClosure, 1015} {
 		fc := &fakeConn{}
-		c := newConn(fc, fc, false, 1<<20, 0, 0)
+		c := newRawConn(fc, fc, false, 1<<20, 0, 0)
 		_ = c.Close(code, "reason")
 		reply, ok := closeReply(fc)
 		if !ok {
@@ -206,7 +206,7 @@ func TestLocalCloseForbiddenCodes(t *testing.T) {
 	}
 	// A normal code still carries code + reason.
 	fc := &fakeConn{}
-	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
 	_ = c.Close(StatusGoingAway, "later")
 	if reply, ok := closeReply(fc); !ok || replyCode(reply) != StatusGoingAway {
 		t.Fatalf("1001: reply %q ok=%v, want code 1001", reply, ok)
@@ -539,7 +539,7 @@ func TestClientDuplicate101Headers(t *testing.T) {
 func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 	t.Parallel()
 	fc := &fakeConn{}
-	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
 	_ = c.Close(StatusGoingAway, "bad\xffreason")
 	reply, ok := closeReply(fc)
 	if !ok {
@@ -552,7 +552,7 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 		t.Fatalf("reply code %d, want 1001", replyCode(reply))
 	}
 	fc = &fakeConn{}
-	c = newConn(fc, fc, false, 1<<20, 0, 0)
+	c = newRawConn(fc, fc, false, 1<<20, 0, 0)
 	_ = c.Close(StatusGoingAway, "bye")
 	if reply, ok := closeReply(fc); !ok || !bytes.Equal(reply[closeCodeBytes:], []byte("bye")) {
 		t.Fatalf("valid reason: payload %q, want code + \"bye\"", reply)

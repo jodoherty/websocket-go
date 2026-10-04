@@ -98,7 +98,7 @@ func TestWriteDeadlineUnsticksClose(t *testing.T) {
 		stuck:   make(chan struct{}), // never closed: a permanent blackhole
 		closed:  make(chan struct{}),
 	}
-	c := newConn(nc, nc, true, 1<<20, 0, 20*time.Millisecond)
+	c := newRawConn(nc, nc, true, 1<<20, 0, 20*time.Millisecond)
 
 	// A writer stuck on the blackhole, holding the write mutex.
 	werr := make(chan error, 1)
@@ -183,7 +183,7 @@ func (i *immediateConn) lastArmed() time.Time {
 // by a stale, already-spent deadline.
 func TestWriteDeadlineClearedAfterSuccess(t *testing.T) {
 	nc := &immediateConn{}
-	c := newConn(nc, nc, true, 1<<20, 0, 50*time.Millisecond)
+	c := newRawConn(nc, nc, true, 1<<20, 0, 50*time.Millisecond)
 
 	err := c.WriteMessage(OpText, []byte("one"))
 	if err != nil {
@@ -207,7 +207,7 @@ func TestWriteDeadlineClearedAfterSuccess(t *testing.T) {
 // leak if the read path is not currently in a read.
 func TestWriteTransportFailureFailsConnection(t *testing.T) {
 	nc := &closedConn{inner: failWriteConn{}, closed: make(chan struct{})}
-	c := newConn(nc, nc, true, 1<<20, 0, 0)
+	c := newSession(newRawConn(nc, nc, true, 1<<20, 0, 0), nil)
 
 	writeErr := c.WriteMessage(OpBinary, []byte("gone"))
 	if writeErr == nil {
@@ -259,15 +259,15 @@ func (c *closedConn) Close() error {
 // the closer's recorded error must survive — the transport error must not
 // overwrite what the concurrent Close recorded.
 func TestWriteFailureAfterConcurrentClose(t *testing.T) {
-	var c *Conn
+	var c *RawConn
 	nc := hookWriteConn{hook: func() {
 		// Simulate a Close that completed while this write was in flight:
-		// state and closeErr are set exactly as [Conn.Close] would set
+		// state and closeErr are set exactly as [RawConn.Close] would set
 		// them. Same goroutine, so no synchronization is needed.
 		c.state.Store(stClosed)
 		c.closeErr = closeErrFor(StatusGoingAway, "bye")
 	}}
-	c = newConn(nc, nc, true, 1<<20, 0, 0)
+	c = newRawConn(nc, nc, true, 1<<20, 0, 0)
 
 	err := c.WriteMessage(OpBinary, []byte("x"))
 	if err == nil {
@@ -303,7 +303,7 @@ func (h hookWriteConn) SetWriteDeadline(time.Time) error { return nil }
 // timeout to bound teardown gets that bound.
 func TestCloseRespectsWriteTimeout(t *testing.T) {
 	nc := &immediateConn{}
-	c := newConn(nc, nc, true, 1<<20, 0, 250*time.Millisecond)
+	c := newRawConn(nc, nc, true, 1<<20, 0, 250*time.Millisecond)
 
 	err := c.Close(StatusNormalClosure, "")
 	if !errors.Is(err, io.EOF) {
@@ -320,7 +320,7 @@ func TestCloseRespectsWriteTimeout(t *testing.T) {
 // untuned connection cannot be held open forever by a silent peer.
 func TestCloseFallbackBoundWithoutWriteTimeout(t *testing.T) {
 	nc := &immediateConn{}
-	c := newConn(nc, nc, true, 1<<20, 0, 0)
+	c := newRawConn(nc, nc, true, 1<<20, 0, 0)
 
 	err := c.Close(StatusNormalClosure, "")
 	if !errors.Is(err, io.EOF) {
@@ -338,7 +338,7 @@ func TestCloseFallbackBoundWithoutWriteTimeout(t *testing.T) {
 // reader observes is legitimately either, so only the stable endpoints are
 // asserted.
 func TestClosedSignal(t *testing.T) {
-	c := newConn(&immediateConn{}, &immediateConn{}, true, 1<<20, 0, 0)
+	c := newRawConn(&immediateConn{}, &immediateConn{}, true, 1<<20, 0, 0)
 	if c.Closed() {
 		t.Fatal("Closed() true on a fresh connection")
 	}

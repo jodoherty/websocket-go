@@ -58,8 +58,23 @@ Unlicense (see `LICENSE`).
 
 ## Concurrency and allocation invariants
 
-- `Conn.ReadMessage` is owned by one pumping goroutine; `WriteMessage` and
-  `Close` are safe from any goroutine. Read-side scratch
+- `Session` is built on `RawConn` by containment (`Session.raw`,
+  unexported — never embed): a `Session` must expose exactly the session
+  surface and nothing of the raw event/frame API, and no accessor may
+  hand the underlying `*RawConn` to callers. One read loop per transport:
+  the session's `ReadMessage` is the only reader of its `RawConn`.
+  `DialRaw`/`UpgradeRaw`/`HandleRaw` hand the `RawConn` to applications
+  that run the protocol policy themselves.
+- Protocol compliance lives in `RawConn` and therefore applies in both
+  modes: client masking, the close-code table (invalid codes failed with
+  1002, never echoed), RFC 6455 §5.6 UTF-8, the message size limit, and
+  frame reassembly. `Session` adds policy only: auto-pong, the pong
+  handler, the close-to-terminal-error mapping, and keepalive probing.
+- The read side is owned by one pumping goroutine in either face:
+  `Session.ReadMessage` for a session, `RawConn.ReadEvent` for raw mode —
+  and a connection has exactly one of them, never both. `WriteMessage`,
+  `WriteFrame`, `Pong`, and `Close` are safe from any goroutine.
+  Read-side scratch
   (`frameCodec.in/len8/mask`) and write-side scratch (`hdr/rand4/
   maskScratch`) are each owned by exactly one goroutine — do not move
   them without re-deriving that ownership.
@@ -145,6 +160,10 @@ ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
                     plus the stalled-write bounded-write regression
+ws/raw_test.go      the raw API: the ReadEvent contract (control frames are
+                    events, no auto-pong, close resolution), the WriteFrame
+                    MC/DC matrix (state, control shape, UTF-8, writable set),
+                    the DialRaw / UpgradeRaw / HandleRaw server and client faces
 ws/dial_test.go       Dial URL→target resolution: default ports, explicit
                     ports, bracketed IPv6 literals
 ws/longrunning_test.go write-deadline wedge regression + Closed() signal,

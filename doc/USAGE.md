@@ -27,7 +27,7 @@ it is.
    `ws.WithRequireClientCert()` rejects requests that arrived without one.
 
 3. **No callbacks, no pump goroutine.** The goroutine that calls
-   `Conn.ReadMessage` *is* the connection's goroutine. A session is:
+   `Session.ReadMessage` *is* the connection's goroutine. A session is:
 
    ```go
    mux.Handle("/ws/chat", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,13 +90,16 @@ it is.
    No background goroutines; `WithIdleTimeout(0)` disables it.
 
 5. **Concurrency rules, minimal.**
-   - `WriteMessage` / `Close`: safe from any goroutine.
-   - `ReadMessage`: owned by the pumping goroutine; never two at once.
-   - Sequential `ReadMessage` calls need no synchronization between them —
+   - `WriteMessage` / `Close`: safe from any goroutine (on `Session` and on
+     `RawConn`, including `WriteFrame` and `Pong`).
+   - `ReadMessage` (`Session`) / `ReadEvent` (`RawConn`): owned by the
+     pumping goroutine; never two at once, and never mixed on one
+     connection.
+   - Sequential read calls need no synchronization between them —
      it's one goroutine.
    - Writes are bounded by a per-connection write timeout (default 30 s),
      so a blackholed transport cannot hold the write mutex forever and
-     wedge `Close`; `Conn.Closed()` gives a background writer a race-free
+     wedge `Close`; `Closed()` gives a background writer a race-free
      signal to stop. `WithWriteTimeout(0)` restores unbounded writes.
    - A transport-level write failure closes the connection with the
      error recorded — the same verdict the read path gives a failed pong
@@ -228,11 +231,14 @@ go func() {
 // Server
 func NewUpgrader(opts ...Option) *Upgrader
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, opts ...HandshakeOption) (*Conn, error)
+func (u *Upgrader) UpgradeRaw(w http.ResponseWriter, r *http.Request, opts ...HandshakeOption) (*RawConn, error)
 // Handle(fn): on handler return, closes with the *CloseError's code,
 // 1000 for a nil return, or 1011 for any other error (the session did
-// not end normally).
+// not end normally). HandleRaw is the same contract over a *RawConn.
 func (u *Upgrader) Handle(fn func(r *http.Request, c *Conn) error) http.Handler
 func Handle(fn func(r *http.Request, c *Conn) error) http.Handler
+func (u *Upgrader) HandleRaw(fn func(r *http.Request, c *RawConn) error) http.Handler
+func HandleRaw(fn func(r *http.Request, c *RawConn) error) http.Handler
 
 // Options (shared by server and client where symmetric)
 WithCheckOrigin(f)         // default: same-origin when an Origin header is present
@@ -243,32 +249,53 @@ WithIdleTimeout(d)         // default 60 s window: probe at d, dead at 2d; 0 dis
 WithWriteTimeout(d)        // default 30 s write bound; 0 disables; negatives fall back
 WithCompression(enabled)   // permessage-deflate (RFC 7692); default true, opt out per upgrader or dial
 WithCompressionLevel(l)    // flate level for compression; default flate.DefaultCompression
-WithPongHandler(f)         // invoked inline by ReadMessage when a pong arrives; pongs are otherwise invisible
+WithPongHandler(f)         // sessions only: invoked inline by ReadMessage when a pong
+                           // arrives; pongs are otherwise invisible (no effect on RawConn)
 WithPreHandshake(f)        // policy hook before the switch; plain error → fixed 403 "forbidden" body;
                            // *UpgradeError controls status and body
 WithHandshakeData(v)       // per-upgrade value, c.HandshakeData()
 
-// Conn
-Conn.ReadMessage() (op int, data []byte, err error)
-   // a clean end reads as (0, nil, io.EOF); other closes as *CloseError
-Conn.WriteMessage(op int, data []byte) error   // the echo form: the op comes off the wire;
+// Session (type Conn = Session; the alias exists so old code keeps compiling)
+Session.ReadMessage() (op int, data []byte, err error)
+   // a clean end reads as (0, nil, io.EOF); other closes as *CloseError;
+   // pings answered automatically, pongs consumed (or WithPongHandler)
+Session.WriteMessage(op int, data []byte) error   // the echo form: the op comes off the wire;
                                                // on a closed conn: recorded error, or ErrClosed
-Conn.WriteText(s string) error                 // OpText; invalid UTF-8 refused before the wire
-Conn.WriteBinary(b []byte) error               // OpBinary, bytes untouched
-Conn.WriteJSON(v any) error                    // marshal (off-lock) then OpText
-Conn.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
-Conn.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
-Conn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
-Conn.Compressed() bool     // whether permessage-deflate was negotiated on this connection
-Conn.SetReadDeadline / SetWriteDeadline
-Conn.Closed() bool         // race-free "am I closed?" for background writers
+Session.WriteText(s string) error                 // OpText; invalid UTF-8 refused before the wire
+Session.WriteBinary(b []byte) error               // OpBinary, bytes untouched
+Session.WriteJSON(v any) error                    // marshal (off-lock) then OpText
+Session.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
+Session.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
+Session.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr()
+Session.Compressed() bool     // whether permessage-deflate was negotiated on this connection
+Session.SetReadDeadline / SetWriteDeadline
+Session.Closed() bool         // race-free "am I closed?" for background writers
+
+// RawConn — the protocol core the session is built on (DialRaw / UpgradeRaw):
+// every control frame is an event, pings are answered by you, and writes
+// can fragment. No WithPongHandler: pongs are events.
+type Event struct {
+    Op      int     // OpText, OpBinary, OpPing, OpPong, OpClose
+    Payload []byte  // data: the message; ping/pong: the control payload
+    Code    int     // OpClose: the resolved close code
+    Reason  string  // OpClose: the reason text
+}
+RawConn.ReadEvent() (Event, error)   // the raw read loop: one event per call, in wire order;
+                                     // the peer's close is an OpClose event, then the terminal error
+RawConn.WriteFrame(op int, payload []byte, more bool) error  // raw frame; more=true starts/continues
+                                                            // a fragmented message (RFC 6455 §5.4)
+RawConn.Pong(payload []byte) error   // the answer to a received ping (≤125 B); you are the responder
+RawConn.WriteMessage / WriteText / WriteBinary / WriteJSON / Ping / Close / Closed
+RawConn.ID() / Subprotocol() / HandshakeData() / RemoteAddr() / LocalAddr() / Compressed()
 
 // Sentinels
 var ErrClosed  // returned by WriteMessage after a normal closure (1000)
 io.EOF       // returned by ReadMessage and Close for a clean end
 
 // Client
-func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)
+func Dial(ctx context.Context, url string, opts ...Option) (*Conn, error)        // the session view
+func DialRaw(ctx context.Context, url string, opts ...Option) (*RawConn, error)  // the raw view: keepalive off by
+                                         // default (WithIdleTimeout opts in), pongs are events
 WithHeader(k, v)           // e.g. Authorization: Bearer ...
 WithTLS(cfg) / WithTLSClientCert(cert, key) / WithTLSClientChain(cert, chain, key)  // mTLS
                                                                   // (chain: leaf + intermediates)
@@ -365,7 +392,8 @@ default same-origin check.
 *Session lifecycle — re-validate, and close on expiry or logout.*
 WebSocket sessions outlive ordinary ones, so re-check the session in the
 read loop (every 30 minutes is the cheat sheet's figure) and, on logout,
-close every connection for that session through a session → `Conn.ID()`
+close every connection for that session through a session →
+`Session.ID()`
 map. Pair with `SameSite=Lax` (or `Strict`) cookies so a cross-site
 handshake cannot carry the session at all:
 
@@ -506,7 +534,7 @@ mux.Handle("/vnc", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request)
     }
 }))
 
-func bridge(c *ws.Conn, target string) error {
+func bridge(c *ws.Session, target string) error {
     vnc, err := net.Dial("tcp", target)
     if err != nil {
         _ = c.Close(ws.StatusServiceUnavailable, "backend unreachable")

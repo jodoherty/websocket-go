@@ -36,7 +36,7 @@ func TestProtocolViolationCloseFrame(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &fakeConn{data: tc.data}
-			c := newConn(fc, fc, tc.isClient, 1<<20, 0, 0)
+			c := newSession(newRawConn(fc, fc, tc.isClient, 1<<20, 0, 0), nil)
 			_, _, err := c.ReadMessage()
 			var ce *CloseError
 			if err == nil || !errors.As(err, &ce) || ce.Code != StatusProtocolError {

@@ -187,9 +187,9 @@ func TestKeepaliveProbesThenKillsDeadPeer(t *testing.T) {
 	idle := time.Second
 	synctest.Test(t, func(t *testing.T) {
 		nc := newGatedConn()
-		c := newConn(nc, nc, true, 1<<20, idle, 0)
+		c := newRawConn(nc, nc, true, 1<<20, idle, 0)
 		probeAt := c.lastActivity.Add(idle) // the exact deadline the first arm sets
-		errc := startRead(t, c)
+		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // the reader is durably blocked with a deadline at idle
 
 		synctest.Sleep(idle - 100*time.Millisecond) // t = idle-100ms
@@ -221,8 +221,8 @@ func TestKeepaliveAlivePeerSurvives(t *testing.T) {
 	idle := time.Second
 	synctest.Test(t, func(t *testing.T) {
 		nc := newGatedConn()
-		c := newConn(nc, nc, true, 1<<20, idle, 0)
-		errc := startRead(t, c)
+		c := newRawConn(nc, nc, true, 1<<20, idle, 0)
+		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // deadline at idle
 
 		synctest.Sleep(idle) // t = idle: probe #1
@@ -264,8 +264,8 @@ func TestKeepaliveActivityResetsClock(t *testing.T) {
 	idle := time.Second
 	synctest.Test(t, func(t *testing.T) {
 		nc := newGatedConn()
-		c := newConn(nc, nc, true, 1<<20, idle, 0)
-		errc := startRead(t, c)
+		c := newRawConn(nc, nc, true, 1<<20, idle, 0)
+		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // deadline at idle
 
 		synctest.Sleep(idle / 2)    // t = 0.5*idle
@@ -308,8 +308,8 @@ func TestKeepaliveProbeWriteBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		nc := newGatedConn()
 		nc.stallWrite = true
-		c := newConn(nc, nc, true, 1<<20, idle, writeTimeout)
-		errc := startRead(t, c)
+		c := newRawConn(nc, nc, true, 1<<20, idle, writeTimeout)
+		errc := startRead(t, newSession(c, nil))
 		synctest.Wait() // reader durably blocked on the read deadline at idle
 
 		synctest.Sleep(idle) // t = idle: the silence timeout probes with a ping

@@ -17,9 +17,9 @@
 //     through [ClientCert] (which reads r.TLS.PeerCertificates).
 //
 //  3. There are no callbacks and no pump goroutine. The goroutine that calls
-//     [Conn.ReadMessage] is the connection's goroutine. Your handler does its
-//     setup, upgrades, runs its read loop, and returns when the connection
-//     dies — cleanup is a plain deferred call.
+//     [Session.ReadMessage] is the connection's goroutine. Your handler does
+//     its setup, upgrades, runs its read loop, and returns when the
+//     connection dies — cleanup is a plain deferred call.
 //
 //     c, err := up.Upgrade(w, r)
 //     if err != nil {
@@ -42,12 +42,33 @@
 //     }
 //
 //  4. Close detection covers all four classes of death, funneled into the
-//     single ReadMessage return: a close frame from the peer, a transport
-//     error, a keepalive timeout (a silent peer is probed with a ping once
-//     silence reaches the idle timeout, [WithIdleTimeout], and the
-//     connection is considered dead if it is still silent after a second
-//     window — all inline in the read path, no background goroutines), and
-//     a local [Conn.Close] call.
+//     single read return: a close frame from the peer, a transport error, a
+//     keepalive timeout (a silent peer is probed with a ping once silence
+//     reaches the idle timeout, [WithIdleTimeout], and the connection is
+//     considered dead if it is still silent after a second window — all
+//     inline in the read path, no background goroutines), and a local
+//     [Session.Close] call.
+//
+// # Two faces: the session and the raw connection
+//
+// The protocol core is [RawConn]: one read loop ([RawConn.ReadEvent]) that
+// delivers every protocol event — each data message with its op-type, every
+// ping, every pong, the peer's close with its resolved code and reason — and
+// a write side that can fragment messages frame by frame
+// ([RawConn.WriteFrame]). It enforces what the RFC requires (masking, the
+// close-code table, UTF-8, the size limit, the mandatory close on protocol
+// violation) and does no application policy: it never answers a ping for
+// you, and, from [DialRaw], it sends no keepalive probes unless asked.
+//
+// [Session] is the policy layer built on the same core: [Dial] and
+// [Upgrader.Upgrade] produce one, and its [Session.ReadMessage] runs the
+// same loop with the control traffic handled for the application — pings
+// answered automatically, pongs consumed (or handed to a
+// [WithPongHandler]), and the peer's close mapped to the read's terminal
+// error. Message-oriented applications use Session; protocol implementers
+// use RawConn via [DialRaw] and [Upgrader.UpgradeRaw]. A Session
+// deliberately does not expose its raw connection: two read loops over one
+// transport would race.
 //
 // # Extensions
 //
@@ -63,12 +84,16 @@
 //
 // # Concurrency
 //
-//  1. [Conn.WriteMessage] and its natural-typed forms ([Conn.WriteText],
-//     [Conn.WriteBinary], [Conn.WriteJSON]), [Conn.Ping] — plus
-//     [Conn.Close] — are safe to call from any goroutine.
-//  2. [Conn.ReadMessage] is not: read state is owned by the goroutine that
-//     pumps the connection. Never call ReadMessage from two goroutines.
-//  3. Between sequential ReadMessage calls in the same goroutine there are no
+//  1. [Session.WriteMessage] and its natural-typed forms ([Session.WriteText],
+//     [Session.WriteBinary], [Session.WriteJSON]), [Session.Ping] — plus
+//     [Session.Close] — are safe to call from any goroutine; the same holds
+//     for the raw equivalents on [RawConn] (including [RawConn.WriteFrame]
+//     and [RawConn.Pong]).
+//  2. The read loop is not: [Session.ReadMessage] and [RawConn.ReadEvent]
+//     are owned by the single goroutine that pumps the connection, and the
+//     two are never mixed on one connection — read state is owned by that
+//     goroutine. Never call either from two goroutines.
+//  3. Between sequential read calls in the same goroutine there are no
 //     visibility concerns: handler-local state modified in one iteration is
 //     plainly visible in the next.
 //
@@ -113,13 +138,16 @@
 //  1. protocol constants (close codes, frame opcodes, wire format, defaults)
 //  2. errors (CloseError, ErrClosed, internal sentinels)
 //  3. wire format (the frame codec: readFrame, writeFrame)
-//  4. Conn (state, constructor, terminal handling)
-//  5. reading (ReadMessage, keepalive probe)
-//  6. writing and closing (WriteMessage, Ping, Close, Closed)
+//  4. RawConn (state, constructor, terminal handling, compression)
+//  5. reading and the session layer (RawConn.ReadEvent, the keepalive probe,
+//     Event, Session, Session.ReadMessage, the Conn alias, Session
+//     delegation)
+//  6. writing and closing (WriteMessage, WriteFrame, WriteText/WriteBinary/
+//     WriteJSON, Ping, Pong, Close, Closed)
 //  7. connection accessors (ID, addresses, deadlines)
 //  8. options (Option/Config and every With* function)
-//  9. server (Upgrader.Upgrade, Handle)
-//  10. client (Dial)
+//  9. server (Upgrader.Upgrade/UpgradeRaw, Handle/HandleRaw)
+//  10. client (Dial, DialRaw)
 package ws
 
 // This software is released into the public domain under the Unlicense
@@ -578,14 +606,19 @@ func xorMaskKey(dst, src []byte, key [4]byte) {
 	}
 }
 
-// writeFrame writes one complete (FIN set) frame. compressed sets RSV1,
+// writeFrame writes one frame. fin sets the FIN bit — every caller but
+// the fragmented-write path sends complete frames, which is also the only
+// legal form for control frames (RFC 6455 §5.5). compressed sets RSV1,
 // which is reserved for permessage-deflate and must only be set on data
 // frames carrying a compressed message (RFC 7692 §6). It does not take any
-// lock; a [Conn] serializes calls via its write mutex.
-func (fc *frameCodec) writeFrame(opcode int, payload []byte, compressed bool) error {
+// lock; the [RawConn] serializes calls via its write mutex.
+func (fc *frameCodec) writeFrame(opcode int, payload []byte, compressed, fin bool) error {
 	hdr := fc.hdr[:]
 	// opcode is a 4-bit value (0-15), so the conversion cannot overflow.
-	first := finBit | byte(opcode) //nolint:gosec // 4-bit opcode
+	first := byte(opcode) //nolint:gosec // 4-bit opcode
+	if fin {
+		first |= finBit
+	}
 	if compressed {
 		first |= rsv1Bit
 	}
@@ -632,7 +665,7 @@ func (fc *frameCodec) writeFrame(opcode int, payload []byte, compressed bool) er
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4 · Conn: state, constructor, terminal handling
+// 4 · RawConn: state, constructor, terminal handling
 
 const (
 	stOpen int32 = iota
@@ -642,22 +675,39 @@ const (
 //nolint:gochecknoglobals // monotonic per-process sequence for Conn.ID
 var connSeq atomic.Uint64
 
-// Conn is an open WebSocket connection.
+// RawConn is a raw WebSocket connection: the RFC 6455 protocol as an
+// event stream, with no policy layer above it.
 //
-// A Conn is tied to exactly one pumping goroutine: the goroutine that calls
-// [Conn.ReadMessage]. [Conn.WriteMessage] and [Conn.Close] may be called
-// from any goroutine.
+// RawConn is the core of the package, and [Session] is built on it:
+// Session runs the same read loop and consumes the control events the
+// message-oriented application never wants. Use RawConn (via [DialRaw] or
+// [Upgrader.UpgradeRaw]) when you are implementing a protocol on
+// WebSockets and want to see and drive the control traffic yourself —
+// every ping and every pong arrives as an [Event], the peer's close
+// arrives as an OpClose event carrying its code and reason, and writes
+// can be fragmented frame by frame with [RawConn.WriteFrame]. Use
+// [Session] (via [Dial] or [Upgrader.Upgrade]) for ordinary
+// message-oriented traffic.
 //
-// Conn is not safe for concurrent use of ReadMessage from multiple
-// goroutines.
-type Conn struct {
+// What RawConn does not do, by design: it never answers a ping for you —
+// you are the responder ([RawConn.Pong]) — and, when produced by
+// [DialRaw], it sends no keepalive probes unless an idle timeout was set
+// with [WithIdleTimeout] (the probe's answer then arrives as an OpPong
+// event). What RawConn cannot not do, because the RFC and the security
+// invariants require it: mask client frames, enforce the close-code table,
+// enforce UTF-8 on text (1007) and the message size limit, reassemble
+// fragmented data messages, and close the connection on a protocol
+// violation (answered with 1002 per RFC 6455 §7.1.7) or a transport
+// failure. [RawConn.ReadEvent] is the single read loop; like
+// [Session.ReadMessage] it must only be called from one goroutine at a
+// time. Every write and [RawConn.Close] is safe from any goroutine.
+type RawConn struct {
 	nc net.Conn
 	fc frameCodec
 	mu sync.Mutex // serializes the write path
 
 	id          uint64
 	subprotocol string
-	pongHandler func([]byte) // invoked inline by ReadMessage (the pumping goroutine)
 
 	state         atomic.Int32 // stOpen or stClosed
 	closeErr      error        // valid once state == stClosed; guarded by c.mu
@@ -691,6 +741,12 @@ type Conn struct {
 	deflater    *flate.Writer
 	compressBuf *bytes.Buffer
 
+	// fragWriting is write-path fragmentation state, under c.mu: set while
+	// a WriteFrame sequence with more=true is in progress, so a
+	// continuation frame can only follow a start frame this connection
+	// sent (RFC 6455 §5.4).
+	fragWriting bool
+
 	// Read-side scratch, touched by the pumping goroutine only: the
 	// re-used decompressor ([flate.Resetter]) and its output, lazily
 	// created on the first compressed message.
@@ -703,9 +759,9 @@ type Conn struct {
 	inflateWire  []byte       // payload + the four RFC bytes, grown to the largest message
 }
 
-func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int64,
+func newRawConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int64,
 	idleTimeout, writeTimeout time.Duration,
-) *Conn {
+) *RawConn {
 	var reader *bufio.Reader
 	if existing, ok := stream.(*bufio.Reader); ok {
 		reader = existing
@@ -713,7 +769,7 @@ func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int6
 		reader = bufio.NewReaderSize(stream, bufSize)
 	}
 
-	return &Conn{
+	return &RawConn{
 		nc: conn,
 		fc: frameCodec{
 			br:       reader,
@@ -731,14 +787,14 @@ func newConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int6
 // applyCompression records a successful permessage-deflate negotiation on
 // the connection: the RSV1 bit becomes the "compressed" marker on the read
 // side, and the write side starts compressing data messages.
-func (c *Conn) applyCompression() {
+func (c *RawConn) applyCompression() {
 	c.fc.deflate = true
 	c.deflateNegotiated = true
 }
 
 // Compressed reports whether permessage-deflate was negotiated, i.e. whether
 // data messages on this connection travel compressed and carry RSV1.
-func (c *Conn) Compressed() bool { return c.deflateNegotiated }
+func (c *RawConn) Compressed() bool { return c.deflateNegotiated }
 
 // compress deflates data into the write scratch. The output is a truncated
 // raw DEFLATE stream: after writing the payload we Flush (not Close), which
@@ -751,7 +807,7 @@ func (c *Conn) Compressed() bool { return c.deflateNegotiated }
 // outlives the frame write: bufio consumes it synchronously before
 // writeFrame returns, and the next compress resets it under the same write
 // lock.
-func (c *Conn) compress(data []byte) error {
+func (c *RawConn) compress(data []byte) error {
 	if c.deflater == nil {
 		c.compressBuf = &bytes.Buffer{}
 		writer, err := flate.NewWriter(c.compressBuf, c.compressLevel)
@@ -815,7 +871,7 @@ func compressTailCheck(stream []byte) ([]byte, error) {
 // inflate unboundedly before being rejected. The returned slice is fresh: the caller owns it and may
 // retain it, while every decompressor buffer is per-connection scratch reused
 // on the next message — one heap allocation per compressed message.
-func (c *Conn) decompress(src []byte) ([]byte, error) {
+func (c *RawConn) decompress(src []byte) ([]byte, error) {
 	if c.inflater == nil {
 		c.inflateSrc = &bytes.Reader{}
 		reader := flate.NewReader(c.inflateSrc)
@@ -897,7 +953,7 @@ func (g *inflateGuard) Write(p []byte) (int, error) {
 // The state transition and the closeErr write happen under c.mu so that no
 // reader — which also reads closeErr under c.mu — can ever observe the
 // closed state without the recorded error.
-func (c *Conn) finish(err error) error {
+func (c *RawConn) finish(err error) error {
 	c.mu.Lock()
 	if c.state.Load() == stOpen {
 		c.state.Store(stClosed)
@@ -911,53 +967,53 @@ func (c *Conn) finish(err error) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5 · Reading
+// 5 · Reading and the session layer
 
-// ReadMessage reads the next complete message from the connection.
+// ReadEvent reads the next protocol event from the connection, in wire
+// order, and delivers it unmodified: every ping, every pong, every close
+// (with its resolved code and reason), and each complete data message
+// carrying its op-type.
 //
-// It returns (op, data, nil) for a complete text or binary message, where op
-// is OpText or OpBinary. It returns (0, nil, [io.EOF]) when the connection
-// has ended cleanly — a normal closure (code 1000) in either direction, or
-// a close frame without a status — so [errors.Is] on [io.EOF] is the check
-// for a clean end. Any other close — including expected ones like 1001
-// "going away" — is reported as a [*CloseError] carrying the code and
-// reason, so the distinction between a clean end and a notification is
-// visible to the application.
+// ReadEvent is the policy-free core of the package: it enforces the RFC
+// 6455 compliance rules — masking, the close-code table, UTF-8 on text
+// (1007), the message size limit, RFC 7692 §6 reserved bits — and answers
+// them where the RFC mandates an answer (a close frame is always replied
+// to, a protocol violation is answered with a 1002 close frame, RFC
+// 6455 §7.1.7) — but it does no application policy. It never answers a
+// ping on the application's behalf, never sends a keepalive probe unless
+// an idle timeout was configured, and never hides a frame: pongs the peer
+// sends are events, not something that disappears. The [Session] type is
+// the policy layer on top: its [Session.ReadMessage] runs this same loop
+// and consumes the control events the message-oriented application never
+// wants.
 //
-// A frame-level protocol violation — a masking violation, reserved-bit
-// misuse, a malformed or oversized frame header, an unknown opcode — is
-// answered with a 1002 close frame before the transport is torn down
-// (RFC 6455 §7.1.7). Errors detected while a data message is being
-// assembled (fragmentation violations, size and decompression limits) end
-// the connection without a close frame: the stream has already diverged,
-// so anything written past that point is best effort at best.
+// A received ping is the application's to answer: by RFC 6455 §5.5.3 a
+// peer that receives a ping must answer with a pong, and the answer is
+// [RawConn.Pong] — call it from the read loop or another goroutine, with
+// any payload you like (the RFC says the echo; your protocol may use the
+// payload for its own correlation). If nobody answers, the peer's own
+// keepalive will eventually declare the connection dead.
 //
-// Pings and pongs are handled transparently: incoming pings are answered
-// automatically and pongs are consumed, so neither appears in the return
-// values. Text messages must be valid UTF-8 (RFC 6455 §5.6): a text
-// message that is not — whole or reassembled from fragments — fails the
-// connection with 1007 (invalid data type), the close the browser
-// implementations use for exactly this. Binary messages are never checked.
+// Errors: a close frame from the peer is the OpClose event, after which
+// the next ReadEvent returns the terminal error — [io.EOF] for a normal
+// closure (1000, or a close frame without a status), a [*CloseError]
+// otherwise. A protocol violation or an over-limit or corrupt data
+// message is a terminal error that already closed the transport, as is a
+// transport failure or an idle-timeout expiry.
 //
-// When the idle timeout is enabled and a blocking read has been silent for
-// the window, a ping is sent inline and the read re-arms; if the peer is
-// still silent after a second window the read fails with a timeout. All of
-// this is inline — no background goroutine — so a silently dead peer is
-// detected within about two windows.
-//
-// ReadMessage must only be called from one goroutine at a time.
-func (c *Conn) ReadMessage() (int, []byte, error) {
+// ReadEvent must only be called from one goroutine at a time.
+func (c *RawConn) ReadEvent() (Event, error) {
 	if c.state.Load() == stClosed {
 		c.mu.Lock()
 		closeErr := c.closeErr
 		c.mu.Unlock()
 
-		return 0, nil, terminalErr(closeErr)
+		return Event{}, terminalErr(closeErr)
 	}
 	for {
 		frm, readErr := c.readNextFrame()
 		if readErr != nil {
-			return 0, nil, readErr
+			return Event{}, readErr
 		}
 		// Clear the keepalive deadline; a zero idle timeout never armed one,
 		// so skip the call when keepalive is disabled.
@@ -971,37 +1027,36 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 		// a control frame that carries it is a protocol violation.
 		ctrlErr := c.checkCompressedControl(frm)
 		if ctrlErr != nil {
-			return 0, nil, ctrlErr
+			return Event{}, ctrlErr
 		}
 
 		switch frm.opcode {
-		case OpPing:
-			pingErr := c.writeFrame(OpPong, frm.payload, false)
-			if pingErr != nil {
-				return 0, nil, c.finish(pingErr)
-			}
-
-			continue
-		case OpPong:
-			if c.pongHandler != nil {
-				c.pongHandler(frm.payload)
-			}
-
-			continue
+		case OpPing, OpPong:
+			return Event{Op: frm.opcode, Payload: frm.payload}, nil
 		case OpClose:
-			return c.peerClose(frm.payload)
+			code, reason, closeErr := c.resolvePeerClose(frm.payload)
+			if closeErr != nil {
+				return Event{}, closeErr
+			}
+			// The close is resolved: reply with the same code and finish,
+			// then deliver the event; the next ReadEvent reports the
+			// terminal error the finish recorded.
+			_ = c.Close(code, reason)
+			_ = c.finish(closeErrFor(code, reason))
+
+			return Event{Op: OpClose, Code: code, Reason: reason}, nil
 		case OpText, OpBinary, OpContinuation:
 			msgOp, payload, complete, dataErr := c.readData(frm)
 			if dataErr != nil {
-				return 0, nil, c.finish(dataErr)
+				return Event{}, c.finish(dataErr)
 			}
 			if !complete {
 				continue
 			}
 
-			return msgOp, payload, nil
+			return Event{Op: msgOp, Payload: payload}, nil
 		default:
-			return 0, nil, c.failProtocol(fmt.Sprintf("unknown opcode %d", frm.opcode))
+			return Event{}, c.failProtocol(fmt.Sprintf("unknown opcode %d", frm.opcode))
 		}
 	}
 }
@@ -1009,7 +1064,7 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 // checkCompressedControl enforces RFC 7692 §6: the compressed (RSV1) bit is
 // reserved for data messages, so a control frame that carries it is a
 // protocol violation that terminates the connection.
-func (c *Conn) checkCompressedControl(frm frame) error {
+func (c *RawConn) checkCompressedControl(frm frame) error {
 	if frm.compressed && frm.isControl() {
 		return c.failProtocol("permessage-deflate bit set on a control frame")
 	}
@@ -1021,7 +1076,7 @@ func (c *Conn) checkCompressedControl(frm frame) error {
 // compressed, expands it. It returns the message opcode and payload; complete
 // reports whether a possibly fragmented message has ended. A decompression
 // failure (a corrupt or oversized payload) is returned as the error.
-func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
+func (c *RawConn) readData(frm frame) (int, []byte, bool, error) {
 	msgOp, payload, complete, compressed, msgErr := c.handleData(frm)
 	if msgErr != nil {
 		return 0, nil, false, msgErr
@@ -1059,7 +1114,7 @@ func (c *Conn) readData(frm frame) (int, []byte, bool, error) {
 // before the transport is torn down (RFC 6455 §7.1.7), so the peer sees
 // a close frame rather than a bare TCP close; a transport error or a
 // silence timeout that killed the connection is terminal.
-func (c *Conn) readNextFrame() (frame, error) {
+func (c *RawConn) readNextFrame() (frame, error) {
 	for {
 		armErr := c.armIdle()
 		if armErr != nil {
@@ -1086,7 +1141,7 @@ func (c *Conn) readNextFrame() (frame, error) {
 // returns retry=true when a probe ping was sent and the read loop should
 // continue; otherwise it returns the connection error (transport error, or
 // the silence timeout that killed the connection).
-func (c *Conn) keepaliveTimeout(err error) (bool, error) {
+func (c *RawConn) keepaliveTimeout(err error) (bool, error) {
 	if !isReadTimeout(err) {
 		return false, err
 	}
@@ -1105,38 +1160,239 @@ func (c *Conn) keepaliveTimeout(err error) (bool, error) {
 	return true, nil // armIdle re-arms with the grace window (probeAt + idle)
 }
 
-// peerClose handles a close frame received from the peer: reply with the same
-// code, tear down, and report the outcome.
+// resolvePeerClose validates a close frame received from the peer and
+// returns its resolved close code and reason — or the protocol failure,
+// when the payload is unusable. The caller ([RawConn.ReadEvent]) replies
+// with the same code and tears the connection down; resolving is kept
+// apart from tearing down because the raw read delivers the close as an
+// event before reporting the terminal error.
 //
 // A close frame without a payload closes normally (1005 "no status"). A
 // payload must carry a usable status code — in 1000-4999, not one of the
 // codes that MUST NOT be set on the wire (1005, 1006, 1015), and not the
 // reserved 1004 (RFC 6455 §7.4) — or the connection is failed with 1002
 // (§7.1.5); an unusable code is never echoed back.
-func (c *Conn) peerClose(payload []byte) (int, []byte, error) {
+func (c *RawConn) resolvePeerClose(payload []byte) (int, string, error) {
 	if len(payload) == 1 {
-		return 0, nil, c.failProtocol("close frame with one-byte payload")
+		return 0, "", c.failProtocol("close frame with one-byte payload")
 	}
 	if len(payload) >= closeCodeBytes {
 		code := int(binary.BigEndian.Uint16(payload[:closeCodeBytes]))
 		if !usableCloseCode(code) {
-			return 0, nil, c.failProtocol(fmt.Sprintf("close frame with unusable status code %d", code))
+			return 0, "", c.failProtocol(fmt.Sprintf("close frame with unusable status code %d", code))
 		}
-		reason := string(payload[closeCodeBytes:])
-		_ = c.Close(code, reason)
 
-		return 0, nil, c.finish(closeErrFor(code, reason))
+		return code, string(payload[closeCodeBytes:]), nil
 	}
 
 	// len(payload) == 0: no status received; closes normally.
-	_ = c.Close(StatusNoStatusReceived, "")
-
-	return 0, nil, c.finish(nil)
+	return StatusNoStatusReceived, "", nil
 }
+
+// Event is one protocol event delivered by [RawConn.ReadEvent]: a control
+// frame (each ping, each pong, the peer's close) or a complete data
+// message. The fields are populated per Op:
+//
+//   - OpText / OpBinary: Payload is the reassembled, decompressed message;
+//     Code and Reason are zero.
+//   - OpPing / OpPong: Payload is the control-frame payload; Code and
+//     Reason are zero.
+//   - OpClose: Code is the resolved close code (StatusNoStatusReceived
+//     for a payload-less close) and Reason the reason text; Payload is
+//     nil. The connection is already replying to the close and tearing
+//     down: the next ReadEvent returns the terminal error.
+type Event struct {
+	Op      int
+	Payload []byte
+	Code    int
+	Reason  string
+}
+
+// Session is a message-oriented WebSocket connection built on [RawConn]:
+// data messages in, data messages out, and the control traffic handled
+// for the application. Pings the peer sends are answered automatically;
+// pongs are consumed (or delivered to a [WithPongHandler]); the peer's
+// close is mapped to the read's terminal error — [io.EOF] for a clean end,
+// a [*CloseError] otherwise. Keepalive probes ride on the underlying
+// connection's idle timeout.
+//
+// A Session is tied to exactly one pumping goroutine: the goroutine that
+// calls [Session.ReadMessage]. Every other method is safe from any
+// goroutine.
+//
+// The raw protocol view — every ping, every pong, every close event, and
+// fragmented writes — is [RawConn], produced by [DialRaw] and
+// [Upgrader.UpgradeRaw]. A Session deliberately does not expose it: the
+// two read loops over one transport would race.
+type Session struct {
+	raw         *RawConn
+	pongHandler func([]byte) // invoked inline by ReadMessage (the pumping goroutine)
+}
+
+// newSession wraps the policy layer over a raw connection: the pong
+// handler and, via ReadMessage, the automatic pong and the close mapping.
+func newSession(raw *RawConn, pongHandler func([]byte)) *Session {
+	return &Session{raw: raw, pongHandler: pongHandler}
+}
+
+// ReadMessage reads the next complete message from the connection.
+//
+// It returns (op, data, nil) for a complete text or binary message, where op
+// is OpText or OpBinary. It returns (0, nil, [io.EOF]) when the connection
+// has ended cleanly — a normal closure (code 1000) in either direction, or
+// a close frame without a status — so [errors.Is] on [io.EOF] is the check
+// for a clean end. Any other close — including expected ones like 1001
+// "going away" — is reported as a [*CloseError] carrying the code and
+// reason, so the distinction between a clean end and a notification is
+// visible to the application.
+//
+// A frame-level protocol violation — a masking violation, reserved-bit
+// misuse, a malformed or oversized frame header, an unknown opcode — is
+// answered with a 1002 close frame before the transport is torn down
+// (RFC 6455 §7.1.7). Errors detected while a data message is being
+// assembled (fragmentation violations, size and decompression limits) end
+// the connection without a close frame: the stream has already diverged,
+// so anything written past that point is best effort at best.
+//
+// Pings and pongs are handled transparently: incoming pings are answered
+// automatically and pongs are consumed, so neither appears in the return
+// values. Text messages must be valid UTF-8 (RFC 6455 §5.6): a text
+// message that is not — whole or reassembled from fragments — fails the
+// connection with 1007 (invalid data type), the close the browser
+// implementations use for exactly this. Binary messages are never checked.
+//
+// When the idle timeout is enabled and a blocking read has been silent for
+// the window, a ping is sent inline and the read re-arms; if the peer is
+// still silent after a second window the read fails with a timeout. All of
+// this is inline — no background goroutine — so a silently dead peer is
+// detected within about two windows.
+//
+// ReadMessage must only be called from one goroutine at a time.
+func (s *Session) ReadMessage() (int, []byte, error) {
+	for {
+		event, readErr := s.raw.ReadEvent()
+		if readErr != nil {
+			return 0, nil, readErr
+		}
+		switch event.Op {
+		case OpPing:
+			// Answer inline, exactly as a raw application would with
+			// RawConn.Pong: a failed pong write breaks the transport, so
+			// the read reports it and the connection is torn down.
+			pingErr := s.raw.Pong(event.Payload)
+			if pingErr != nil {
+				return 0, nil, s.raw.finish(pingErr)
+			}
+
+			continue
+		case OpPong:
+			if s.pongHandler != nil {
+				s.pongHandler(event.Payload)
+			}
+
+			continue
+		case OpClose:
+			// The raw loop already replied and finished; report the
+			// resolved close the way the read has always reported it.
+			return 0, nil, terminalErr(closeErrFor(event.Code, event.Reason))
+		default:
+			return event.Op, event.Payload, nil
+		}
+	}
+}
+
+// Conn is the message-oriented session.
+//
+// Deprecated: use [*Session]; the alias exists so existing code that
+// names *Conn keeps compiling and will be removed in a later release.
+type Conn = Session
+
+// opcodeName is the human-readable name of an opcode for error messages.
+func opcodeName(opcode int) string {
+	switch opcode {
+	case OpContinuation:
+		return "continuation"
+	case OpText:
+		return "text"
+	case OpBinary:
+		return "binary"
+	case OpClose:
+		return "close"
+	case OpPing:
+		return "ping"
+	case OpPong:
+		return "pong"
+	default:
+		return fmt.Sprintf("opcode %d", opcode)
+	}
+}
+
+// The Session's write, close, and accessor surface delegates to the raw
+// connection unchanged; the doc of the [RawConn] method each one wraps is
+// the full contract.
+
+// WriteMessage writes a complete text or binary message, exactly as
+// [RawConn.WriteMessage]: safe from any goroutine, validated before the
+// wire, and a transport failure fails the connection.
+func (s *Session) WriteMessage(op int, data []byte) error { return s.raw.WriteMessage(op, data) }
+
+// WriteText writes s as a text message, exactly as [RawConn.WriteText].
+func (s *Session) WriteText(msg string) error { return s.raw.WriteText(msg) }
+
+// WriteBinary writes data as a binary message, exactly as [RawConn.WriteBinary].
+func (s *Session) WriteBinary(data []byte) error { return s.raw.WriteBinary(data) }
+
+// WriteJSON marshals v to JSON and writes it as a text message, exactly as
+// [RawConn.WriteJSON].
+func (s *Session) WriteJSON(v any) error { return s.raw.WriteJSON(v) }
+
+// Ping sends an application-level ping, exactly as [RawConn.Ping]; the
+// peer's pong is consumed by the read loop (or delivered to the
+// [WithPongHandler], if one was set).
+func (s *Session) Ping(payload []byte) error { return s.raw.Ping(payload) }
+
+// Close closes the connection, exactly as [RawConn.Close]: idempotent,
+// safe from any goroutine, best-effort close frame, bounded write.
+func (s *Session) Close(code int, reason string) error { return s.raw.Close(code, reason) }
+
+// Closed reports whether the connection has been closed, exactly as
+// [RawConn.Closed].
+func (s *Session) Closed() bool { return s.raw.Closed() }
+
+// ID returns the connection's unique identifier, exactly as [RawConn.ID].
+func (s *Session) ID() uint64 { return s.raw.ID() }
+
+// Subprotocol returns the negotiated subprotocol, exactly as
+// [RawConn.Subprotocol].
+func (s *Session) Subprotocol() string { return s.raw.Subprotocol() }
+
+// HandshakeData returns the value passed to the upgrade via
+// WithHandshakeData, exactly as [RawConn.HandshakeData].
+func (s *Session) HandshakeData() any { return s.raw.HandshakeData() }
+
+// RemoteAddr returns the peer's network address, exactly as
+// [RawConn.RemoteAddr].
+func (s *Session) RemoteAddr() net.Addr { return s.raw.RemoteAddr() }
+
+// LocalAddr returns this endpoint's network address, exactly as
+// [RawConn.LocalAddr].
+func (s *Session) LocalAddr() net.Addr { return s.raw.LocalAddr() }
+
+// SetReadDeadline sets the underlying connection's read deadline, exactly
+// as [RawConn.SetReadDeadline].
+func (s *Session) SetReadDeadline(t time.Time) error { return s.raw.SetReadDeadline(t) }
+
+// SetWriteDeadline sets the underlying connection's write deadline,
+// exactly as [RawConn.SetWriteDeadline].
+func (s *Session) SetWriteDeadline(t time.Time) error { return s.raw.SetWriteDeadline(t) }
+
+// Compressed reports whether permessage-deflate was negotiated, exactly as
+// [RawConn.Compressed].
+func (s *Session) Compressed() bool { return s.raw.Compressed() }
 
 // failProtocol tears the connection down with 1002 (protocol error) and
 // returns the violation for ReadMessage to report.
-func (c *Conn) failProtocol(what string) error {
+func (c *RawConn) failProtocol(what string) error {
 	err := fmt.Errorf("%w: %s", errProtocol, what)
 	_ = c.Close(StatusProtocolError, what)
 
@@ -1183,7 +1439,7 @@ func truncateReason(reason string) string {
 // fragment — and compressed when that finished message arrived as a
 // compressed (RFC 7692) payload (RSV1 on the first frame only); it holds
 // the partial message in the connection otherwise.
-func (c *Conn) handleData(frm frame) (int, []byte, bool, bool, error) {
+func (c *RawConn) handleData(frm frame) (int, []byte, bool, bool, error) {
 	if frm.opcode == OpContinuation {
 		if frm.compressed {
 			return 0, nil, false, false, fmt.Errorf("%w: permessage-deflate bit set on a continuation frame", errProtocol)
@@ -1226,7 +1482,7 @@ func (c *Conn) handleData(frm frame) (int, []byte, bool, bool, error) {
 // timeout path, only when silence is actually observed. While a probe is
 // outstanding the deadline is one full window past the probe, giving the
 // peer time to answer.
-func (c *Conn) armIdle() error {
+func (c *RawConn) armIdle() error {
 	if c.idleTimeout <= 0 {
 		return nil
 	}
@@ -1274,7 +1530,7 @@ func isReadTimeout(err error) bool {
 // closedWriteErr is the error a write path returns for a closed
 // connection: the recorded close error when there is one, ErrClosed for a
 // normal closure.
-func (c *Conn) closedWriteErr() error {
+func (c *RawConn) closedWriteErr() error {
 	if c.closeErr != nil {
 		return c.closeErr
 	}
@@ -1287,7 +1543,7 @@ func (c *Conn) closedWriteErr() error {
 // automatic pong and keepalive ping, and the close frame ([Conn.Close]) —
 // each of which validates its own use. A closed connection yields
 // [Conn.closedWriteErr], never a silent success.
-func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
+func (c *RawConn) writeFrame(opcode int, payload []byte, compressed bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state.Load() == stClosed {
@@ -1302,7 +1558,7 @@ func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 		defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
 	}
 
-	return c.fc.writeFrame(opcode, payload, compressed)
+	return c.fc.writeFrame(opcode, payload, compressed, true)
 }
 
 // WriteMessage writes a complete text or binary message. It is safe to call
@@ -1335,7 +1591,7 @@ func (c *Conn) writeFrame(opcode int, payload []byte, compressed bool) error {
 // the read path answers to a peer ping. A peer whose keepalive window is
 // shorter than the write bound may therefore declare the connection dead
 // while a write is in flight; tune the two to match.
-func (c *Conn) WriteMessage(opcode int, data []byte) error {
+func (c *RawConn) WriteMessage(opcode int, data []byte) error {
 	if opcode != OpText && opcode != OpBinary {
 		return fmt.Errorf("%w: WriteMessage requires OpText or OpBinary", errProtocol)
 	}
@@ -1389,7 +1645,7 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 				errMessageTooBig, len(frame), c.fc.maxMsg)
 		}
 	}
-	writeErr := c.fc.writeFrame(opcode, frame, compressed)
+	writeErr := c.fc.writeFrame(opcode, frame, compressed, true)
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	if writeErr != nil {
 		// The transport write failed, so the pipe is broken: no later
@@ -1410,21 +1666,127 @@ func (c *Conn) WriteMessage(opcode int, data []byte) error {
 	return writeErr
 }
 
+// WriteFrame writes one raw frame — the low-level counterpart of
+// [RawConn.WriteMessage] — safe to call from any goroutine, with the same
+// write-mutex, write-bound, and closed-connection semantics, and the same
+// verdict on a transport failure: the connection is failed with the error
+// recorded, exactly as [RawConn.WriteMessage].
+//
+// WriteFrame is how a raw application fragments a message across frames:
+// start it with a frame of OpText or OpBinary and more=true, continue with
+// OpContinuation frames, and end with more=false. A peer reassembles the
+// fragments into one message — [RawConn.ReadEvent] and
+// [Session.ReadMessage] both report the finished message, never the
+// fragments — so fragmentation is a transport-level tool (stream a large
+// message while interleaving control traffic, pace a write across event
+// loop iterations), not a way to change what the peer receives. A
+// continuation frame may only follow a start frame sent on this
+// connection; a standalone continuation is refused (RFC 6455 §5.4). A
+// frame with more=false is a complete one-frame message, exactly as
+// WriteMessage.
+//
+// Validation, per frame: the opcode must be OpText, OpBinary,
+// OpContinuation, OpPing, or OpPong (anything else is a protocol error);
+// control frames (ping, pong) carry at most 125 payload bytes and may not
+// be fragmented; each frame's payload must fit the connection's message
+// limit. A single-frame text message (OpText with more=false) must be
+// valid UTF-8, as any OpText message; fragments of a longer text message
+// are not checked, because a fragment boundary may split a rune — keep
+// every fragment of a text message valid UTF-8 if you want the reassembled
+// message to pass the peer's check (RFC 6455 §5.6). The frame is written
+// uncompressed: permessage-deflate applies to whole messages, and only
+// [RawConn.WriteMessage] compresses.
+func (c *RawConn) WriteFrame(opcode int, payload []byte, more bool) error {
+	validateErr := c.validateRawFrame(opcode, payload, more)
+	if validateErr != nil {
+		return validateErr
+	}
+	c.mu.Lock()
+	if c.state.Load() == stClosed {
+		writeErr := c.closedWriteErr()
+		c.mu.Unlock()
+
+		return writeErr
+	}
+	if opcode == OpContinuation && !c.fragWriting {
+		// The stream has no message in progress for this to continue.
+		c.mu.Unlock()
+
+		return fmt.Errorf("%w: continuation frame without a start frame in progress", errProtocol)
+	}
+	if opcode <= OpBinary {
+		// Data frames — continuation, text, and binary, the opcodes 0-2 —
+		// drive the fragmentation state; control frames cannot fragment
+		// and leave the state untouched.
+		c.fragWriting = more
+	}
+	if c.writeTimeout > 0 {
+		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	}
+	writeErr := c.fc.writeFrame(opcode, payload, false, !more)
+	_ = c.nc.SetWriteDeadline(time.Time{})
+	if writeErr != nil {
+		// The transport write failed, so the pipe is broken: fail the
+		// connection, as WriteMessage does.
+		if c.state.Load() == stOpen {
+			c.state.Store(stClosed)
+			c.closeErr = writeErr
+			_ = c.nc.Close()
+		}
+	}
+	c.mu.Unlock()
+
+	return writeErr
+}
+
+// validateRawFrame applies WriteFrame's pre-write validation: the message
+// size limit, the writable opcode set, the control-frame shape, and the
+// single-frame UTF-8 rule. A refused frame never reaches the wire and
+// never touches the connection's state.
+func (c *RawConn) validateRawFrame(opcode int, payload []byte, more bool) error {
+	if int64(len(payload)) > c.fc.maxMsg {
+		return fmt.Errorf("%w: frame of %d bytes exceeds the %d byte limit",
+			errMessageTooBig, len(payload), c.fc.maxMsg)
+	}
+	switch {
+	case opcode == OpPing || opcode == OpPong:
+		if more {
+			return fmt.Errorf("%w: %s frames are never fragmented", errProtocol, opcodeName(opcode))
+		}
+		if len(payload) > maxControlPayload {
+			return fmt.Errorf("%w: %s payload of %d bytes exceeds the %d byte control-frame limit",
+				errProtocol, opcodeName(opcode), len(payload), maxControlPayload)
+		}
+	case opcode == OpText && !more && !utf8.Valid(payload):
+		// RFC 6455 §5.6: a single-frame text message is the whole
+		// message, so it must be valid UTF-8. Fragments are exempt: a
+		// boundary may split a rune.
+		return fmt.Errorf("%w: %d bytes", errInvalidUTF8, len(payload))
+	case opcode == OpText || opcode == OpBinary || opcode == OpContinuation:
+
+	default:
+		return fmt.Errorf("%w: %s frame is not writable", errProtocol, opcodeName(opcode))
+	}
+
+	return nil
+}
+
 // Ping sends an application-level ping frame carrying the given payload
 // (RFC 6455 §5.5). It is safe to call from any goroutine, exactly as
-// [Conn.WriteMessage]: the write takes the write mutex, obeys the
+// [RawConn.WriteMessage]: the write takes the write mutex, obeys the
 // connection's write bound, and on a closed connection yields the recorded
 // close error — [ErrClosed] after a normal closure — never a silent
 // success.
 //
-// The peer answers with a pong carrying the same payload. Pongs are
-// consumed transparently unless a [WithPongHandler] was set, which is the
-// half that makes the pair useful for round-trip-time measurement: ping,
-// and time the handler's wake. Any frame — the pong included — resets the
-// keepalive idle clock, so an application ping also proves liveness.
+// The peer answers with a pong carrying the same payload. On a [Session]
+// the pong is consumed transparently unless a [WithPongHandler] was set, which
+// is the half that makes the pair useful for round-trip-time measurement:
+// ping, and time the handler's wake. On a [RawConn] the pong arrives as an
+// OpPong [Event]. Any frame — the pong included — resets the keepalive
+// idle clock, so an application ping also proves liveness.
 //
 // A ping is a control frame, so its payload is at most 125 bytes.
-func (c *Conn) Ping(payload []byte) error {
+func (c *RawConn) Ping(payload []byte) error {
 	if len(payload) > maxControlPayload {
 		return fmt.Errorf("%w: ping payload of %d bytes exceeds the %d byte control-frame limit",
 			errProtocol, len(payload), maxControlPayload)
@@ -1433,16 +1795,34 @@ func (c *Conn) Ping(payload []byte) error {
 	return c.writeFrame(OpPing, payload, false)
 }
 
+// Pong sends a pong frame carrying the given payload (RFC 6455 §5.5) — the
+// answer to a ping. It is safe to call from any goroutine, exactly as
+// [RawConn.Ping]. On a [RawConn] this is how you answer the pings that
+// arrive as OpPing events: by RFC 6455 §5.5.3 the answer is mandatory, and
+// a peer whose keepalive window elapses without one declares the
+// connection dead. The RFC prescribes echoing the ping's payload; your
+// protocol may use the payload for its own correlation instead.
+//
+// A pong is a control frame, so its payload is at most 125 bytes.
+func (c *RawConn) Pong(payload []byte) error {
+	if len(payload) > maxControlPayload {
+		return fmt.Errorf("%w: pong payload of %d bytes exceeds the %d byte control-frame limit",
+			errProtocol, len(payload), maxControlPayload)
+	}
+
+	return c.writeFrame(OpPong, payload, false)
+}
+
 // WriteText writes s as a text message. If s is not valid UTF-8 it is
 // rejected before reaching the wire, exactly as any OpText write
 // (RFC 6455 §5.6).
-func (c *Conn) WriteText(s string) error {
+func (c *RawConn) WriteText(s string) error {
 	return c.WriteMessage(OpText, []byte(s))
 }
 
 // WriteBinary writes data as a binary message: the bytes pass through
 // unchanged, with no copy and no validation.
-func (c *Conn) WriteBinary(data []byte) error {
+func (c *RawConn) WriteBinary(data []byte) error {
 	return c.WriteMessage(OpBinary, data)
 }
 
@@ -1452,7 +1832,7 @@ func (c *Conn) WriteBinary(data []byte) error {
 // before anything reaches the wire. JSON output is valid UTF-8 by
 // construction, so the text-frame rule (RFC 6455 §5.6) holds by
 // construction as well.
-func (c *Conn) WriteJSON(v any) error {
+func (c *RawConn) WriteJSON(v any) error {
 	payload, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("%w: %w", errBadJSON, err)
@@ -1487,7 +1867,7 @@ func (c *Conn) WriteJSON(v any) error {
 // stops reading can also delay the [Conn.ReadMessage] that reports the
 // closure by that same bound. Worst case, handler teardown waits on the
 // order of the write timeout plus the close bound.
-func (c *Conn) Close(code int, reason string) error {
+func (c *RawConn) Close(code int, reason string) error {
 	if code < closeCodeMin || code > closeCodeMax {
 		return fmt.Errorf("%w: %d", errBadCloseCode, code)
 	}
@@ -1525,7 +1905,7 @@ func (c *Conn) Close(code int, reason string) error {
 		closeBound = c.writeTimeout
 	}
 	_ = c.nc.SetWriteDeadline(time.Now().Add(closeBound))
-	_ = c.fc.writeFrame(OpClose, payload, false)
+	_ = c.fc.writeFrame(OpClose, payload, false, true)
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
 	_ = c.nc.Close()
@@ -1537,38 +1917,38 @@ func (c *Conn) Close(code int, reason string) error {
 // It is the cheap, race-free signal a background writer goroutine needs to
 // stop: it can check Closed() (or select on work and bail when true) instead
 // of waiting for its next WriteMessage to fail with ErrClosed.
-func (c *Conn) Closed() bool {
+func (c *RawConn) Closed() bool {
 	return c.state.Load() == stClosed
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7 · Connection accessors
+// 7 · Connection accessors (RawConn, with the Session delegations)
 
 // ID returns a unique identifier for the connection (unique within this
 // process), useful as a key in session registries.
-func (c *Conn) ID() uint64 { return c.id }
+func (c *RawConn) ID() uint64 { return c.id }
 
 // Subprotocol returns the negotiated subprotocol, or "" if none.
-func (c *Conn) Subprotocol() string { return c.subprotocol }
+func (c *RawConn) Subprotocol() string { return c.subprotocol }
 
 // HandshakeData returns the value passed to the upgrade via
 // WithHandshakeData, or nil if none was provided.
-func (c *Conn) HandshakeData() any { return c.handshakeData }
+func (c *RawConn) HandshakeData() any { return c.handshakeData }
 
 // RemoteAddr returns the peer's network address.
-func (c *Conn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
+func (c *RawConn) RemoteAddr() net.Addr { return c.nc.RemoteAddr() }
 
 // LocalAddr returns this endpoint's network address.
-func (c *Conn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
+func (c *RawConn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
 
 // SetReadDeadline sets the underlying connection's read deadline. When the
 // idle timeout keepalive is enabled it is overridden by the keepalive for
 // the duration of each blocking read; use WithIdleTimeout(0) to manage
 // deadlines yourself.
-func (c *Conn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
+func (c *RawConn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
 
 // SetWriteDeadline sets the underlying connection's write deadline.
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
+func (c *RawConn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 8 · Options
@@ -1682,13 +2062,15 @@ func WithWriteTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.WriteTimeout = d }
 }
 
-// WithPongHandler sets a handler for pong frames received on the
-// connection; pongs are otherwise consumed transparently and never reach
-// the application. The handler is invoked inline by [Conn.ReadMessage], in
+// WithPongHandler sets a handler for pong frames received on a session:
+// pongs are otherwise consumed transparently and never reach the
+// application. The handler is invoked inline by [Session.ReadMessage], in
 // the pumping goroutine itself, so it must be fast and non-blocking — the
 // usual use is recording the arrival of the answer to an application
-// [Conn.Ping]. It is never invoked from any other goroutine, and never
-// after ReadMessage has returned a terminal error.
+// [Session.Ping]. It is never invoked from any other goroutine, and never
+// after ReadMessage has returned a terminal error. It has no effect on a
+// [RawConn] produced by [DialRaw] or [Upgrader.UpgradeRaw]: there, pongs
+// are events, not a callback.
 func WithPongHandler(handler func(payload []byte)) Option {
 	return func(cfg *Config) { cfg.pongHandler = handler }
 }
@@ -1832,7 +2214,7 @@ type Upgrader struct {
 	preHandshake      []func(r *http.Request) error
 	compressEnabled   bool
 	compressLevel     int // flate level, as configured
-	pingHandler       func([]byte)
+	pongHandler       func([]byte)
 }
 
 // NewUpgrader creates an Upgrader with sensible defaults: strict same-origin
@@ -1866,7 +2248,7 @@ func NewUpgrader(opts ...Option) *Upgrader {
 		preHandshake:      cfg.PreHandshake,
 		compressEnabled:   cfg.Compression,
 		compressLevel:     cfg.CompressionLevel,
-		pingHandler:       cfg.pongHandler,
+		pongHandler:       cfg.pongHandler,
 	}
 }
 
@@ -1913,7 +2295,7 @@ func (e *UpgradeError) Error() string {
 	return fmt.Sprintf("ws: upgrade rejected: %s (HTTP %d)", e.Msg, e.Status)
 }
 
-func reject(writer http.ResponseWriter, status int, msg string) (*Conn, error) {
+func reject(writer http.ResponseWriter, status int, msg string) (*RawConn, error) {
 	return nil, rejectStatus(writer, status, msg)
 }
 
@@ -2039,18 +2421,45 @@ func writeSwitchingProtocols(conn net.Conn, protocol, accept, extension string) 
 	return nil
 }
 
-// Upgrade validates the WebSocket handshake on r and switches the connection
-// to a [Conn], which is returned. It is the last HTTP operation the calling
-// handler should perform: once Upgrade succeeds, w must not be used again.
+// Upgrade validates the WebSocket handshake on r and switches the
+// connection to a [*Session], which is returned. It is the last HTTP
+// operation the calling handler should perform: once Upgrade succeeds, w
+// must not be used again.
 //
-// On rejection, Upgrade writes an appropriate HTTP error response itself and
-// returns a [*UpgradeError] for logging; the handler should simply return.
+// On rejection, Upgrade writes an appropriate HTTP error response itself
+// and returns a [*UpgradeError] for logging; the handler should simply
+// return.
 //
 // Origin checking, client certificate requirements, and PreHandshake hooks
 // are applied in that order.
 func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 	opts ...HandshakeOption,
 ) (*Conn, error) {
+	raw, err := u.upgradeCore(writer, request, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return newSession(raw, u.pongHandler), nil
+}
+
+// UpgradeRaw is [Upgrader.Upgrade] for the raw protocol view: the same
+// handshake validation and protocol switch, but the returned connection is
+// a [*RawConn] — every ping, pong, and close arrives as an [Event], pings
+// are not answered automatically, and fragmented writes are available via
+// [RawConn.WriteFrame].
+func (u *Upgrader) UpgradeRaw(writer http.ResponseWriter, request *http.Request,
+	opts ...HandshakeOption,
+) (*RawConn, error) {
+	return u.upgradeCore(writer, request, opts)
+}
+
+// upgradeCore performs the handshake validation and protocol switch and
+// returns the raw connection; [Upgrader.Upgrade] wraps it in a [*Session]
+// on top.
+func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request,
+	opts []HandshakeOption,
+) (*RawConn, error) {
 	var sessionOpts handshakeOpts
 	for _, o := range opts {
 		o(&sessionOpts)
@@ -2117,19 +2526,19 @@ func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request,
 		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
 
-	return u.finishSession(raw, buf, protocol, sessionOpts.data, extension), nil
+	return u.finishRaw(raw, buf, protocol, sessionOpts.data, extension), nil
 }
 
-// finishSession assembles the upgraded connection: the frame codec on the
-// hijacked stream, the negotiated session state, and the permessage-deflate
-// switch when the extension was granted.
-func (u *Upgrader) finishSession(raw net.Conn, buf *bufio.ReadWriter, protocol string,
+// finishRaw assembles the upgraded raw connection: the frame codec on the
+// hijacked stream with the negotiated session state and the
+// permessage-deflate switch when the extension was granted. The caller
+// wraps it in a [*Session] when the message-oriented view was asked for.
+func (u *Upgrader) finishRaw(raw net.Conn, buf *bufio.ReadWriter, protocol string,
 	data any, extension string,
-) *Conn {
-	conn := newConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
+) *RawConn {
+	conn := newRawConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
 	conn.handshakeData = data
-	conn.pongHandler = u.pingHandler
 	if extension != "" {
 		conn.applyCompression()
 		conn.compressLevel = u.compressLevel
@@ -2166,39 +2575,75 @@ func (u *Upgrader) negotiateExtensions(request *http.Request) (string, error) {
 // error), the recorded close wins and nothing more goes on the wire.
 //
 // The returned handler is ordinary: wrap it in further middleware as needed.
-func (u *Upgrader) Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
-	return http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
-		conn, err := u.Upgrade(writer, r)
+func (u *Upgrader) Handle(handler func(request *http.Request, c *Conn) error) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := u.Upgrade(writer, request)
 		if err != nil {
 			return
 		}
-		err = handler(r, conn)
-		if closeErr, ok := errors.AsType[*CloseError](err); ok {
-			code := closeErr.Code
-			if code < closeCodeMin || code > closeCodeMax {
-				// An out-of-range code cannot go on the wire; tear down with
-				// 1002 so the connection is always closed.
-				_ = conn.Close(StatusProtocolError, "invalid close code from handler")
 
-				return
-			}
-			_ = conn.Close(code, closeErr.Reason)
-
-			return
-		}
-		if err == nil {
-			_ = conn.Close(StatusNormalClosure, "")
-
-			return
-		}
-		_ = conn.Close(StatusUnexpectedCondition, "handler failure")
+		closeAfterHandler(conn, handler(request, conn))
 	})
+}
+
+// HandleRaw is [NewUpgrader].Handle for the raw protocol view: the handler
+// receives a [*RawConn] and drives the protocol itself — the returned
+// close-code mapping is the same as Handle's, because the connection's
+// teardown is the same.
+func (u *Upgrader) HandleRaw(handler func(request *http.Request, c *RawConn) error) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := u.UpgradeRaw(writer, request)
+		if err != nil {
+			return
+		}
+
+		closeAfterHandler(conn, handler(request, conn))
+	})
+}
+
+// closeAfterHandler tears down the connection after a handler returns, the
+// same way for the session and the raw view: a returned [*CloseError]
+// closes with its code (an out-of-range code remapped to 1002, so the
+// connection is always torn down), nil closes normally (1000), and any
+// other error — a policy failure, a transport error, a keepalive timeout —
+// closes with 1011 (unexpected condition), because the session did not end
+// normally. When the handler's error already tore the connection down (the
+// common case for transport errors: the read fails and records the error),
+// the recorded close wins and nothing more goes on the wire.
+func closeAfterHandler(conn interface {
+	Close(code int, reason string) error
+}, err error) {
+	if closeErr, ok := errors.AsType[*CloseError](err); ok {
+		code := closeErr.Code
+		if code < closeCodeMin || code > closeCodeMax {
+			// An out-of-range code cannot go on the wire; tear down with
+			// 1002 so the connection is always closed.
+			_ = conn.Close(StatusProtocolError, "invalid close code from handler")
+
+			return
+		}
+		_ = conn.Close(code, closeErr.Reason)
+
+		return
+	}
+	if err == nil {
+		_ = conn.Close(StatusNormalClosure, "")
+
+		return
+	}
+	_ = conn.Close(StatusUnexpectedCondition, "handler failure")
 }
 
 // Handle is [NewUpgrader].Handle with the default upgrader, for the simple
 // cases where no upgrader configuration is needed.
 func Handle(handler func(r *http.Request, c *Conn) error) http.Handler {
 	return NewUpgrader().Handle(handler)
+}
+
+// HandleRaw is [NewUpgrader].HandleRaw with the default upgrader, for the
+// simple cases where no upgrader configuration is needed.
+func HandleRaw(handler func(r *http.Request, c *RawConn) error) http.Handler {
+	return NewUpgrader().HandleRaw(handler)
 }
 
 // Handshake helpers, shared by [Upgrader.Upgrade] and [Dial].
@@ -2560,9 +3005,10 @@ func dialTarget(rawurl string) (string, string, bool, error) {
 	return host, parsed.RequestURI(), isTLS, nil
 }
 
-// Dial opens a WebSocket client connection to rawurl (ws:// or wss://).
-// It performs the handshake and returns an open [Conn] whose read state is
-// owned by the calling goroutine.
+// Dial opens a WebSocket client connection to rawurl (ws:// or wss://) and
+// returns an open [*Session] whose read state is owned by the calling
+// goroutine. For the raw protocol view — every ping, pong, and close as an
+// event, no automatic pong, fragmented writes — use [DialRaw].
 //
 // The server's subprotocol selection is verified (RFC 6455 §1.9): the 101
 // response may select none, or exactly one of the subprotocols this client
@@ -2575,16 +3021,60 @@ func dialTarget(rawurl string) (string, string, bool, error) {
 // the extension may be declined, or accepted with at most the client's own
 // constraints — anything else fails the dial.
 func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
-	host, path, isTLS, err := dialTarget(rawurl)
+	raw, cfg, err := dialConn(ctx, rawurl, opts...)
 	if err != nil {
 		return nil, err
 	}
 
+	return newSession(raw, cfg.pongHandler), nil
+}
+
+// DialRaw opens a raw WebSocket client connection to rawurl (ws:// or
+// wss://), exactly as [Dial], and returns a [*RawConn]: every ping, pong,
+// and close the peer sends arrives as an [Event] from
+// [RawConn.ReadEvent], nothing is hidden, and writes can be fragmented with
+// [RawConn.WriteFrame].
+//
+// Two defaults differ from [Dial], because a protocol implementer owns the
+// control traffic: keepalive probes are off (no idle timeout is armed) —
+// set [WithIdleTimeout] to enable them; the probe's answer then arrives as
+// an OpPong event — and pings are never answered automatically: by RFC
+// 6455 §5.5.3 you are the responder, with [RawConn.Pong]. A [WithPongHandler]
+// is ignored: pongs are events, not a callback.
+//
+// Everything else — subprotocol verification, compression negotiation, the
+// compliance rules the raw view cannot opt out of (masking, close-code
+// table, UTF-8, the message size limit) — is exactly [Dial]'s.
+func DialRaw(ctx context.Context, rawurl string, opts ...Option) (*RawConn, error) {
+	cfg := defaultDialConfig()
+	cfg.IdleTimeout = 0 // raw: no keepalive probes unless asked for
+	for _, apply := range opts {
+		apply(cfg)
+	}
+	sanitizeLimits(cfg)
+	raw, _, err := dialConnWith(ctx, rawurl, cfg)
+
+	return raw, err
+}
+
+// dialConn dials and performs the handshake, returning the raw connection
+// and the resolved config. The default idle timeout keeps the session
+// keepalive; the caller builds the session view on top.
+func dialConn(ctx context.Context, rawurl string, opts ...Option) (*RawConn, *Config, error) {
 	cfg := defaultDialConfig()
 	for _, apply := range opts {
 		apply(cfg)
 	}
 	sanitizeLimits(cfg)
+
+	return dialConnWith(ctx, rawurl, cfg)
+}
+
+func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *Config, error) {
+	host, path, isTLS, err := dialTarget(rawurl)
+	if err != nil {
+		return nil, nil, err
+	}
 	if d := cfg.dialTimeout; d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
@@ -2593,7 +3083,7 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 
 	conn, err := dialTransport(ctx, host, isTLS, cfg.tlsConfigClient)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	reader := bufio.NewReaderSize(conn, bufSize)
@@ -2602,13 +3092,13 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	if reqErr != nil {
 		_ = conn.Close()
 
-		return nil, reqErr
+		return nil, nil, reqErr
 	}
 	subprotocol, compressed, respErr := readHandshakeResponse(reader, key, cfg.Subprotocols, cfg.Compression)
 	if respErr != nil {
 		_ = conn.Close()
 
-		return nil, respErr
+		return nil, nil, respErr
 	}
 
 	// The handshake is done; clear the connect deadline so the session is
@@ -2616,15 +3106,14 @@ func Dial(ctx context.Context, rawurl string, opts ...Option) (*Conn, error) {
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 
-	session := newConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
-	session.subprotocol = subprotocol
-	session.pongHandler = cfg.pongHandler
+	raw := newRawConn(conn, reader, true, cfg.MaxMessageSize, cfg.IdleTimeout, cfg.WriteTimeout)
+	raw.subprotocol = subprotocol
 	if compressed {
-		session.applyCompression()
-		session.compressLevel = cfg.CompressionLevel
+		raw.applyCompression()
+		raw.compressLevel = cfg.CompressionLevel
 	}
 
-	return session, nil
+	return raw, cfg, nil
 }
 
 // writeHandshakeRequest writes the client's opening HTTP request to conn and

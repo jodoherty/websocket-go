@@ -25,11 +25,12 @@ import (
 // goroutine on any end it is not reading itself, and waits on drains with
 // timeouts rather than trusting they will finish.
 
-// pipeConnPair builds two Conns facing each other over an in-memory pipe —
-// no sockets, no TLS, so the tests are fast and hermetic.
+// pipeConnPair builds two Sessions facing each other over an in-memory
+// pipe — no sockets, no TLS, so the tests are fast and hermetic.
 func pipeConnPair() (server, client *Conn) {
 	sr, cr := net.Pipe()
-	return newConn(sr, sr, false, 1<<20, 0, 0), newConn(cr, cr, true, 1<<20, 0, 0)
+	return newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil),
+		newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
 }
 
 // drain reads conn until it terminates, then signals done. Use it on a pipe

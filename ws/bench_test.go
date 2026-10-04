@@ -27,7 +27,7 @@ func encodeOneFrame(b *testing.B, isClient bool, payload []byte) []byte {
 	b.Helper()
 	var buf bytes.Buffer
 	fc := &frameCodec{bw: bufio.NewWriterSize(&buf, 16<<10), isClient: isClient, maxMsg: 1 << 20}
-	writeErr := fc.writeFrame(OpText, payload, false)
+	writeErr := fc.writeFrame(OpText, payload, false, true)
 	if writeErr != nil {
 		b.Fatalf("encodeOneFrame: %v", writeErr)
 	}
@@ -48,7 +48,7 @@ func BenchmarkFrameCodecWrite(b *testing.B) {
 			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
 			for range b.N {
-				writeErr := fc.writeFrame(OpText, payload, false)
+				writeErr := fc.writeFrame(OpText, payload, false, true)
 				if writeErr != nil {
 					b.Fatal(writeErr)
 				}
@@ -97,8 +97,8 @@ func BenchmarkFrameCodecRead(b *testing.B) {
 func BenchmarkConnRoundTrip(b *testing.B) {
 	payload := benchPayload()
 	sr, cr := net.Pipe()
-	server := newConn(sr, sr, false, 1<<20, 0, 0)
-	client := newConn(cr, cr, true, 1<<20, 0, 0)
+	server := newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil)
+	client := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
 	defer client.Close(StatusNormalClosure, "")
 	defer server.Close(StatusNormalClosure, "")
 
@@ -201,8 +201,8 @@ func BenchmarkClose(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		sr, cr := net.Pipe()
-		server := newConn(sr, sr, false, 1<<20, 0, 0)
-		client := newConn(cr, cr, true, 1<<20, 0, 0)
+		server := newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil)
+		client := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
 		// Both directions need a reader (net.Pipe is bidirectional), or
 		// the close frame and the ack each sit out closeWriteTimeout.
 		serverDrain := drain(b, server)

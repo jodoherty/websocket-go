@@ -34,7 +34,7 @@ func TestWriteHelpersWireFormat(t *testing.T) {
 	t.Parallel()
 
 	fc := &fakeConn{}
-	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
 
 	err := c.WriteText("héllo ☃")
 	if err != nil {
@@ -78,7 +78,7 @@ func TestWriteJSONMarshalFailure(t *testing.T) {
 	t.Parallel()
 
 	fc := &fakeConn{}
-	c := newConn(fc, fc, false, 1<<20, 0, 0)
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
 
 	err := c.WriteJSON(func() {})
 	if err == nil {
