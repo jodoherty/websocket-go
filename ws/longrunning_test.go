@@ -141,8 +141,9 @@ func TestWriteDeadlineUnsticksClose(t *testing.T) {
 // immediateConn is a net.Conn whose writes succeed at once, recording the
 // last write deadline set on it.
 type immediateConn struct {
-	mu sync.Mutex
-	dl time.Time
+	mu    sync.Mutex
+	dl    time.Time
+	armed time.Time
 }
 
 func (i *immediateConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
@@ -157,6 +158,9 @@ func (i *immediateConn) SetReadDeadline(time.Time) error {
 func (i *immediateConn) SetWriteDeadline(t time.Time) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	if !t.IsZero() {
+		i.armed = t
+	}
 	i.dl = t
 	return nil
 }
@@ -164,6 +168,14 @@ func (i *immediateConn) lastDeadline() time.Time {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.dl
+}
+
+// lastArmed returns the most recent non-zero write deadline: the bound a
+// write was made under, even when a later clear has already reset dl.
+func (i *immediateConn) lastArmed() time.Time {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.armed
 }
 
 // TestWriteDeadlineClearedAfterSuccess guards the deferred clear: after a
@@ -184,6 +196,41 @@ func TestWriteDeadlineClearedAfterSuccess(t *testing.T) {
 	err = c.WriteMessage(OpText, []byte("two"))
 	if err != nil {
 		t.Fatalf("second write: %v", err)
+	}
+}
+
+// TestCloseRespectsWriteTimeout pins the close-frame write bound for a
+// connection with [WithWriteTimeout]: the close must arm the connection's
+// own bound, not a separate constant, so a caller that tuned the write
+// timeout to bound teardown gets that bound.
+func TestCloseRespectsWriteTimeout(t *testing.T) {
+	nc := &immediateConn{}
+	c := newConn(nc, nc, true, 1<<20, 0, 250*time.Millisecond)
+
+	err := c.Close(StatusNormalClosure, "")
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Close: got %v, want io.EOF for a normal closure", err)
+	}
+	dl := nc.lastArmed()
+	if d := time.Until(dl) - 250*time.Millisecond; d < -100*time.Millisecond || d > 100*time.Millisecond {
+		t.Fatalf("close armed a write deadline %v out, want about 250ms", time.Until(dl))
+	}
+}
+
+// TestCloseFallbackBoundWithoutWriteTimeout covers the other branch: with no
+// write timeout set, the fixed closeWriteTimeout must still arm, so an
+// untuned connection cannot be held open forever by a silent peer.
+func TestCloseFallbackBoundWithoutWriteTimeout(t *testing.T) {
+	nc := &immediateConn{}
+	c := newConn(nc, nc, true, 1<<20, 0, 0)
+
+	err := c.Close(StatusNormalClosure, "")
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Close: got %v, want io.EOF for a normal closure", err)
+	}
+	dl := nc.lastArmed()
+	if d := time.Until(dl) - closeWriteTimeout; d < -100*time.Millisecond || d > 100*time.Millisecond {
+		t.Fatalf("close armed a write deadline %v out, want about %v", time.Until(dl), closeWriteTimeout)
 	}
 }
 

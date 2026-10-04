@@ -13,6 +13,8 @@ package ws
 //   - ExampleCloseCode: application close codes, end to end
 //   - ExampleWithCheckOrigin: origin allowlist, per-endpoint size cap, and
 //                             per-action authorization (1008)
+//   - ExampleConn_WriteText: the text-frame UTF-8 rule — a refused write
+//                             leaves the connection open
 //
 // Note the // Output: block sits inside each function body: since Go 1.27
 // the golden-output comment is only recognized there; in the old
@@ -24,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -279,4 +282,51 @@ func ExampleCloseCode() {
 	fmt.Println(code, reason, ok)
 	// Output:
 	// 1008 token expired true
+}
+
+// ExampleConn_WriteText demonstrates the text-frame rule (RFC 6455 §5.6):
+// an OpText payload that is not valid UTF-8 is refused before anything
+// reaches the wire, the refusal does not close the connection, and a valid
+// message immediately after is delivered. Applications that move raw byte
+// sequences should use OpBinary — it passes through with no validation.
+func ExampleConn_WriteText() {
+	sr, cr := net.Pipe()
+	server := newConn(sr, sr, false, 1<<20, 0, 0)
+	client := newConn(cr, cr, true, 1<<20, 0, 0)
+	// net.Pipe is bidirectional, so both ends need readers; without them
+	// the teardown close frames would wait out the close-write deadline.
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			_, _, err := server.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		for {
+			_, _, err := client.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	err := client.WriteText("héllo wörld")
+	fmt.Println(err)
+	err = client.WriteMessage(OpText, []byte{0xff, 0xfe})
+	fmt.Println(err)
+	err = client.WriteText("delivered")
+	fmt.Println(err)
+	_ = client.Close(StatusNormalClosure, "")
+	<-serverDone
+	<-clientDone
+	// Output:
+	// <nil>
+	// ws: text message is not valid UTF-8: 2 bytes
+	// <nil>
 }

@@ -57,9 +57,11 @@ hand-written editing.)
    per-connection entries matter because a handshake or close flood
    multiplies that cost: a slow open/close is resource amplification. The
    *bounded* slow paths are deliberately not benchmarked — Close against a
-   stalled transport sits out the full `closeWriteTimeout` per b.N ramp
-   phase; those bounds are correctness properties pinned by deadline
-   tests (`TestWriteDeadlineUnsticksClose`, `TestKeepaliveProbeWriteBounded`).
+   stalled transport sits out its write bound (the connection's
+   `WithWriteTimeout` when set, the fixed `closeWriteTimeout` fallback
+   otherwise) per b.N ramp phase; those bounds are correctness properties
+   pinned by deadline tests (`TestWriteDeadlineUnsticksClose`,
+   `TestKeepaliveProbeWriteBounded`).
    On a Ryzen 7600X a 1 KiB round trip is ~1.4 µs (~710 MB/s) with a single
    allocation (the payload), the masked client write is ~190 ns with zero
    allocations, each side of the handshake is ~3 µs, and the accept key is
@@ -78,7 +80,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **95.2% branch coverage** (395 of 415
+    no-match). The library sits at **95.2% branch coverage** (397 of 417
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -163,4 +165,11 @@ server's permessage-deflate response (the extension must be one the client
 offered, at most once, and must not demand more of the client's compressor
 than it allows), and option limits that fall back to the defaults rather
 than degrading (`sanitizeLimits`): non-positive message sizes and negative
-timeouts can never silently disable a protection.
+timeouts can never silently disable a protection. The per-connection
+write timeout is the bound on the read path's own writes — the automatic
+pong and the keepalive probe — so a peer that sends pings but never reads
+pins the pumping goroutine only until that bound fires and the connection
+dies (the bound is the defense against the ping stall, which is also the
+per-connection cost it lets an attacker buy), and `Close`'s close-frame
+write obeys the same bound (with a fixed fallback when the caller set
+none), so teardown of a stalled connection is always finite.

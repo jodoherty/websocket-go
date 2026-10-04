@@ -1409,6 +1409,17 @@ func (c *Conn) WriteJSON(v any) error {
 // before the FIN, so the frame reaches the peer in order when the transport
 // allows. Concurrent Close callers all observe the same recorded error, from
 // the first one to close.
+//
+// Teardown latency on a stalled transport. The close-frame write is bounded
+// by the connection's [WithWriteTimeout] when one was set, and by a fixed
+// 5-second fallback otherwise — a silent or half-dead peer must not be able
+// to hold the close open forever. Two stacking effects are worth knowing:
+// Close takes the same write mutex as every other writer, so it queues
+// behind an in-flight data write (itself bounded by the write timeout), and
+// the read path answers the peer's close frame with its own, so a peer that
+// stops reading can also delay the [Conn.ReadMessage] that reports the
+// closure by that same bound. Worst case, handler teardown waits on the
+// order of the write timeout plus the close bound.
 func (c *Conn) Close(code int, reason string) error {
 	if code < closeCodeMin || code > closeCodeMax {
 		return fmt.Errorf("%w: %d", errBadCloseCode, code)
@@ -1432,9 +1443,15 @@ func (c *Conn) Close(code int, reason string) error {
 	c.closeErr = closeErrFor(code, reason)
 	// The close frame is sent best-effort: the kernel delivers queued data
 	// before the FIN, so it reaches the peer in order when the transport
-	// allows. The write is bounded — a silent or half-dead peer must not be
-	// able to hold the close open forever.
-	_ = c.nc.SetWriteDeadline(time.Now().Add(closeWriteTimeout))
+	// allows. The write is bounded by the connection's write timeout when
+	// the caller set one — the same bound every other write on this
+	// connection obeys — and by the fixed fallback otherwise, so a silent
+	// or half-dead peer must not be able to hold the close open forever.
+	closeBound := closeWriteTimeout
+	if c.writeTimeout > 0 {
+		closeBound = c.writeTimeout
+	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(closeBound))
 	_ = c.fc.writeFrame(OpClose, payload, false)
 	_ = c.nc.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()

@@ -46,7 +46,13 @@ rather than replace it.
                log.Printf("session ended: code=%d reason=%q err=%v", code, reason, err)
                break
            }
-           _ = c.WriteMessage(op, data)
+           if werr := c.WriteMessage(op, data); werr != nil {
+               // The peer stopped reading: writes into a stalled
+               // transport fail on the write timeout, so stop trying
+               // and let the loop (and the deferred Close) clean up.
+               log.Printf("session write failed: %v", werr)
+               break
+           }
        }
        // connection is gone; deferred cleanups run now
    }))
@@ -94,6 +100,109 @@ rather than replace it.
    payload `ReadMessage` returns, which the caller owns. Writes allocate
    nothing. This is pinned by the allocation-budget tests, not just
    benchmarked.
+
+## Usage: good and bad
+
+These are the design properties that stay true no matter how carefully the
+rest of the application is written, shown as paired examples.
+
+### Every write error is a signal, not a nuisance
+
+A write succeeding does not prove the peer is alive: a stalled transport
+(peer stopped reading, NAT entry expired, link blackholed) absorbs many
+writes into the kernel buffer before it starts failing, and the failure
+arrives on the write timeout, not on the first lost message.
+
+```go
+// good: a failed write means the peer stopped reading — stop sending
+// and let the loop exit; the deferred Close tears the session down.
+if err := c.WriteMessage(op, data); err != nil {
+    log.Printf("session write failed: %v", err)
+    break
+}
+
+// bad: the write silently fails on a stalled transport, the loop keeps
+// "working", and messages are lost until keepalive declares the peer
+// dead — possibly minutes later.
+_ = c.WriteMessage(op, data)
+```
+
+### `OpText` is for text; `OpBinary` is for bytes
+
+Text frames must be valid UTF-8 (RFC 6455 §5.6). A write that is not is
+refused before it reaches the wire — the connection stays open, but an
+unchecked refusal reads exactly like the silent loss above.
+
+```go
+// good: raw byte sequences travel as binary; structured data as JSON.
+err := c.WriteBinary(protobufBuf)
+err = c.WriteJSON(event)
+
+// bad: arbitrary bytes on the text path fail the write; if the error is
+// unchecked, the application believes the data was delivered.
+c.WriteMessage(OpText, rawBytes)
+```
+
+### Teardown is bounded, not instant
+
+`Close` writes a close frame before tearing down the transport, and that
+write is bounded by the connection's `WithWriteTimeout` (falling back to a
+fixed 5 s when unset). On a stalled transport, `Close` can also queue
+behind an in-flight data write, so a handler's `defer c.Close(...)` can
+wait on the order of the write timeout before returning.
+
+```go
+// good: the write timeout is the staleness budget. A service that wants
+// fast teardown of dead sessions sets it to what it can afford to wait;
+// the close bound follows it.
+c, err := up.Upgrade(w, r, ws.WithWriteTimeout(2*time.Second))
+
+// bad: WithWriteTimeout(0) restores unbounded writes — a blackholed peer
+// now pins the read loop (pong write, keepalive probe) and holds the
+// write mutex against Close, all indefinitely.
+c, err := up.Upgrade(w, r, ws.WithWriteTimeout(0))
+```
+
+### A ping is a write, and all writes share one lock
+
+The automatic pong and the keepalive probe take the same write mutex as
+the application's data frames, bounded by the same write timeout. A peer
+that sends pings but never reads can pin the pumping goroutine until that
+bound fires — the bound is the defense, which means the write timeout is
+also the per-connection cost an attacker can buy with pings.
+
+```go
+// good: keep the write timeout proportional to the number of stalled
+// connections you can tolerate at once, and tune WithIdleTimeout to
+// match — a keepalive probe cannot get through behind a stalled write,
+// so an idle window shorter than the write bound only declares peers
+// dead early.
+
+// bad: a 30-minute write timeout for one slow consumer means every
+// stalled connection costs a pinned goroutine for 30 minutes.
+```
+
+### One pumping goroutine per connection
+
+`ReadMessage` is owned by the goroutine that calls it; that goroutine *is*
+the session. Writers may run anywhere, but the reader must not move.
+
+```go
+// good: the handler's loop is the reader; background goroutines only
+// write, and check c.Closed() before sending.
+go func() {
+    for msg := range ticker {
+        if c.Closed() {
+            return
+        }
+        _ = c.WriteMessage(OpBinary, msg)
+    }
+}()
+
+// bad: two goroutines calling ReadMessage interleave frame assembly on
+// the same scratch buffers; the session desynchronizes in ways that are
+// nearly impossible to diagnose.
+```
 
 ## API
 
