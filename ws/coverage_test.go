@@ -8,6 +8,7 @@ package ws_test
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -229,6 +230,16 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	_, err = up.Upgrade(httptest.NewRecorder(), req)
 	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
 		t.Fatalf("no key: %v, want 400", err)
+	}
+
+	// A key that is the base64 of more than 16 octets is malformed
+	// (RFC 6455 §4.1): the length must be exact, so a 20-octet key is
+	// rejected like a short one.
+	req = upgradeReq()
+	req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(make([]byte, 20)))
+	_, err = up.Upgrade(httptest.NewRecorder(), req)
+	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
+		t.Fatalf("long key: %v, want 400", err)
 	}
 }
 
@@ -544,5 +555,99 @@ func TestUpgradeResponseAlreadyStarted(t *testing.T) {
 		upgradeErr.Status != http.StatusBadRequest ||
 		!strings.Contains(upgradeErr.Msg, "unconsumed request data") {
 		t.Fatalf("Upgrade = %v, want a 400 'unconsumed request data'; server response was:\n%s", upErr, response)
+	}
+}
+
+// TestUpgradeSmallPipelinedTail pins the unconsumed-bytes guard at the
+// boundary: even a handful of pipelined bytes after the upgrade request
+// must abort the switch (400), not just a full second request — the
+// leftover bytes would desynchronize the frame stream.
+func TestUpgradeSmallPipelinedTail(t *testing.T) {
+	up := ws.NewUpgrader(ws.WithCheckOrigin(func(*http.Request) bool { return true }))
+	upErrCh := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, request *http.Request) {
+		_, upErr := up.Upgrade(w, request)
+		upErrCh <- upErr
+	})
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	host := strings.TrimPrefix(s.URL, "http://")
+	conn, err := net.Dial("tcp", host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Six pipelined bytes — well under any bufio chunk size, over the
+	// guard's zero threshold.
+	request := "GET /ws HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"\r\n" +
+		"EXTRA1"
+	_, err = conn.Write([]byte(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var response []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		response = append(response, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if got := string(response); !strings.HasPrefix(got, "HTTP/1.1 400") {
+		t.Fatalf("small pipelined tail: response %q, want HTTP/1.1 400 (abort the switch)", got)
+	}
+	upErr, ok := <-upErrCh
+	if !ok {
+		t.Fatalf("Upgrade did not return; server response was:\n%s", response)
+	}
+	upgradeErr := &ws.UpgradeError{}
+	if !errors.As(upErr, &upgradeErr) ||
+		upgradeErr.Status != http.StatusBadRequest ||
+		!strings.Contains(upgradeErr.Msg, "unconsumed request data") {
+		t.Fatalf("Upgrade = %v, want a 400 'unconsumed request data'", upErr)
+	}
+}
+
+// TestNonPositiveMessageSizeFallsBack pins sanitizeLimits on both faces:
+// a non-positive MaxMessageSize must fall back to the default, never stick
+// — a zero limit would reject every frame on both the read and the write
+// side.
+func TestNonPositiveMessageSizeFallsBack(t *testing.T) {
+	up := ws.NewUpgrader(ws.WithMaxMessageSize(0))
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *ws.Session) error {
+		op, data, err := c.ReadMessage()
+		if err != nil {
+			return err
+		}
+		return c.WriteMessage(op, data)
+	}))
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := ws.Dial(ctx, "ws"+strings.TrimPrefix(s.URL, "http")+"/ws", ws.WithMaxMessageSize(0))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close(ws.StatusNormalClosure, "")
+	// A small message round-trips on both faces: the default limit is in
+	// effect, not zero.
+	err = c.WriteMessage(ws.OpText, []byte("fits"))
+	if err != nil {
+		t.Fatalf("write with WithMaxMessageSize(0): %v, want the default limit in effect", err)
+	}
+	_, _, err = c.ReadMessage()
+	if err != nil {
+		t.Fatalf("read with WithMaxMessageSize(0): %v, want the default limit in effect", err)
 	}
 }

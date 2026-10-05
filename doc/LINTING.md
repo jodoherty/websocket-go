@@ -42,6 +42,17 @@ Test files (`_test.go`) get a second, documented exclusion rule — test
 scaffolding is not the drop-in artifact, and stateful tests (shared ports,
 synctest, table-driven literals) make a blanket strict set there noise.
 
+There are no reason-less suppressions in the tree: every `//nolint:` in
+`ws/` and `cmd/` carries the reason inline (the gosec ones, for instance,
+mark the deliberate uses — the RFC-mandated SHA-1 handshake, the bounded
+64-bit length read, the demo's peer-sourced log fields). The two newest
+suppressions are gosec `#nosec` annotations in `cmd/mut` — the
+scratch-module builder joins a file name into a path, and the name's taint
+comes from `os.ReadDir` on the repo's own `ws/` directory. The join is made
+safe by construction (`filepath.Base` plus an identity check rejects any
+path component), and the `#nosec` carries that reason inline rather than
+silencing the check.
+
 `staticcheck -checks=all` enables every `ST`/`SA`/`S` check, including
 several golangci-lint's staticcheck linter does not enable; it is a second
 independent opinion on the same code and also passes clean.

@@ -11,10 +11,21 @@ hand-written editing.)
    frame examples (masked/unmasked, fragmented, 256-byte and 64KiB length
    forms) are taken verbatim from the RFC. If both sides of our stack were
    wrong in the same way, these still fail.
-3. **Fuzzing** (`go test ./ws -run '' -fuzz FuzzReadFrame -fuzztime 30s`) —
-   the frame decoder is hammered with arbitrary byte streams; the invariant
-   is "no panic, no infinite loop, frame or error". Two million executions
-   pass clean.
+3. **Fuzzing** (`make fuzz`; deeper: `go test -fuzz=<target> -fuzztime 600s ./ws`) —
+   seven targets, each run 10 s in the gate. The frame decoder is hammered
+   with arbitrary byte streams; the invariant is "no panic, no infinite
+   loop, frame or error". Beyond the codec, six connection-level targets
+   pump arbitrary streams through the protocol state machines: the session
+   read loop across all four state variants (masking side × compression —
+   where sequence bugs live: fragmentation interleaved with close, RSV1
+   across frames, size and UTF-8 limits on reassembled messages, and
+   close-code resolution), raw traffic with interleaved legal writes, the
+   RFC 7692 extension-negotiation parsers, the subprotocol selection/echo
+   logic, the client's 101-response parser, and Dial's URL→target
+   resolution (which also asserts the request it builds carries no
+   CRLF-injection surface). Tens of millions of executions pass clean; the
+   seed corpus is the legal-frame catalogue every connection-level target
+   starts from.
 4. **Cross-implementation interop** (`e2e/e2e_test.go`) — the strongest
    conformance evidence: Node's `ws` library (a completely separate
    codebase) plays both roles. Node client ↔ Go server verifies echo,
@@ -116,6 +127,29 @@ hand-written editing.)
     and the extension-negotiation parsing contribute 8 of the decisions);
     the other 201 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
+13. **Mutation gate** (`make mut`) — the reverse check on the test
+    evidence above: `cmd/mut` applies each of **68 curated security-
+    relevant mutants** to a scratch copy of the ws package and requires the
+    full test suite to kill it. Each mutant is a single one-spot rewrite of
+    `ws/ws.go` — an operator flip (`>` → `>=`, `==` → `!=`), a bound
+    change (125 → 126, 4999 → 4998), a deleted guard (the masking rule, the
+    RSV1 gate, the pipelined-bytes abort, the subprotocol echo check), or a
+    constant shift (the accept GUID, the close-code range) — curated to the
+    library's security invariants, one or two per invariant: the frame
+    codec and masking, fragmentation and the size/decompression bounds, the
+    close-code table and close state machine, the handshake in both
+    directions, the subprotocol negotiation, the origin gate, and the
+    compression negotiation. The classification: a failing test is
+    **KILLED** (the suite catches that bug); a passing suite is **SURVIVED**
+    — the suite would *not* have caught that bug, which is a real test gap,
+    and any surviving non-equivalent mutant fails the gate; a mutant that
+    does not compile is discarded from the verdict as **UNCOMPILABLE**
+    (standard mutation-testing practice) and flags a stale registry entry.
+    Patterns are validated to occur exactly once in the live source, the
+    same discipline as `cmd/mcdc`. Current state: **68 mutants, 68 killed,
+    0 survivors** — every invariant in the registry is pinned by at least
+    one test, and the gate keeps it that way: a test that gets deleted or
+    weakened stops killing its mutant.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
 The keepalive read loop is timing logic — probe at the boundary, kill on

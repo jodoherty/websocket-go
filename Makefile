@@ -1,6 +1,6 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc multiver e2e demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc mut multiver e2e demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -8,7 +8,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc branchcov coverage multiver e2e
+gate: all race fuzz bench mcdc mut branchcov coverage multiver e2e
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -26,12 +26,24 @@ test:
 race:
 	go test -race ./...
 
-# Ten seconds of the frame-codec fuzzer (run longer for deeper exploration).
-# -run '^$' skips the regular suite (make test already runs it, and
-# -fuzz would run it again); the fuzz engine loads the seed corpus from
-# testdata/fuzz regardless, so no exploration time is lost.
+# Ten seconds per fuzz target (run longer for deeper exploration:
+# go test -fuzz=<target> -fuzztime=600s ./ws/). -run '^$' skips the regular
+# suite (make test already runs it, and -fuzz would run it again).
+FUZZ_TARGETS ?= FuzzReadFrame FuzzSessionRead FuzzRawTraffic FuzzCompressionParams FuzzSubprotocolNegotiation FuzzHandshakeResponse FuzzDialURL
 fuzz:
-	go test -fuzz=FuzzReadFrame -fuzztime=10s -run '^$$' ./ws/
+	@for target in $(FUZZ_TARGETS); do \
+		echo "fuzz: $$target"; \
+		go test -fuzz=$$target -fuzztime=10s -run '^$$' ./ws/ || exit 1; \
+	done
+
+# Mutation gate: apply each curated security-relevant mutation to a scratch
+# copy of ws/ws.go and require the test suite to kill it. A survivor is a
+# real coverage gap (a behavior the suite does not pin); an uncompilable
+# mutant is a stale registry entry. Run verbose for per-mutant output:
+# go run ./cmd/mut -v.
+MUT_WORKERS ?= 16
+mut:
+	go run ./cmd/mut -workers $(MUT_WORKERS)
 
 bench:
 	go test -bench=. -benchmem -run XXX ./ws/

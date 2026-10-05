@@ -559,6 +559,54 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 	}
 }
 
+// TestCloseReasonLengthBoundary pins the close payload's size arithmetic:
+// a reason of exactly maxCloseReason (123) bytes fits the 125-byte close
+// payload (2-byte code + reason) and must not be truncated; one more byte
+// truncates it back to the limit.
+func TestCloseReasonLengthBoundary(t *testing.T) {
+	t.Parallel()
+	// A reason of exactly maxCloseReason (123) bytes fits untruncated.
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
+	_ = c.Close(StatusGoingAway, strings.Repeat("a", 123))
+	reply, ok := closeReply(fc)
+	if !ok || len(reply) != 2+123 {
+		t.Fatalf("123-byte reason: payload % x, want 125 bytes (code + reason)", reply)
+	}
+	if replyCode(reply) != StatusGoingAway {
+		t.Fatalf("code %d, want 1001", replyCode(reply))
+	}
+	// 124 bytes must truncate back to the 123-byte limit.
+	fc = &fakeConn{}
+	c = newRawConn(fc, fc, false, 1<<20, 0, 0)
+	_ = c.Close(StatusGoingAway, strings.Repeat("a", 124))
+	reply, ok = closeReply(fc)
+	if !ok || len(reply) != 2+123 {
+		t.Fatalf("124-byte reason: payload % x, want 125 bytes (truncated)", reply)
+	}
+}
+
+// TestConnectionHeaderTokenList pins the RFC 6455 §4.1 token check on the
+// Connection header: the value is a comma-separated list of tokens, so
+// "Upgrade" anywhere in the list satisfies the check. Splitting on the
+// wrong delimiter (or requiring the whole value to be the token) would
+// reject a legal handshake.
+func TestConnectionHeaderTokenList(t *testing.T) {
+	t.Parallel()
+	h := http.Header{}
+	h.Add("Connection", "keep-alive, Upgrade")
+	if !headerContainsToken(h, "Connection", "Upgrade") {
+		t.Fatal("comma-separated Connection list: Upgrade not found")
+	}
+	// A value where Upgrade is only a substring of a longer token must
+	// not match: the tokens are compared whole, case-insensitively.
+	h2 := http.Header{}
+	h2.Add("Connection", "upgrade-x")
+	if headerContainsToken(h2, "Connection", "Upgrade") {
+		t.Fatal("substring token: Upgrade matched where it should not")
+	}
+}
+
 // TestPeerCloseReasonRequiresUTF8 pins RFC 6455 §7.1.5/§8.1 on the read
 // side: a peer close frame whose reason is not valid UTF-8 fails the
 // connection with 1002 — answered on the wire with a 1002, never the
@@ -589,6 +637,33 @@ func TestPeerCloseReasonRequiresUTF8(t *testing.T) {
 	}
 	if reply != StatusNormalClosure {
 		t.Fatalf("1000 with reason: reply %d, want 1000", reply)
+	}
+}
+
+// TestCloseCodeUpperBoundary pins the close-code range's upper bound
+// (RFC 6455 §7.4): 4999 is a usable code — a peer close carrying it is
+// delivered with that code, not failed as unusable, and a local Close
+// with it puts it on the wire. 5000 (above the range) is pinned by
+// TestMCDCCloseCode.
+func TestCloseCodeUpperBoundary(t *testing.T) {
+	t.Parallel()
+	// Peer close 4999: delivered, and the reply echoes 4999.
+	errStr, reply := runPeerClose(t, []byte{0x13, 0x87}) // 4999
+	if reply != 4999 {
+		t.Fatalf("4999: reply %d, want 4999 echoed", reply)
+	}
+	if !strings.Contains(errStr, "closed with code 4999") {
+		t.Fatalf("4999: %q, want closed with code 4999", errStr)
+	}
+	// Local close 4999: the code goes on the wire.
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
+	err := c.Close(4999, "boundary")
+	if err == nil {
+		t.Fatal("Close(4999) returned nil, want the recorded CloseError")
+	}
+	if reply, ok := closeReply(fc); !ok || replyCode(reply) != 4999 {
+		t.Fatalf("4999 on the wire: % x, want code 4999", reply)
 	}
 }
 

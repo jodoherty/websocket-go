@@ -95,7 +95,10 @@ make lint        # golangci-lint, every linter enabled (.golangci.yml)
 make staticcheck # staticcheck -checks=all
 make test        # go test ./...
 make race        # go test -race ./...
-make fuzz        # frame-codec fuzzer, 10 s
+make fuzz        # fuzz targets: the frame codec plus the connection-level
+                # protocol state machines, 10 s each
+make mut         # mutation gate: every curated security mutation must be
+                # killed by the test suite
 make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
@@ -160,7 +163,15 @@ ws/ws.go            the entire library in one file — copy it into an
 ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation
 ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)
-ws/fuzz_test.go     FuzzReadFrame — codec safety fuzz target
+ws/fuzz_test.go     fuzz targets: FuzzReadFrame (codec safety) plus six
+                    connection-level targets — the session read loop in all
+                    four state variants (FuzzSessionRead), raw traffic with
+                    interleaved legal writes (FuzzRawTraffic), the RFC 7692
+                    negotiation parsers (FuzzCompressionParams), subprotocol
+                    selection/echo (FuzzSubprotocolNegotiation), the client
+                    101-response parser (FuzzHandshakeResponse), and Dial
+                    URL→target resolution with CRLF-injection invariants
+                    (FuzzDialURL)
 ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
@@ -222,6 +233,11 @@ cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
 cmd/mcdc/       MC/DC audit: enumerates every compound decision, computes
                 the required independence pairs from the boolean structure,
                 and verifies each is traced to an existing test subtest
+cmd/mut/        mutation gate: applies each of 68 curated security-relevant
+                one-spot rewrites (operator flips, bound changes, deleted
+                guards, constant shifts) to a scratch copy of the ws package
+                and requires the full test suite to kill it; a surviving
+                non-equivalent mutant is a test gap and fails the gate
 doc/USAGE.md      user-facing guide: design, API, running, VNC example
 doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions
@@ -238,7 +254,7 @@ e2e/            e2e suites:
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make gate (the full set) plus the
                     individual lint / staticcheck / test / race / fuzz /
-                    bench / mcdc / branchcov / coverage / e2e targets
+                    mut / bench / mcdc / branchcov / coverage / e2e targets
 ```
 
 ## Workflow

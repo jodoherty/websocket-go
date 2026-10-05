@@ -453,3 +453,28 @@ func TestRawServerFaces(t *testing.T) {
 		t.Fatalf("terminal error = %v, want io.EOF", err)
 	}
 }
+
+// TestContinuationAfterCompleteFrameRefused pins the fragmentation state
+// clearing: a complete data frame (more=false) leaves no message in
+// progress, so the next WriteFrame(OpContinuation) is a standalone
+// continuation and must be refused — a sticky state would accept it and
+// hand the peer a continuation that starts nowhere (RFC 6455 §5.4).
+func TestContinuationAfterCompleteFrameRefused(t *testing.T) {
+	t.Parallel()
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, true, 1<<20, 0, 0)
+	err := c.WriteFrame(OpText, []byte("hi"), false)
+	if err != nil {
+		t.Fatalf("complete frame: %v", err)
+	}
+	err = c.WriteFrame(OpContinuation, []byte("x"), false)
+	if err == nil {
+		t.Fatal("standalone continuation after a complete frame: accepted, want refusal")
+	}
+	// The connection is untouched by the refusal: a fresh complete frame
+	// still writes.
+	err = c.WriteFrame(OpBinary, []byte("ok"), false)
+	if err != nil {
+		t.Fatalf("frame after the refusal: %v", err)
+	}
+}

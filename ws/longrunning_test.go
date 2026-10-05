@@ -1,9 +1,12 @@
 package ws
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
@@ -356,5 +359,58 @@ func TestClosedSignal(t *testing.T) {
 
 	if !c.Closed() {
 		t.Fatal("Closed() false after Close")
+	}
+}
+
+// TestTerminalReadErrorLeavesConnectionClosed pins finish's state store: a
+// terminal error recorded by the read path (here a transport EOF) must
+// leave the connection closed — Closed() true, and a later write fails with
+// the recorded error. If the state store were skipped the connection would
+// be in a torn state: the terminal error recorded but the connection still
+// open, so the later write would silently succeed.
+func TestTerminalReadErrorLeavesConnectionClosed(t *testing.T) {
+	// An empty stream: the first read hits EOF, a terminal transport error.
+	fc := &fakeConn{}
+	c := newSession(newRawConn(fc, fc, true, 1<<20, 0, 0), nil)
+	_, _, err := c.ReadMessage()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal read = %v, want io.EOF", err)
+	}
+	if !c.Closed() {
+		t.Fatal("Closed() false after the terminal read error")
+	}
+	err = c.WriteText("late")
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("write after terminal error = %v, want the recorded error (io.EOF)", err)
+	}
+}
+
+// TestDefaultWriteTimeoutApplies pins the default write bound: it must be a
+// positive bound on both faces, never zero. Zero is the documented
+// opt-out (unbounded writes); a zero default would let a blackholed peer
+// wedge a write — and, with it, Close — forever.
+func TestDefaultWriteTimeoutApplies(t *testing.T) {
+	if defaultWriteTimeout <= 0 {
+		t.Fatalf("default write bound = %v, want a positive bound", defaultWriteTimeout)
+	}
+	if got := NewUpgrader().writeTimeout; got <= 0 {
+		t.Fatalf("server default write bound = %v, want the positive default", got)
+	}
+
+	// Client face: a dialed session must carry the same bound.
+	up := NewUpgrader()
+	mux := http.NewServeMux()
+	mux.Handle("/ws", up.Handle(func(_ *http.Request, _ *Session) error { return nil }))
+	s := httptest.NewServer(mux)
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, wsURL(s.URL)+"/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close(StatusNormalClosure, "")
+	if got := c.raw.writeTimeout; got <= 0 {
+		t.Fatalf("client default write bound = %v, want the positive default", got)
 	}
 }

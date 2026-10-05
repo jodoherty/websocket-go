@@ -807,3 +807,38 @@ func TestCompressTailCheck(t *testing.T) {
 		})
 	}
 }
+
+// TestDecompressedMessageAtLimitSucceeds pins the decompression bound's
+// inclusivity: a compressed message whose expanded form is exactly
+// MaxMessageSize is legal and must be delivered; only a larger expansion
+// fails the connection (TestDeflateDecompressionErrors covers that side).
+// A boundary that rejected exactly-at-limit output would drop legal
+// messages.
+func TestDecompressedMessageAtLimitSucceeds(t *testing.T) {
+	t.Parallel()
+	const limit = 100
+	srv := startCompressedEchoServer(t, WithMaxMessageSize(limit))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := Dial(ctx, "ws"+srv.URL[len("http"):]+"/echo",
+		WithMaxMessageSize(limit), WithIdleTimeout(0))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(StatusNormalClosure, "")
+	if !conn.Compressed() {
+		t.Fatal("Compressed() = false, want true for a default dial")
+	}
+	// Exactly limit bytes of one rune compress to a frame far under the
+	// limit, and inflate back to exactly the limit on both sides.
+	payload := bytes.Repeat([]byte("a"), limit)
+	writeErr := conn.WriteMessage(OpBinary, payload)
+	if writeErr != nil {
+		t.Fatalf("write at the decompressed limit: %v", writeErr)
+	}
+	op, data, err := conn.ReadMessage()
+	if err != nil || op != OpBinary || !bytes.Equal(data, payload) {
+		t.Fatalf("read at the decompressed limit = (%d, %d bytes, %v), want %d bytes, nil",
+			op, len(data), err, limit)
+	}
+}
