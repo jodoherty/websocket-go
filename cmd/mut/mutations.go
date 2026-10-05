@@ -117,6 +117,22 @@ func controlFrameMutations() []mutation {
 			Invariant: "the compressed bit on a control frame must be a protocol error " +
 				"(RFC 7692 §6); inverting rejects compressed data frames instead",
 		},
+		{
+			Name: "ping-maxmsg-guard-drop",
+			Pattern: "if int64(len(payload)) > c.fc.maxMsg {\n\t\t" +
+				"return fmt.Errorf(\"%w: ping of %d bytes exceeds the %d byte limit\",",
+			Replacement: guardDropClause + "\n\t\treturn fmt.Errorf(\"%w: ping of %d bytes exceeds the %d byte limit\",",
+			Invariant: "Ping must respect the connection's message size limit, as the " +
+				"read side applies it to every received frame, control frames included",
+		},
+		{
+			Name: "pong-maxmsg-guard-drop",
+			Pattern: "if int64(len(payload)) > c.fc.maxMsg {\n\t\t" +
+				"return fmt.Errorf(\"%w: pong of %d bytes exceeds the %d byte limit\",",
+			Replacement: guardDropClause + "\n\t\treturn fmt.Errorf(\"%w: pong of %d bytes exceeds the %d byte limit\",",
+			Invariant: "Pong must respect the connection's message size limit, as the " +
+				"read side applies it to every received frame, control frames included",
+		},
 	}
 }
 

@@ -13,6 +13,12 @@
 //   - a mutant that does not compile is discarded from the verdict (standard
 //     mutation-testing practice) and reported as UNCOMPILABLE.
 //
+// The gate verifies itself before and during the run: a toolchain that
+// cannot load the module (for instance, one older than go.mod's go
+// directive) fails the gate up front, and a run in which every single
+// mutant is uncompilable fails it as well — a gate that verified nothing
+// must never pass.
+//
 // The registry is curated to the library's security invariants — masking,
 // size limits, the close-code table, UTF-8, the handshake, the origin gate,
 // the compression negotiation, the close state machine — one or two
@@ -71,6 +77,7 @@ const (
 	scratchDirPerm  = 0o700
 	scratchFilePerm = 0o600
 	mutantRunGrace  = 10 * time.Minute
+	envProbeGrace   = 2 * time.Minute
 )
 
 type mutation struct {
@@ -93,12 +100,34 @@ func main() {
 	verbose := flag.Bool("v", false, "print each mutant as it finishes")
 	flag.Parse()
 
+	checkEnvironment()
+
 	source, err := os.ReadFile("ws/ws.go")
 	if err != nil {
 		log.Fatalf("read ws/ws.go: %v", err)
 	}
 
 	report(runMutants(selectMutants(string(source), *only), *workers, *verbose))
+}
+
+// checkEnvironment verifies that the local toolchain can load the module
+// before a single mutant runs. testMutant pins GOTOOLCHAIN=local for each
+// scratch run, so the probe does the same: a toolchain chain where the
+// gate itself runs on one toolchain while the local one is older than
+// go.mod's go directive would otherwise classify every mutant as
+// UNCOMPILABLE and let the gate pass while verifying nothing. A broken
+// environment fails loudly here; the command is trivial (package metadata
+// only) and its output is the diagnostic.
+func checkEnvironment() {
+	ctx, cancel := context.WithTimeout(context.Background(), envProbeGrace)
+	cmd := exec.CommandContext(ctx, "go", "list", "./ws")
+	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
+	combined, err := cmd.CombinedOutput()
+	cancel()
+	if err != nil {
+		log.Fatalf("environment check failed — no mutant can run, so the gate would pass vacuously:\n%s",
+			strings.TrimSpace(string(combined)))
+	}
 }
 
 // selectMutants filters the registry by the -only regexp and validates
@@ -191,6 +220,11 @@ func report(finished []result) {
 	uncompilable := len(finished) - killed - survived
 	outf("\nmuts: %d total, %d killed, %d survived (%d equivalent), %d uncompilable\n",
 		len(finished), killed, survived, survived-gaps, uncompilable)
+	if len(finished) > 0 && uncompilable == len(finished) {
+		outf("status: FAIL — every mutant is uncompilable; the gate verified nothing " +
+			"(broken environment or a fully stale registry)\n")
+		os.Exit(1)
+	}
 	if gaps > 0 {
 		outf("status: FAIL — %d surviving non-equivalent mutants are test gaps\n", gaps)
 		os.Exit(1)

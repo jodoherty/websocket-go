@@ -39,8 +39,10 @@ fuzz:
 # Mutation gate: apply each curated security-relevant mutation to a scratch
 # copy of ws/ws.go and require the test suite to kill it. A survivor is a
 # real coverage gap (a behavior the suite does not pin); an uncompilable
-# mutant is a stale registry entry. Run verbose for per-mutant output:
-# go run ./cmd/mut -v.
+# mutant is a stale registry entry. The gate first probes that the local
+# toolchain can load the module, and fails if every mutant is uncompilable:
+# a gate that verifies nothing must never pass. Run verbose for
+# per-mutant output: go run ./cmd/mut -v.
 MUT_WORKERS ?= 16
 mut:
 	go run ./cmd/mut -workers $(MUT_WORKERS)

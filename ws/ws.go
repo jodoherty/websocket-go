@@ -2367,11 +2367,17 @@ func (c *RawConn) validateRawFrame(opcode Op, payload []byte, more bool) error {
 // OpPong [Event]. Any frame — the pong included — resets the keepalive
 // idle clock, so an application ping also proves liveness.
 //
-// A ping is a control frame, so its payload is at most 125 bytes.
+// A ping is a control frame, so its payload is at most 125 bytes — and, as
+// on the read side, it must also respect the connection's message size
+// limit, since the limit applies to every frame the peer receives.
 func (c *RawConn) Ping(payload []byte) error {
 	if len(payload) > maxControlPayload {
 		return fmt.Errorf("%w: ping payload of %d bytes exceeds the %d byte control-frame limit",
 			errProtocol, len(payload), maxControlPayload)
+	}
+	if int64(len(payload)) > c.fc.maxMsg {
+		return fmt.Errorf("%w: ping of %d bytes exceeds the %d byte limit",
+			errMessageTooBig, len(payload), c.fc.maxMsg)
 	}
 
 	return c.writeFrame(OpPing, payload, false)
@@ -2385,11 +2391,17 @@ func (c *RawConn) Ping(payload []byte) error {
 // connection dead. The RFC prescribes echoing the ping's payload; your
 // protocol may use the payload for its own correlation instead.
 //
-// A pong is a control frame, so its payload is at most 125 bytes.
+// A pong is a control frame, so its payload is at most 125 bytes — and, as
+// on the read side, it must also respect the connection's message size
+// limit.
 func (c *RawConn) Pong(payload []byte) error {
 	if len(payload) > maxControlPayload {
 		return fmt.Errorf("%w: pong payload of %d bytes exceeds the %d byte control-frame limit",
 			errProtocol, len(payload), maxControlPayload)
+	}
+	if int64(len(payload)) > c.fc.maxMsg {
+		return fmt.Errorf("%w: pong of %d bytes exceeds the %d byte limit",
+			errMessageTooBig, len(payload), c.fc.maxMsg)
 	}
 
 	return c.writeFrame(OpPong, payload, false)

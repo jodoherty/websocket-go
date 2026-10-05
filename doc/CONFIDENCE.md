@@ -128,7 +128,7 @@ hand-written editing.)
     the other 201 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
 13. **Mutation gate** (`make mut`) — the reverse check on the test
-    evidence above: `cmd/mut` applies each of **68 curated security-
+    evidence above: `cmd/mut` applies each of **70 curated security-
     relevant mutants** to a scratch copy of the ws package and requires the
     full test suite to kill it. Each mutant is a single one-spot rewrite of
     `ws/ws.go` — an operator flip (`>` → `>=`, `==` → `!=`), a bound
@@ -146,7 +146,12 @@ hand-written editing.)
     does not compile is discarded from the verdict as **UNCOMPILABLE**
     (standard mutation-testing practice) and flags a stale registry entry.
     Patterns are validated to occur exactly once in the live source, the
-    same discipline as `cmd/mcdc`. Current state: **68 mutants, 68 killed,
+    same discipline as `cmd/mcdc`. The gate also verifies its own
+    environment: before the first mutant runs it probes that the local
+    toolchain (which every scratch run is pinned to) can load the module,
+    and a run in which every single mutant is uncompilable fails it — a
+    gate that would verify nothing must never pass. Current state:
+    **70 mutants, 70 killed,
     0 survivors** — every invariant in the registry is pinned by at least
     one test, and the gate keeps it that way: a test that gets deleted or
     weakened stops killing its mutant.

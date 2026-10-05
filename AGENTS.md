@@ -98,7 +98,8 @@ make race        # go test -race ./...
 make fuzz        # fuzz targets: the frame codec plus the connection-level
                 # protocol state machines, 10 s each
 make mut         # mutation gate: every curated security mutation must be
-                # killed by the test suite
+                # killed by the test suite; the gate fails if the environment
+                # cannot run the mutants or if every mutant is uncompilable
 make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make branchcov   # per-branch coverage, unit + e2e merged
@@ -233,11 +234,12 @@ cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
 cmd/mcdc/       MC/DC audit: enumerates every compound decision, computes
                 the required independence pairs from the boolean structure,
                 and verifies each is traced to an existing test subtest
-cmd/mut/        mutation gate: applies each of 68 curated security-relevant
+cmd/mut/        mutation gate: applies each of 70 curated security-relevant
                 one-spot rewrites (operator flips, bound changes, deleted
                 guards, constant shifts) to a scratch copy of the ws package
                 and requires the full test suite to kill it; a surviving
-                non-equivalent mutant is a test gap and fails the gate
+                non-equivalent mutant is a test gap and fails the gate, and so
+                does an environment in which no mutant can run
 doc/USAGE.md      user-facing guide: design, API, running, VNC example
 doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions

@@ -95,6 +95,71 @@ func TestRawPongAnswer(t *testing.T) {
 	}
 }
 
+// TestPingPongEnforceMessageSizeLimit pins the read/write symmetry of the
+// connection's message size limit on control frames: the read side applies
+// the limit to every frame the peer sends, control frames included, so the
+// Ping and Pong helpers must refuse payloads over the limit before they
+// reach the wire — a peer enforcing the same limit would fail the
+// connection on the over-limit ping rather than answer it. (WriteFrame
+// already enforced the limit; this closes the asymmetry with the helpers.)
+func TestPingPongEnforceMessageSizeLimit(t *testing.T) {
+	t.Parallel()
+
+	// The write side: at a limit below the 125-byte control maximum the
+	// helpers refuse a full-size payload exactly as WriteFrame does.
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, true, 100, 0, 0)
+	payload := make([]byte, maxControlPayload)
+	err := c.Ping(payload)
+	if err == nil || !errors.Is(err, errMessageTooBig) {
+		t.Fatalf("Ping(125) with a 100-byte limit = %v, want the size-limit refusal", err)
+	}
+	err = c.Pong(payload)
+	if err == nil || !errors.Is(err, errMessageTooBig) {
+		t.Fatalf("Pong(125) with a 100-byte limit = %v, want the size-limit refusal", err)
+	}
+	if len(fc.written) != 0 {
+		t.Fatalf("refused helpers wrote % x, want nothing", fc.written)
+	}
+
+	// Under both limits the helpers still write, and at the default limit
+	// a full-size payload goes to the wire.
+	err = c.Ping([]byte("fit"))
+	if err != nil {
+		t.Fatalf("Ping under both limits: %v", err)
+	}
+	if len(fc.written) != 2+maskKeyLen+3 || Op(fc.written[0]&opcodeMask) != OpPing {
+		t.Fatalf("ping frame = % x, want a masked 3-byte ping", fc.written)
+	}
+	fc2 := &fakeConn{}
+	c2 := newRawConn(fc2, fc2, true, 1<<20, 0, 0)
+	err = c2.Ping(payload)
+	if err != nil {
+		t.Fatalf("Ping(125) at the default limit: %v", err)
+	}
+	if len(fc2.written) != 2+maskKeyLen+maxControlPayload {
+		t.Fatalf("ping frame length = %d, want %d",
+			len(fc2.written), 2+maskKeyLen+maxControlPayload)
+	}
+
+	// The read side, already: the peer's full-size ping is a protocol
+	// violation on this connection — the same outcome the write side now
+	// prevents locally. 0x99 is fin|mask|ping; 0x7d is the 125-byte length.
+	mask := [4]byte{0xCA, 0xFE, 0x42, 0x13}
+	peer := []byte{0x99, 0x7D}
+	peer = append(peer, mask[:]...)
+	for i := range maxControlPayload {
+		peer = append(peer, mask[i&3])
+	}
+	fc3 := &fakeConn{data: peer}
+	c3 := newSession(newRawConn(fc3, fc3, false, 100, 0, 0), nil)
+	_, _, err = c3.ReadMessage()
+	var ce *CloseError
+	if err == nil || !errors.As(err, &ce) || ce.Code != StatusProtocolError {
+		t.Fatalf("read of a peer ping(125) at a 100-byte limit = %v, want CloseError 1002", err)
+	}
+}
+
 // TestRawFragmentedWrite pins the fragmented write contract: a start frame
 // plus a continuation frame are reassembled by the peer into the one
 // message the read reports.
