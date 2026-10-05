@@ -143,6 +143,34 @@ server-side `Upgrade`/`Handle` produce a session, `UpgradeRaw`/`HandleRaw`
 the raw connection. A session never exposes its raw connection — two read
 loops over one transport would race.
 
+## Transports
+
+The protocol core is transport-agnostic; only the handshake surface changes.
+One handler serves WebSockets over all three transports:
+
+- **HTTP/1.1** — the classic `Upgrade` request, the default and the only path
+  on toolchains whose HTTP/2 server does not route extended CONNECT.
+- **HTTP/2 and HTTP/3** — the same handshake rides an *extended CONNECT*
+  (RFC 8441 / RFC 9220). `Upgrader.Upgrade` detects it from the request method
+  and the `:protocol` pseudo-header, opens the tunnel with full-duplex I/O, and
+  answers with a 200 whose body is the frame stream. A standard-library
+  handler needs no changes: when the toolchain's HTTP/2 server routes
+  extended CONNECT the CONNECT branch is simply taken; otherwise it is inert
+  and clients use the HTTP/1.1 upgrade.
+
+Because the frame loop reads `request.Body` and writes the response body, the
+server has no per-stream deadline to set over h2/h3 — this package's keepalive
+read deadline and bounded-write guarantee (which hold over a hijacked
+`net.Conn`) do not apply on that path, and liveness rests on the transport's
+own idle timeout instead.
+
+For a stream the standard library does not drive — an HTTP/3 or QUIC stream
+from an external transport — use `Upgrader.SessionOnStream(stream,
+subprotocol, extension)`. The application runs the extended-CONNECT handshake
+on the stream itself and hands the open stream over; a stream that also
+reports an address and deadlines (a `net.Conn`) is used directly, and a bare
+stream is wrapped so it still reports a nil address and no-op deadlines.
+
 ## Usage: good and bad
 
 These are the design properties that stay true no matter how carefully the

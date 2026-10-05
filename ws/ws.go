@@ -177,6 +177,20 @@
 //     spec, so this package fails with 1007 (invalid data type) — the
 //     interop-correct choice for §7.4.
 //
+// # HTTP/2 and HTTP/3
+//
+// One handler serves WebSockets over all three transports. The HTTP/1.1
+// handshake is the [Upgrader.Upgrade] request; over HTTP/2 and HTTP/3 the same
+// handshake rides an extended CONNECT (RFC 8441 / RFC 9220), which
+// [Upgrader.Upgrade] detects from the request method and the :protocol
+// pseudo-header and answers with a 200 whose body is the frame tunnel. Where a
+// toolchain's HTTP/2 server does not route extended CONNECT the CONNECT branch
+// is simply never taken and clients use the HTTP/1.1 upgrade instead.
+// [Upgrader.SessionOnStream] is the entry point for a stream the standard
+// library does not drive — an HTTP/3 or QUIC stream — which the application
+// hands over after running the extended-CONNECT handshake on it itself. The
+// protocol core is transport-agnostic; only the handshake surface changes.
+//
 // # File map
 //
 // This is a single-file implementation. Go does not require declaration
@@ -187,8 +201,9 @@
 //     write/close/accessor surface
 //  2. options: [Option], [Config], and every [WithSubprotocols] function
 //  3. server entry: [Upgrader], [Upgrader.Upgrade]/[Upgrader.UpgradeRaw],
-//     [Upgrader.Handle]/[Upgrader.HandleRaw], the handshake validation and
-//     negotiation helpers
+//     [Upgrader.Handle]/[Upgrader.HandleRaw], [Upgrader.SessionOnStream], and
+//     the handshake validation and negotiation helpers (the HTTP/1.1 Upgrade
+//     and the HTTP/2/3 extended CONNECT)
 //  4. client entry: [Dial]/[DialRaw] and the dial-time handshake
 //  5. the raw face: [RawConn], [Event], [RawConn.ReadEvent], keepalive,
 //     close-code resolution, [RawConn.WriteFrame]/[RawConn.Pong] and the
@@ -680,16 +695,12 @@ func rejectOnConn(raw net.Conn, status int, msg string) *UpgradeError {
 	return &UpgradeError{Status: status, Msg: msg}
 }
 
-// checkHandshakeHeaders validates the websocket protocol headers on the
-// request and returns its Sec-WebSocket-Key (RFC 6455 §4.1-§4.2): the
-// Connection and Upgrade tokens, exactly one supported
-// Sec-WebSocket-Version, and exactly one well-formed Sec-WebSocket-Key —
-// the base64 of exactly 16 octets. Several header lines for the
-// single-value headers are a malformed handshake: the value would be
-// ambiguous, so they are rejected rather than resolved to the first line.
-// Each rejection writes the HTTP error response itself; the version-mismatch
-// response additionally names the version(s) the server understands, per
-// §4.2.
+// checkHandshakeHeaders validates the HTTP/1.1 Upgrade handshake on the
+// request and returns its Sec-WebSocket-Key: the Connection and Upgrade
+// tokens, then the shared version-and-key checks of [checkWebSocketKey]. The
+// Connection and Upgrade tokens are HTTP/1.1-only; over HTTP/2 and HTTP/3 the
+// protocol is named by the :protocol pseudo-header instead and those checks
+// are skipped.
 func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
 	if !headerContainsToken(request.Header, "Connection", "Upgrade") {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Connection: Upgrade header")
@@ -697,6 +708,20 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 	if !headerContainsToken(request.Header, "Upgrade", "websocket") {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Upgrade: websocket header")
 	}
+
+	return checkWebSocketKey(writer, request)
+}
+
+// checkWebSocketKey validates the RFC 6455 §4.2 fields carried by BOTH the
+// HTTP/1.1 Upgrade and the HTTP/2/3 extended-CONNECT handshake — exactly one
+// supported Sec-WebSocket-Version and exactly one well-formed
+// Sec-WebSocket-Key, the base64 of 16 octets — and returns the key. Several
+// header lines for a single-value header are a malformed handshake: the value
+// would be ambiguous, so they are rejected rather than resolved to the first
+// line. Each rejection writes the HTTP error response itself; the
+// version-mismatch response additionally names the version(s) the server
+// understands, per §4.2.
+func checkWebSocketKey(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
 	versions := request.Header.Values("Sec-WebSocket-Version")
 	if len(versions) == 0 {
 		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Version header")
@@ -796,6 +821,15 @@ func (u *Upgrader) UpgradeRaw(writer http.ResponseWriter, request *http.Request)
 // returns the raw connection; [Upgrader.Upgrade] wraps it in a [*Session]
 // on top.
 func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request) (*RawConn, error) {
+	// RFC 8441 / RFC 9220: over HTTP/2 and HTTP/3 the WebSocket handshake rides
+	// an extended CONNECT instead of the HTTP/1.1 Upgrade, and the transport
+	// surfaces the negotiated protocol as the :protocol pseudo-header. Branch on
+	// the request shape so one handler serves a client that upgraded (h1) or
+	// connected (h2/h3); on a toolchain whose HTTP/2 server does not route
+	// extended CONNECT the branch is simply never taken and h1 is used.
+	if request.Method == http.MethodConnect {
+		return u.upgradeConnect(writer, request)
+	}
 	if request.Method != http.MethodGet {
 		return reject(writer, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -856,17 +890,15 @@ func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request
 		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
 
-	return u.finishRaw(raw, buf, protocol, extension), nil
+	return u.finishRaw(raw, buf.Reader, protocol, extension), nil
 }
 
 // finishRaw assembles the upgraded raw connection: the frame codec on the
-// hijacked stream with the negotiated session state and the
-// permessage-deflate switch when the extension was granted. The caller
-// wraps it in a [*Session] when the message-oriented view was asked for.
-func (u *Upgrader) finishRaw(raw net.Conn, buf *bufio.ReadWriter, protocol string,
-	extension string,
-) *RawConn {
-	conn := newRawConn(raw, buf.Reader, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
+// upgraded channel with the negotiated session state and the permessage-deflate
+// switch when the extension was granted. The caller wraps it in a [*Session]
+// when the message-oriented view was asked for.
+func (u *Upgrader) finishRaw(channel transport, read io.Reader, protocol, extension string) *RawConn {
+	conn := newRawConn(channel, read, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
 	if extension != "" {
 		conn.applyCompression()
@@ -874,6 +906,116 @@ func (u *Upgrader) finishRaw(raw net.Conn, buf *bufio.ReadWriter, protocol strin
 	}
 
 	return conn
+}
+
+// upgradeConnect handles a WebSocket that arrived as an HTTP/2 or HTTP/3
+// extended CONNECT (RFC 8441 / RFC 9220). The handshake headers are the RFC
+// 6455 set minus the HTTP/1.1-only Connection and Upgrade tokens — the
+// protocol is named by the :protocol pseudo-header instead — and the response
+// is a 200 whose body becomes the frame tunnel, kept open with full-duplex
+// I/O. A CONNECT to any other protocol is not this request.
+func (u *Upgrader) upgradeConnect(writer http.ResponseWriter, request *http.Request) (*RawConn, error) {
+	if request.Header.Get(":protocol") != "websocket" {
+		return reject(writer, http.StatusNotImplemented, "unsupported :protocol")
+	}
+	rejection := u.checkPolicy(writer, request)
+	if rejection != nil {
+		return nil, rejection
+	}
+	key, rejection := checkWebSocketKey(writer, request)
+	if rejection != nil {
+		return nil, rejection
+	}
+	protocol, protoErr := negotiateProtocol(u.subprotocols,
+		strings.Join(request.Header.Values("Sec-WebSocket-Protocol"), ", "))
+	if protoErr != nil {
+		return reject(writer, http.StatusBadRequest, protoErr.Error())
+	}
+	extension, extErr := u.negotiateExtensions(request)
+	if extErr != nil {
+		return reject(writer, http.StatusBadRequest, extErr.Error())
+	}
+	// The tunnel is full-duplex: the frame loop reads request.Body and writes
+	// the response body interleaved until the stream closes.
+	err := http.NewResponseController(writer).EnableFullDuplex()
+	if err != nil {
+		return reject(writer, http.StatusInternalServerError, "full-duplex unsupported")
+	}
+	respondExtendedConnect(writer, key, protocol, extension)
+
+	channel := streamTransport{body: request.Body, tunnel: writer}
+
+	return u.finishRaw(channel, channel, protocol, extension), nil
+}
+
+// respondExtendedConnect writes the extended-CONNECT success response: a 200
+// carrying the accept key and any negotiated headers. Unlike the HTTP/1.1 path
+// there is no "Switching Protocols" status and no Upgrade/Connection headers —
+// the stream simply becomes the tunnel after the headers.
+func respondExtendedConnect(writer http.ResponseWriter, key, protocol, extension string) {
+	hdr := writer.Header()
+	hdr.Set("Sec-WebSocket-Accept", acceptKey(key))
+	if protocol != "" {
+		hdr.Set("Sec-WebSocket-Protocol", protocol)
+	}
+	if extension != "" {
+		hdr.Set("Sec-WebSocket-Extensions", extension)
+	}
+	writer.WriteHeader(http.StatusOK)
+}
+
+// streamTransport adapts an extended-CONNECT stream to [transport]: reads come
+// from the request body and writes go to the response tunnel, which
+// [http.ResponseController.EnableFullDuplex] keeps open. The stream has no
+// address of its own, so the address accessors report nil. HTTP/2 and HTTP/3
+// expose no per-stream deadline, so the deadline methods are no-ops — liveness
+// then rests on the transport's own idle timeout rather than this package's
+// read deadline.
+type streamTransport struct {
+	body   io.ReadCloser
+	tunnel io.Writer
+}
+
+// Read, Write and Close are thin pass-throughs to the underlying transport:
+// the frame codec already wraps their errors, and Read must deliver io.EOF
+// unwrapped for the read loop's clean-end detection.
+func (s streamTransport) Read(p []byte) (int, error) { return s.body.Read(p) } //nolint:wrapcheck
+
+func (s streamTransport) Write(p []byte) (int, error) { return s.tunnel.Write(p) } //nolint:wrapcheck
+
+func (s streamTransport) Close() error {
+	if closer, ok := s.tunnel.(io.Closer); ok {
+		_ = closer.Close()
+	}
+
+	return s.body.Close() //nolint:wrapcheck
+}
+
+func (s streamTransport) RemoteAddr() net.Addr { return nil }
+
+func (s streamTransport) LocalAddr() net.Addr { return nil }
+
+func (s streamTransport) SetReadDeadline(time.Time) error { return nil }
+
+func (s streamTransport) SetWriteDeadline(time.Time) error { return nil }
+
+// SessionOnStream builds a [*Session] over an already-established
+// extended-CONNECT stream that the standard library does not drive — typically
+// an HTTP/3 or QUIC stream from an external transport. The stream carries the
+// WebSocket frames in both directions; the subprotocol and extension must
+// already be negotiated. A stream that also reports an address and deadlines,
+// as a [net.Conn] does, is used directly; a bare stream reports a nil address
+// and no-op deadlines. Standard-library HTTP/2 callers use [Upgrader.Upgrade]
+// instead, which detects the extended CONNECT itself.
+func (u *Upgrader) SessionOnStream(stream io.ReadWriteCloser, subprotocol, extension string) *Session {
+	var channel transport
+	if full, ok := stream.(transport); ok {
+		channel = full
+	} else {
+		channel = streamTransport{body: stream, tunnel: stream}
+	}
+
+	return newSession(u.finishRaw(channel, stream, subprotocol, extension), u.pongHandler)
 }
 
 // negotiateExtensions runs permessage-deflate negotiation when compression is
@@ -1639,7 +1781,7 @@ var connSeq atomic.Uint64
 // [Session.ReadMessage] it must only be called from one goroutine at a
 // time. Every write and [RawConn.Close] is safe from any goroutine.
 type RawConn struct {
-	nc net.Conn
+	nc transport
 	fc frameCodec
 	mu sync.Mutex // serializes the write path
 
@@ -1695,21 +1837,36 @@ type RawConn struct {
 	inflateWire  []byte       // payload + the four RFC bytes, grown to the largest message
 }
 
-func newRawConn(conn net.Conn, stream io.Reader, isClient bool, maxMessageSize int64,
+// transport is the bidirectional channel a [RawConn] runs its frames on. It is
+// exactly the subset of [net.Conn] the protocol engine uses, factored out so a
+// hijacked HTTP/1.1 connection and an HTTP/2/3 extended-CONNECT stream share
+// one code path. A [net.Conn] satisfies transport directly; an extended-
+// CONNECT stream satisfies it via [streamTransport]. The address and deadline
+// methods may be unavailable on a stream — a nil address or a no-op deadline —
+// and [RawConn] surfaces exactly what the channel reports.
+type transport interface {
+	io.ReadWriteCloser
+	RemoteAddr() net.Addr
+	LocalAddr() net.Addr
+	SetReadDeadline(deadline time.Time) error
+	SetWriteDeadline(deadline time.Time) error
+}
+
+func newRawConn(channel transport, read io.Reader, isClient bool, maxMessageSize int64,
 	idleTimeout, writeTimeout time.Duration,
 ) *RawConn {
 	var reader *bufio.Reader
-	if existing, ok := stream.(*bufio.Reader); ok {
+	if existing, ok := read.(*bufio.Reader); ok {
 		reader = existing
 	} else {
-		reader = bufio.NewReaderSize(stream, bufSize)
+		reader = bufio.NewReaderSize(read, bufSize)
 	}
 
 	return &RawConn{
-		nc: conn,
+		nc: channel,
 		fc: frameCodec{
 			br:       reader,
-			bw:       bufio.NewWriterSize(conn, bufSize),
+			bw:       bufio.NewWriterSize(channel, bufSize),
 			isClient: isClient,
 			maxMsg:   maxMessageSize,
 		},
