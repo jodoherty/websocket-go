@@ -408,7 +408,9 @@ below are where they live.
   payload cannot inflate unboundedly. See `doc/COMPRESSION.md`.
 - **Origin validation on every handshake** (CSWSH). Strict same-origin by
   default — no `CheckOrigin: always true`; override with `WithCheckOrigin`
-  as an explicit allowlist, never a denylist.
+  as an explicit allowlist, never a denylist. Behind a TLS-terminating
+  proxy the default cannot see the real scheme — see the proxy note in
+  the application-owned section below.
 - **Message size bound** (DoS). Default 16 MiB; for chat-style traffic the
   cheat sheet's ~64 KiB is a sane cap — set it per endpoint:
   `WithMaxMessageSize(64 << 10)`.
@@ -417,9 +419,11 @@ below are where they live.
 - **Bounded writes.** A blackholed peer cannot wedge a connection
   (`WithWriteTimeout`, default 30 s) or hold the close open.
 - **Close-code hygiene.** Invalid or must-not-set codes received fail the
-  connection with 1002 and are never echoed; our own forbidden codes go
-  out with an empty payload; a non-UTF-8 close reason is dropped (the
-  frame carries the code alone), so only UTF-8 ever goes on the wire.
+  connection with 1002 and are never echoed; a close reason from the peer
+  that is not valid UTF-8 is a protocol error, failed with 1002 and never
+  delivered to the application; our own forbidden codes go out with an
+  empty payload; a non-UTF-8 close reason we write is dropped (the frame
+  carries the code alone), so only UTF-8 ever goes on the wire.
 - **Request hygiene.** Handshake bodies rejected, pipelined bytes rejected,
   client request headers/subprotocols with CR/LF rejected, and
   duplicate single-value handshake headers (Version, Key, Accept) rejected
@@ -451,6 +455,29 @@ browser-equivalent policy treatment: `ws.Dial` sends it via
 `ws.WithHeader("Origin", …)`, and the Node `ws` library takes an
 `origin` option — that is how the e2e Node interop passes the demo's
 default same-origin check.
+
+*Behind a TLS-terminating proxy, the default origin check is the wrong
+tool.* The proxy clears `request.TLS`, so the default derives the scheme
+as `http` and compares Origin against `http://<Host>`: a legitimate
+https origin is rejected, and a browser page served from the same host
+over plain http — a different origin by the browser's own rules — passes
+the check, opening cross-site WebSocket hijacking for same-name
+deployments. Such deployments must set `WithCheckOrigin` with an
+allowlist that validates Origin against the scheme the proxy forwarded
+(`X-Forwarded-Proto` as the proxy sets it, with the proxy stripping any
+client-supplied header):
+
+```go
+up := ws.NewUpgrader(ws.WithCheckOrigin(func(r *http.Request) bool {
+    origin := r.Header.Get("Origin")
+    if origin == "" {
+        return r.Header.Get("Authorization") != "" // programmatic clients
+    }
+    // The proxy terminated TLS, so the scheme comes from the forwarded
+    // header, not request.TLS.
+    return trusted[origin] && origin == r.Header.Get("X-Forwarded-Proto")+"://"+r.Host
+}))
+```
 
 *mTLS gate — middleware in front of the upgrader.* The TLS layer verifies
 the client chain; a plain `http.Handler` wrapper refuses requests that

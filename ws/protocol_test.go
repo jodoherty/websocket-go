@@ -559,6 +559,39 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 	}
 }
 
+// TestPeerCloseReasonRequiresUTF8 pins RFC 6455 §7.1.5/§8.1 on the read
+// side: a peer close frame whose reason is not valid UTF-8 fails the
+// connection with 1002 — answered on the wire with a 1002, never the
+// peer's code, and the raw bytes never reach the application — while a
+// valid UTF-8 reason is delivered in full.
+func TestPeerCloseReasonRequiresUTF8(t *testing.T) {
+	t.Parallel()
+	// 1000 + a lone 0xFF byte: the reason is not valid UTF-8.
+	errStr, reply := runPeerClose(t, []byte{0x03, 0xe8, 0xff})
+	if !strings.Contains(errStr, "non-UTF-8 reason") {
+		t.Fatalf("non-UTF-8 reason: %q, want the non-UTF-8 reason failure", errStr)
+	}
+	if reply != StatusProtocolError {
+		t.Fatalf("non-UTF-8 reason: reply %d, want 1002 (the peer's close is failed, not echoed)", reply)
+	}
+	// 1001 + a valid UTF-8 reason: delivered, and the close echoes 1001.
+	errStr, reply = runPeerClose(t, []byte{0x03, 0xe9, 'b', 'y', 'e'})
+	if reply != StatusGoingAway {
+		t.Fatalf("valid reason: reply %d, want 1001", reply)
+	}
+	if !strings.Contains(errStr, "closed with code 1001") || !strings.Contains(errStr, "bye") {
+		t.Fatalf("valid reason: %q, want code 1001 with the reason delivered", errStr)
+	}
+	// 1000 + a valid reason: still a clean close (io.EOF), 1000 echoed.
+	errStr, reply = runPeerClose(t, []byte{0x03, 0xe8, 'd', 'o', 'n', 'e'})
+	if errStr != "EOF" {
+		t.Fatalf("1000 with reason: %q, want clean close (io.EOF)", errStr)
+	}
+	if reply != StatusNormalClosure {
+		t.Fatalf("1000 with reason: reply %d, want 1000", reply)
+	}
+}
+
 // TestRequestWithBodyRejected: RFC 6455 §4.1 — a GET with a body must be
 // rejected before the protocol switch.
 func TestRequestWithBodyRejected(t *testing.T) {

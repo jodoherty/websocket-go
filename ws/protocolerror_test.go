@@ -32,6 +32,12 @@ func TestProtocolViolationCloseFrame(t *testing.T) {
 		{"unknown opcode", true, []byte{0x83, 0x00}, "unknown opcode 3"},
 		{"frame too large", true, []byte{0x81, 127, 0x01, 0, 0, 0, 0, 0, 0, 0, 0},
 			"frame too large"},
+		// 1000 + a non-UTF-8 reason byte: §7.1.5 requires the reason be
+		// UTF-8, so the close is a protocol violation, not a clean end.
+		// The reader is the client side, so the peer's close frame is
+		// unmasked (0x88 0x03 | code 1000 | 0xFF).
+		{"close reason not valid UTF-8", true, []byte{0x88, 0x03, 0x03, 0xe8, 0xff},
+			"close frame with non-UTF-8 reason"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

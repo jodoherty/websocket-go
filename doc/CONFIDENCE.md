@@ -66,7 +66,7 @@ hand-written editing.)
    allocation (the payload), the masked client write is ~190 ns with zero
    allocations, each side of the handshake is ~3 µs, and the accept key is
    ~130 ns.
-10. **Statement coverage** — the library sits at **96.4% statement
+10. **Statement coverage** — the library sits at **96.5% statement
     coverage**, the same figure whether the unit suite alone or the unit
     and e2e suites are combined. The e2e suite (`go test ./e2e -cover
     -coverpkg=./ws`) exercises the real-network `Dial` and the mTLS
@@ -82,7 +82,7 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **93.7% branch coverage** (449 of 479
+    no-match). The library sits at **93.8% branch coverage** (451 of 481
     outcomes). The uncovered outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
@@ -114,7 +114,7 @@ hand-written editing.)
     decision fails the gate. Current state: **30 compound decisions, 66
     required pairs, all traced** (the permessage-deflate RSV state machine
     and the extension-negotiation parsing contribute 8 of the decisions);
-    the other 200 if/for conditions are single-condition (branch-level, no
+    the other 201 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
 
 A note on `synctest`: we use it exactly where it fits, and nowhere else.
@@ -162,7 +162,12 @@ than a bare TCP close), UTF-8 validation on text frames
 (RFC 6455 §5.6 — a non-UTF-8 text message, whole, reassembled from
 fragments, or compressed, fails the connection with 1007, the close Node's
 ws and browsers use; an OpText write that is not valid UTF-8 is refused
-before it reaches the wire), client-side verification of the
+before it reaches the wire) and on close-frame reasons received from the
+peer (RFC 6455 §7.1.5/§8.1 — a close frame whose reason is not valid
+UTF-8 is a protocol violation, failed with 1002 and never delivered to the
+application, so a peer cannot plant arbitrary bytes — newlines included —
+in CloseError.Reason; an outgoing reason that is not valid UTF-8 is
+dropped, the frame carrying the code alone), client-side verification of the
 server's permessage-deflate response (the extension must be one the client
 offered, at most once, and must not demand more of the client's compressor
 than it allows), and option limits that fall back to the defaults rather

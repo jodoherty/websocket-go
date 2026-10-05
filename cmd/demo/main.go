@@ -102,8 +102,8 @@ func main() {
 	if *report != "" {
 		go reportBound(*report, tlsL.Addr(), healthL.Addr())
 	}
-	log.Printf("demo server on %s (bearer token via DEMO_TOKEN, default %q)",
-		tlsL.Addr(), token())
+	log.Printf("demo server on %s (bearer auth on /ws/bearer; token via DEMO_TOKEN, never logged)",
+		tlsL.Addr())
 
 	go func() {
 		log.Printf("health check on %s", healthL.Addr())
@@ -303,6 +303,12 @@ func token() string {
 
 // validToken accepts the bearer token in the Authorization header or, for
 // browser clients (which cannot set headers), the ?token= query parameter.
+//
+// Demo only, not a pattern to copy: a token in a query string rides in
+// access logs, proxy logs, browser history, and Referer headers — exactly
+// where a credential must not appear. Real deployments authenticate with
+// the Authorization header (or mTLS) before the upgrade, as /ws/bearer and
+// /ws/mtls show.
 func validToken(request *http.Request, token string) bool {
 	tokenValue, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
 	if !ok {

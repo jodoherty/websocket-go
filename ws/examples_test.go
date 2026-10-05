@@ -33,6 +33,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -111,12 +112,14 @@ func Example() {
 // authentication is ordinary middleware that runs before the upgrade, and
 // its result rides on the request context into the message handler instead
 // of globals. Browsers cannot set headers on the upgrade, so the token
-// comes in a query parameter here.
+// comes in a query parameter here — demo-grade, not a pattern to copy:
+// a token in the URL rides in access logs, browser history, and Referer
+// headers; production prefers the Authorization header (ExampleDial) or
+// mTLS. The upgrader keeps its default origin policy: the programmatic
+// client below sends no Origin, and a cross-origin browser would still be
+// rejected.
 func ExampleUpgrader() {
-	up := NewUpgrader(
-		WithCheckOrigin(func(*http.Request) bool { return true }),
-		WithSubprotocols("chat.v1"),
-	)
+	up := NewUpgrader(WithSubprotocols("chat.v1"))
 
 	// auth is a plain http.Handler wrapper: nothing about it is
 	// websocket-specific.
@@ -124,8 +127,9 @@ func ExampleUpgrader() {
 	auth := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token := r.URL.Query().Get("token")
-			if token != "secret" {
+			if subtle.ConstantTimeCompare([]byte(token), []byte("secret")) != 1 {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
 				return
 			}
 			r = r.WithContext(context.WithValue(r.Context(), principalKey{}, token))
@@ -169,14 +173,19 @@ func ExampleUpgrader() {
 // ExampleDial shows a programmatic client authenticating with a bearer
 // token. The token check is ordinary middleware in front of the upgrader —
 // nothing about it is websocket-specific — while the client sets the header
-// on the upgrade request with WithHeader, which browsers cannot do.
+// on the upgrade request with WithHeader, which browsers cannot do. The
+// upgrader keeps its default origin policy: the client below sends no
+// Origin header, and a browser presenting one must match the page's own
+// origin.
 func ExampleDial() {
-	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
+	up := NewUpgrader()
 
 	bearer := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Authorization") != "Bearer demo-secret" {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")),
+				[]byte("Bearer demo-secret")) != 1 {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
+
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -561,7 +570,8 @@ func ExampleDialRaw() {
 // handler returns a *CloseError, Handle closes the connection with its
 // code, and the peer extracts the code with CloseCode.
 func ExampleCloseCode() {
-	up := NewUpgrader(WithCheckOrigin(func(*http.Request) bool { return true }))
+	// Default origin policy: the client below sends no Origin header.
+	up := NewUpgrader()
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *Session) error {

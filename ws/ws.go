@@ -524,8 +524,15 @@ func sanitizeLimits(cfg *Config) {
 //
 // The default compares against the request's Host exactly as received, so a
 // Host that carries an explicit default port ("example.com:80") counts as a
-// different origin, and behind a TLS-terminating proxy (request.TLS nil) the
-// scheme is taken to be http; set a custom check for such deployments.
+// different origin. Behind a TLS-terminating proxy (request.TLS nil) the
+// default derives the scheme as http, which is wrong in both directions:
+// a legitimate https origin is rejected, and — the dangerous case — a
+// browser page served from the same host over plain http (a different
+// origin by the browser's own rules) passes the check, opening cross-site
+// WebSocket hijacking for same-name deployments. Such deployments must set
+// a custom check that validates Origin against the scheme the proxy
+// forwarded (X-Forwarded-Proto as the proxy sets it, with the proxy
+// stripping any client-supplied header) and a host allowlist.
 func WithCheckOrigin(check func(r *http.Request) bool) Option {
 	return func(cfg *Config) { cfg.CheckOrigin = check }
 }
@@ -596,7 +603,9 @@ type Upgrader struct {
 // and a wrong-origin browser is still rejected), a 16 MiB message size
 // limit, and a 60 second keepalive window: a connection silent for that long
 // is probed with a ping, and is considered dead if it is still silent after
-// a second window.
+// a second window. Behind a TLS-terminating proxy the default origin check
+// cannot see the real scheme — replace it with a [WithCheckOrigin]
+// allowlist keyed on the proxy-forwarded scheme; see [WithCheckOrigin].
 func NewUpgrader(opts ...Option) *Upgrader {
 	cfg := &Config{
 		CheckOrigin:      defaultCheckOrigin,
@@ -969,6 +978,10 @@ func HandleRaw(handler func(r *http.Request, c *RawConn) error) http.Handler {
 // do not, so rejecting them would bar plain clients out by default. A
 // cross-origin browser is still rejected, because it always presents an
 // Origin.
+//
+// The scheme comes from request.TLS, so a request that reached the server
+// through a TLS-terminating proxy compares against http://<Host>; see
+// [WithCheckOrigin] for why such deployments must set their own check.
 func defaultCheckOrigin(request *http.Request) bool {
 	origin := request.Header.Get("Origin")
 	if origin == "" {
@@ -2003,7 +2016,10 @@ func isReadTimeout(err error) bool {
 // payload must carry a usable status code — in 1000-4999, not one of the
 // codes that MUST NOT be set on the wire (1005, 1006, 1015), and not the
 // reserved 1004 (RFC 6455 §7.4) — or the connection is failed with 1002
-// (§7.1.5); an unusable code is never echoed back.
+// (§7.1.5); an unusable code is never echoed back. The reason, when
+// present, must be valid UTF-8 — it is the UTF-8 of a text message
+// (§5.5) — or the connection is failed with 1002 as well (§8.1); a
+// non-UTF-8 reason is never delivered to the application.
 func (c *RawConn) resolvePeerClose(payload []byte) (int, string, error) {
 	if len(payload) == 1 {
 		return 0, "", c.failProtocol("close frame with one-byte payload")
@@ -2012,6 +2028,14 @@ func (c *RawConn) resolvePeerClose(payload []byte) (int, string, error) {
 		code := int(binary.BigEndian.Uint16(payload[:closeCodeBytes]))
 		if !usableCloseCode(code) {
 			return 0, "", c.failProtocol(fmt.Sprintf("close frame with unusable status code %d", code))
+		}
+		if !utf8.Valid(payload[closeCodeBytes:]) {
+			// RFC 6455 §7.1.5: the reason, when present, is the UTF-8 of
+			// a text message, and §8.1 fails the connection on a
+			// non-UTF-8 stream. Never hand the raw bytes to the
+			// application: a peer could otherwise plant arbitrary bytes
+			// (newlines included) in CloseError.Reason.
+			return 0, "", c.failProtocol("close frame with non-UTF-8 reason")
 		}
 
 		return code, string(payload[closeCodeBytes:]), nil
