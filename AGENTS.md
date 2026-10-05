@@ -253,6 +253,13 @@ e2e/            e2e suites:
                                  interop both directions (Node ws client -> Go server,
                                  Go client -> Node ws server)
                 interop-node-{client,server}.mjs
+                h2/             separate module: a real x/net/http2 extended-CONNECT
+                                (RFC 8441) round-trip through Upgrader.Upgrade; runs
+                                on the go1.26 toolchain with http2xconnect=1 (make
+                                e2e-h2)
+                h3/             separate module: a real quic-go HTTP/3 extended-
+                                CONNECT (RFC 9220) round-trip over SessionOnStream
+                                (make e2e-h3)
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make gate (the full set) plus the
                     individual lint / staticcheck / test / race / fuzz /

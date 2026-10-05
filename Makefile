@@ -1,6 +1,6 @@
 GOLANGCI ?= golangci-lint
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc mut multiver e2e demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -8,7 +8,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc mut branchcov coverage multiver e2e
+gate: all race fuzz bench mcdc mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -98,6 +98,20 @@ multiver:
 e2e:
 	go test -race ./e2e/
 	cd e2e && npm ci && npm test
+
+# Extended-CONNECT (RFC 8441 / RFC 9220) transports, each in its own module
+# so the root go.mod stays dependency-free (the multiver gate must still build
+# on go1.25.0). e2e-h2 drives a real x/net/http2 server: the stdlib HTTP/2
+# client only supports the :protocol pseudo-header on Go 1.27 (issue #53208),
+# where x/net/http2 delegates to it, so the client runs on the go1.26
+# toolchain, which still ships x/net's own transport, with http2xconnect=1
+# (read at package init). e2e-h3 drives a real quic-go HTTP/3 server, which has
+# its own extended-CONNECT implementation and runs on the default toolchain.
+e2e-h2:
+	cd e2e/h2 && GOTOOLCHAIN=go1.26.0 GODEBUG=http2xconnect=1 go test -race -count=1 .
+e2e-h3:
+	cd e2e/h3 && go test -race -count=1 .
+e2e-connect: e2e-h2 e2e-h3
 
 certgen:
 	go run ./cmd/certgen -dir e2e/certs

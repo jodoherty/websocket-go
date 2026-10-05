@@ -146,30 +146,33 @@ loops over one transport would race.
 ## Transports
 
 The protocol core is transport-agnostic; only the handshake surface changes.
-One handler serves WebSockets over all three transports:
 
 - **HTTP/1.1** — the classic `Upgrade` request, the default and the only path
   on toolchains whose HTTP/2 server does not route extended CONNECT.
-- **HTTP/2 and HTTP/3** — the same handshake rides an *extended CONNECT*
-  (RFC 8441 / RFC 9220). `Upgrader.Upgrade` detects it from the request method
-  and the `:protocol` pseudo-header, opens the tunnel with full-duplex I/O, and
-  answers with a 200 whose body is the frame stream. A standard-library
-  handler needs no changes: when the toolchain's HTTP/2 server routes
-  extended CONNECT the CONNECT branch is simply taken; otherwise it is inert
-  and clients use the HTTP/1.1 upgrade.
+- **HTTP/2** — the handshake rides an *extended CONNECT* (RFC 8441 / RFC 9220).
+  `Upgrader.Upgrade` detects it from the request method and the `:protocol`
+  pseudo-header, opens the tunnel with full-duplex I/O, and answers with a 200
+  whose body is the frame stream. An `x/net/http2` or standard-library handler
+  needs no changes: when the HTTP/2 server routes extended CONNECT the CONNECT
+  branch is simply taken; otherwise it is inert and clients use the HTTP/1.1
+  upgrade.
+- **HTTP/3** — also an extended CONNECT (RFC 9220), but the HTTP/3 stack is not
+  in the standard library. With an external stack such as `quic-go` the
+  application runs the handshake itself and uses `Upgrader.SessionOnStream`
+  over the open stream (below).
 
 Because the frame loop reads `request.Body` and writes the response body, the
-server has no per-stream deadline to set over h2/h3 — this package's keepalive
-read deadline and bounded-write guarantee (which hold over a hijacked
-`net.Conn`) do not apply on that path, and liveness rests on the transport's
-own idle timeout instead.
+server has no per-stream deadline to set over an extended CONNECT — this
+package's keepalive read deadline and bounded-write guarantee (which hold over
+a hijacked `net.Conn`) do not apply on that path, and liveness rests on the
+transport's own idle timeout instead.
 
-For a stream the standard library does not drive — an HTTP/3 or QUIC stream
-from an external transport — use `Upgrader.SessionOnStream(stream,
-subprotocol, extension)`. The application runs the extended-CONNECT handshake
-on the stream itself and hands the open stream over; a stream that also
-reports an address and deadlines (a `net.Conn`) is used directly, and a bare
-stream is wrapped so it still reports a nil address and no-op deadlines.
+`Upgrader.SessionOnStream(stream, subprotocol, extension)` builds a session
+over a stream the library does not itself drive: the application has already
+run the extended-CONNECT handshake on it and hands the open, bidirectional
+stream over. A stream that also reports an address and deadlines (a
+`net.Conn`) is used directly; a bare stream is wrapped so it reports a nil
+address and no-op deadlines.
 
 ## Usage: good and bad
 
