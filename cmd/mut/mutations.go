@@ -524,10 +524,17 @@ func compressionNegotiationMutations() []mutation {
 			Invariant:   "the 101 must select permessage-deflate at most once; two extensions must fail the dial",
 		},
 		{
-			Name:        "client-window-cap-drop",
-			Pattern:     "if bits := params.clientWindowBits; bits != 0 && bits < maxWindowBits {",
-			Replacement: "if bits := params.clientWindowBits; bits != 0 && bits < 8 {",
-			Invariant:   "a server response that caps the client window below the full 15 bits must fail the dial",
+			Name:        "snct-echo-check-drop",
+			Pattern:     "if !params.serverNoTakeover {",
+			Replacement: "if false {",
+			Invariant: "the response must echo server_no_context_takeover from the offer (RFC 7692 §7.1.1.1); " +
+				"a server using context takeover is undecodable by the per-message-resetting decompressor",
+		},
+		{
+			Name:        "unoffered-cwb-allow",
+			Pattern:     "if params.hasClientWindowBits {",
+			Replacement: "if false {",
+			Invariant:   "the response must not set client_max_window_bits the client never offered (RFC 7692 §7.1.2.2)",
 		},
 	}
 }

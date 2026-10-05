@@ -154,7 +154,12 @@
 //     sends "permessage-deflate; client_max_window_bits" (the parameter
 //     without a value, i.e. no client-window limit), Firefox sends the bare
 //     token. Both are accepted; RFC 7692 §7.1 makes every parameter
-//     optional.
+//     optional. This client's own offer instead carries both
+//     no-context-takeover parameters — it never reuses the LZ77 window
+//     across messages, so it says so — and requires the response to echo
+//     server_no_context_takeover (RFC 7692 §7.1.1.1); measured responses
+//     from Node ws and gorilla/websocket servers both carry it, and
+//     gorilla's client enforces the same requirement.
 //   - Decompression tail (deviation from RFC 7692 §7.2.2). The RFC prescribes
 //     appending four octets (00 00 ff ff) to complete the truncated stream.
 //     Real peers additionally end the stream with an empty BFINAL=0 block,
@@ -1036,9 +1041,12 @@ func negotiateProtocol(server []string, clientHeader string) (string, error) {
 // (RFC 7692 §7.1), direction-neutral: each field records what the
 // counterparty asked for or granted.
 type deflateParams struct {
-	// clientWindowBits is the client_max_window_bits value: 0 for absent or
-	// value-less (no limit on the client's compressor), 8-15 when valued.
-	clientWindowBits int
+	// hasClientWindowBits records whether client_max_window_bits appears at
+	// all — valued or value-less — since RFC 7692 §7.1.2.2 forbids it in a
+	// response to an offer that did not carry it. (Its value, when valued,
+	// is validated by parseWindowBits but never needed: this client offers
+	// no client window and its compressor always uses the full one.)
+	hasClientWindowBits bool
 	// serverWindowBits is the server_max_window_bits value: 0 for absent,
 	// 8-15 when present (always valued per the ABNF).
 	serverWindowBits int
@@ -1100,12 +1108,12 @@ func parseCompressionParams(group string) (deflateParams, error) {
 				params.serverNoTakeover = true
 			}
 		case "client_max_window_bits":
+			params.hasClientWindowBits = true
 			if hasValue {
-				bits, err := parseWindowBits(value)
+				_, err := parseWindowBits(value)
 				if err != nil {
 					return params, err
 				}
-				params.clientWindowBits = bits
 			}
 		case "server_max_window_bits":
 			if !hasValue {
@@ -1183,10 +1191,13 @@ func negotiateCompression(groups []string) (string, error) {
 // verifyCompressionResponse validates the Sec-WebSocket-Extension header
 // of a 101 response against what this client offered (RFC 7692 §5.1): the
 // server must not select an extension the client never offered, must select
-// permessage-deflate at most once, and must not demand more of the client's
-// compressor than the client's capability — a response that caps the
-// client window below the full 15 bits fails the dial, because the stdlib
-// compressor cannot honor it. It reports whether compression was negotiated.
+// permessage-deflate at most once, and must honor the response-side MUSTs
+// of §7.1: this client's offer carries server_no_context_takeover, so the
+// response must carry it too (§7.1.1.1 — its absence means the server may
+// use context takeover, streams the per-message-resetting decompressor
+// cannot decode); and because the offer carries no client_max_window_bits,
+// the response must not either (§7.1.2.2), valued or value-less. It
+// reports whether compression was negotiated.
 func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 	if !offered && len(groups) > 0 {
 		return false, fmt.Errorf("%w: 101 response selected the unoffered extension %q",
@@ -1209,9 +1220,13 @@ func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 		return false, fmt.Errorf("%w: 101 response selected the unoffered extension %q",
 			errHandshakeFailed, name)
 	}
-	if bits := params.clientWindowBits; bits != 0 && bits < maxWindowBits {
-		return false, fmt.Errorf("%w: 101 response caps the client window at %d bits",
-			errHandshakeFailed, bits)
+	if !params.serverNoTakeover {
+		return false, fmt.Errorf("%w: 101 response omits server_no_context_takeover",
+			errHandshakeFailed)
+	}
+	if params.hasClientWindowBits {
+		return false, fmt.Errorf("%w: 101 response sets the unoffered parameter client_max_window_bits",
+			errHandshakeFailed)
 	}
 
 	return true, nil

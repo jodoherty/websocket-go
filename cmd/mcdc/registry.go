@@ -29,7 +29,6 @@ const (
 	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
 	testMCDCDeflateControl      = "TestMCDCDeflateControl"
 	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
-	testMCDCDeflateClientWindow = "TestMCDCDeflateClientWindow"
 	testMCDCDeflateOffered      = "TestMCDCDeflateOffered"
 	testMCDCDeflateWindowBits   = "TestMCDCDeflateWindowBits"
 )
@@ -463,20 +462,6 @@ func deflateFrameTraces() []decisionTrace {
 				// A 10-bit demand is declined; the full 15-bit demand is
 				// accepted.
 				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateServerWindow, "belowMax"},
-			},
-		},
-		// ws.go (verifyCompressionResponse): bits != 0 && bits <
-		// maxWindowBits (the client-side twin of the server decision above;
-		// identical expression, second occurrence in source order).
-		{
-			expr:       "bits != 0 && bits < maxWindowBits",
-			conditions: []string{"bits != 0", "bits < maxWindowBits"},
-			pairs: []pairTrace{
-				// No window cap is accepted; a 10-bit cap fails the dial.
-				{0, []bool{false, true}, []bool{true, true}, testMCDCDeflateClientWindow, "bits"},
-				// A 10-bit cap fails the dial; the full 15-bit cap is
-				// accepted.
-				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateClientWindow, "belowMax"},
 			},
 		},
 		// ws.go (verifyCompressionResponse): !offered && len(groups) > 0

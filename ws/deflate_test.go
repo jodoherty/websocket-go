@@ -334,6 +334,7 @@ func TestDeflateServerExtensionHeader(t *testing.T) {
 // must not cap the client window below what this compressor can honor.
 func TestDeflateClientVerification(t *testing.T) {
 	t.Parallel()
+	snct := "permessage-deflate; server_no_context_takeover"
 	cases := []struct {
 		name     string
 		ext      string
@@ -341,14 +342,27 @@ func TestDeflateClientVerification(t *testing.T) {
 		compress bool // expected Compressed() when the dial succeeds
 	}{
 		{name: "declined", ext: "", compress: false},
-		{name: "accepted bare", ext: "permessage-deflate", compress: true},
-		{name: "client no context takeover", ext: "permessage-deflate; client_no_context_takeover", compress: true},
-		{name: "server no context takeover", ext: "permessage-deflate; server_no_context_takeover", compress: true},
-		{name: "full window", ext: "permessage-deflate; client_max_window_bits=15", compress: true},
-		{name: "server window constraint", ext: "permessage-deflate; server_max_window_bits=10", compress: true},
-		{name: "smaller client window", ext: "permessage-deflate; client_max_window_bits=10", wantErr: true},
+		// RFC 7692 §7.1.1.1: the offer carries server_no_context_takeover,
+		// so an accepting response must too — absence means the server may
+		// use context takeover, which this decompressor cannot follow.
+		{name: "accepted bare", ext: "permessage-deflate", wantErr: true},
+		{name: "client no context takeover only", ext: "permessage-deflate; client_no_context_takeover", wantErr: true},
+		{name: "server no context takeover", ext: snct, compress: true},
+		{name: "both no context takeover", ext: snct + "; client_no_context_takeover", compress: true},
+		// §7.1.2.2: the offer carries no client_max_window_bits, so the
+		// response must not either — valued or value-less.
+		{name: "client window full", ext: snct + "; client_max_window_bits=15", wantErr: true},
+		{name: "client window value-less", ext: snct + "; client_max_window_bits", wantErr: true},
+		// §7.1.2.1: the server MAY add server_max_window_bits even
+		// unoffered, so long as it echoes the no-takeover parameter.
+		{name: "server window constraint", ext: snct + "; server_max_window_bits=10", compress: true},
+		{name: "server window alone", ext: "permessage-deflate; server_max_window_bits=10", wantErr: true},
+		{name: "smaller client window", ext: snct + "; client_max_window_bits=10", wantErr: true},
 		{name: "unknown extension", ext: "x-deflate", wantErr: true},
-		{name: "duplicated extension", ext: "permessage-deflate, permessage-deflate", wantErr: true},
+		// The guards that run before the §7.1 checks must still fail the
+		// dial on their own: a second extension alongside a fully compliant
+		// first one, not be ignored.
+		{name: "duplicated extension", ext: snct + ", " + snct, wantErr: true},
 		{name: "unknown parameter", ext: "permessage-deflate; bogus", wantErr: true},
 	}
 	for _, tc := range cases {
@@ -374,12 +388,18 @@ func TestDeflateClientVerification(t *testing.T) {
 	}
 
 	// An extension the client never offered fails the dial even when the
-	// client disabled compression.
+	// client disabled compression — with or without the §7.1 parameters,
+	// so the unoffered check itself (not the no-takeover echo check) is
+	// what is proven.
 	t.Run("unoffered with compression disabled", func(t *testing.T) {
 		t.Parallel()
 		_, err := dialWithServerExtension(t, "permessage-deflate", WithCompression(false))
 		if err == nil {
 			t.Fatal("dial succeeded, want failure for an unoffered extension")
+		}
+		_, err = dialWithServerExtension(t, snct, WithCompression(false))
+		if err == nil {
+			t.Fatal("dial succeeded, want failure for an unoffered extension with parameters")
 		}
 	})
 }

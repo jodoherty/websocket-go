@@ -33,10 +33,20 @@ reference-only (see the table in `doc/USAGE.md`).
 
 3. **Per-message contexts in both directions (no context takeover).**
    RFC 7692 §7.2: per-message context is the default; takeover is opt-in.
-   so we simply don't offer the takeover parameters and every message
-   is compressed/decompressed independently. No cross-message codec state
-   → no memory growth, no reset protocol, one fewer set of MC/DC
-   decisions.
+   This implementation never takes over context — the compressor and the
+   decompressor are reset for every message — and it says so on the wire:
+   both the client's offer and the server's response carry
+   `server_no_context_takeover; client_no_context_takeover`. The client
+   also enforces the reverse direction: a 101 that accepts the offer but
+   omits `server_no_context_takeover` means the server may use context
+   takeover (RFC 7692 §7.1.1.1 — acceptance means including the
+   parameter), and takeover streams are undecodable by a
+   per-message-resetting decompressor, so per §7's general rule the
+   client fails the connection instead of discovering the mismatch
+   mid-stream; likewise the response must not carry
+   `client_max_window_bits`, which the offer never did (§7.1.2.2).
+   No cross-message codec state → no memory growth, no reset protocol,
+   one fewer set of MC/DC decisions.
 
 4. **Window bits: accept the default (15); refuse explicit smaller values
    for that connection.** The stdlib `flate.Writer` always uses a full
@@ -136,8 +146,8 @@ New `ws/deflate_test.go` (internal `package ws`, using `newTestConn`/
 `fakeConn`):
 
 - **Handshake:** no header; bare token; each parameter individually and
-  combined; explicit `client_max_window_bits` (15 → accepted, <15 →
-  refused); unknown extension alongside permessage-deflate (400 — the
+  combined; an unoffered `client_max_window_bits` in a response (valued or
+  value-less) fails the dial; unknown extension alongside permessage-deflate (400 — the
   server fails an extension it does not understand, mirroring the
   twice-listed case); permessage-deflate listed twice (400 — the RFC says
   fail).

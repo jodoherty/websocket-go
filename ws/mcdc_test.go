@@ -511,41 +511,6 @@ func TestMCDCDeflateServerWindow(t *testing.T) {
 	})
 }
 
-// TestMCDCDeflateClientWindow traces "bits != 0 && bits < maxWindowBits" in
-// verifyCompressionResponse: a response that caps the client window below
-// the full 15 bits fails the dial; other responses are accepted.
-func TestMCDCDeflateClientWindow(t *testing.T) {
-	t.Parallel()
-
-	t.Run("bits", func(t *testing.T) {
-		t.Parallel()
-		// (bits!=0=F, bits<15=T) flips to (T, T): no window cap is
-		// accepted; a 10-bit cap fails the dial.
-		_, err := dialWithServerExtension(t, "permessage-deflate")
-		if err != nil {
-			t.Fatalf("no window cap: %v", err)
-		}
-		_, err = dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=10")
-		if err == nil {
-			t.Fatal("10-bit cap: dial succeeded, want failure")
-		}
-	})
-
-	t.Run("belowMax", func(t *testing.T) {
-		t.Parallel()
-		// (bits!=0=T, bits<15=T) flips to (T, F): a 10-bit cap fails the
-		// dial; the full 15-bit cap is accepted.
-		_, err := dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=10")
-		if err == nil {
-			t.Fatal("10-bit cap: dial succeeded, want failure")
-		}
-		_, err = dialWithServerExtension(t, "permessage-deflate; client_max_window_bits=15")
-		if err != nil {
-			t.Fatalf("15-bit cap: %v", err)
-		}
-	})
-}
-
 // TestMCDCDeflateOffered traces "!offered && len(groups) > 0" in
 // verifyCompressionResponse: an extension the client never offered fails
 // the dial, and only when the response actually carries one.
@@ -561,7 +526,7 @@ func TestMCDCDeflateOffered(t *testing.T) {
 		if err == nil {
 			t.Fatal("unoffered extension: dial succeeded, want failure")
 		}
-		_, err = dialWithServerExtension(t, "permessage-deflate")
+		_, err = dialWithServerExtension(t, "permessage-deflate; server_no_context_takeover")
 		if err != nil {
 			t.Fatalf("offered extension: %v", err)
 		}
