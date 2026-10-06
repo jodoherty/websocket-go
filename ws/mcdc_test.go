@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -621,6 +622,73 @@ func TestMCDCDeflateWindowBits(t *testing.T) {
 		bits, err := parseWindowBits("15")
 		if err != nil || bits != 15 {
 			t.Fatalf("15: (%d, %v), want 15", bits, err)
+		}
+	})
+}
+
+// TestMCDCStreamDeadlines covers the deadline gate in finishRaw: a session
+// is created only when the deadline options are zero or the channel
+// implements DeadlineStream.
+//
+// Expression (finishRaw):
+//
+//	(u.idleTimeout > 0 || u.writeTimeout > 0) && !deadlineCapable(channel)
+//
+// with the nested sub-decision
+//
+//	u.idleTimeout > 0 || u.writeTimeout > 0.
+func TestMCDCStreamDeadlines(t *testing.T) {
+	t.Parallel()
+	bare := bareRWC{r: io.NopCloser(nil), w: new(bytes.Buffer)}
+
+	t.Run("idle-set", func(t *testing.T) {
+		t.Parallel()
+		// (idle>0=T, write>0=F, !capable=T) flips to (F, F, T): an idle
+		// window over a bare stream is refused; the same stream with the
+		// window zeroed is accepted.
+		_, err := NewUpgrader(WithIdleTimeout(time.Second)).SessionOnStream(bare, "", "")
+		if !errors.Is(err, ErrNoDeadlineSupport) {
+			t.Fatalf("idle-set: err = %v, want ErrNoDeadlineSupport", err)
+		}
+		_, err = NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).SessionOnStream(bare, "", "")
+		if err != nil {
+			t.Fatalf("idle-zero: err = %v, want nil", err)
+		}
+	})
+
+	t.Run("write-set", func(t *testing.T) {
+		t.Parallel()
+		// (idle>0=F, write>0=T, !capable=T) flips to (F, F, T): a write
+		// bound over a bare stream is refused; the same stream with the
+		// bound zeroed is accepted.
+		_, err := NewUpgrader(WithWriteTimeout(time.Second)).SessionOnStream(bare, "", "")
+		if !errors.Is(err, ErrNoDeadlineSupport) {
+			t.Fatalf("write-set: err = %v, want ErrNoDeadlineSupport", err)
+		}
+		_, err = NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).SessionOnStream(bare, "", "")
+		if err != nil {
+			t.Fatalf("write-zero: err = %v, want nil", err)
+		}
+	})
+
+	t.Run("capable", func(t *testing.T) {
+		t.Parallel()
+		// (idle>0=T, write>0=F, !capable=T) flips to (T, F, F): an idle
+		// window over a bare stream is refused; the same window over a
+		// deadline-capable stream is accepted and reported.
+		_, err := NewUpgrader(WithIdleTimeout(time.Second)).SessionOnStream(bare, "", "")
+		if !errors.Is(err, ErrNoDeadlineSupport) {
+			t.Fatalf("bare: err = %v, want ErrNoDeadlineSupport", err)
+		}
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		session, err := NewUpgrader(WithIdleTimeout(time.Second), WithWriteTimeout(0)).SessionOnStream(a, "", "")
+		if err != nil {
+			t.Fatalf("capable: err = %v, want nil", err)
+		}
+		if got := session.EffectiveIdleTimeout(); got != time.Second {
+			t.Fatalf("EffectiveIdleTimeout = %v, want 1s", got)
 		}
 	})
 }

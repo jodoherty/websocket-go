@@ -31,7 +31,14 @@ import (
 )
 
 func TestExtendedConnectH2RoundTrip(t *testing.T) {
-	upgrader := ws.NewUpgrader(ws.WithSubprotocols("chat"))
+	upgrader := ws.NewUpgrader(
+		ws.WithSubprotocols("chat"),
+		// The extended-CONNECT stream exposes no per-stream deadline, so the
+		// deadline options are waived: liveness is bounded by the transport's
+		// own idle timeout. With either option nonzero the upgrade would be
+		// refused with a 501.
+		ws.WithIdleTimeout(0), ws.WithWriteTimeout(0),
+	)
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, err := upgrader.Upgrade(w, r)
 		if err != nil {

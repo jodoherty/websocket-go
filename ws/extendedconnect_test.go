@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // connectWriter stands in for the HTTP/2 full-duplex response on an extended
@@ -95,6 +96,10 @@ func newConnectWriter() *connectWriter {
 func runConnect(t *testing.T, request *http.Request, opts ...Option) (*Session, *connectWriter) {
 	t.Helper()
 	w := newConnectWriter()
+	// The extended-CONNECT stream exposes no per-stream deadline, so the
+	// default deadline options are waived here; the stream is trusted to be
+	// idle-bounded by the transport.
+	opts = append([]Option{WithIdleTimeout(0), WithWriteTimeout(0)}, opts...)
 	session, err := NewUpgrader(opts...).Upgrade(w, request)
 	if err != nil {
 		t.Fatalf("Upgrade: %v", err)
@@ -197,7 +202,9 @@ func TestExtendedConnectOriginPolicy(t *testing.T) {
 func TestExtendedConnectRequiresFullDuplex(t *testing.T) {
 	request := connectRequest(testKey())
 	request.Body = io.NopCloser(new(bytes.Buffer))
-	_, err := NewUpgrader().Upgrade(failDuplexWriter{newConnectWriter()}, request)
+	// Waive the deadline options so the failure under test is the
+	// full-duplex one, not the deadline refusal.
+	_, err := NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).Upgrade(failDuplexWriter{newConnectWriter()}, request)
 	if err == nil {
 		t.Fatal("expected Upgrade to fail when full-duplex is unsupported")
 	}
@@ -206,9 +213,42 @@ func TestExtendedConnectRequiresFullDuplex(t *testing.T) {
 	}
 }
 
+func TestExtendedConnectRejectsDeadlineOptions(t *testing.T) {
+	request := connectRequest(testKey())
+	request.Body = io.NopCloser(new(bytes.Buffer))
+	// The stream cannot enforce the configured window; the upgrade is
+	// refused before the tunnel opens, 501.
+	up := NewUpgrader(WithIdleTimeout(time.Second))
+	_, err := up.Upgrade(newConnectWriter(), request)
+	if status := upgradeStatus(t, err); status != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want %d", status, http.StatusNotImplemented)
+	}
+}
+
+func TestExtendedConnectDeadlineWaiver(t *testing.T) {
+	request := connectRequest(testKey())
+	request.Body = io.NopCloser(new(bytes.Buffer))
+	// With the options waived the same stream upgrades: liveness is the
+	// transport's job, and the session reports the windows it actually
+	// enforces.
+	session, err := NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).Upgrade(newConnectWriter(), request)
+	if err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	if got := session.EffectiveIdleTimeout(); got != 0 {
+		t.Fatalf("EffectiveIdleTimeout = %v, want 0", got)
+	}
+	if got := session.EffectiveWriteTimeout(); got != 0 {
+		t.Fatalf("EffectiveWriteTimeout = %v, want 0", got)
+	}
+}
+
 func TestSessionOnStreamNetPipe(t *testing.T) {
 	a, b := net.Pipe()
-	session := NewUpgrader().SessionOnStream(a, "chat", "")
+	session, err := NewUpgrader().SessionOnStream(a, "chat", "")
+	if err != nil {
+		t.Fatalf("SessionOnStream: %v", err)
+	}
 
 	// A server-side session reads masked client frames, so the peer must send
 	// one.
@@ -252,12 +292,92 @@ func (b bareRWC) Read(p []byte) (int, error)  { return b.r.Read(p) }
 func (b bareRWC) Write(p []byte) (int, error) { return b.w.Write(p) }
 func (bareRWC) Close() error                  { return nil }
 
+// deadlineOnlyRWC is a stream with deadline methods but no address methods,
+// to exercise the deadlineStream pass-through path in SessionOnStream.
+type deadlineOnlyRWC struct{ conn net.Conn }
+
+func (d deadlineOnlyRWC) Read(p []byte) (int, error) {
+	return d.conn.Read(p)
+}
+
+func (d deadlineOnlyRWC) Write(p []byte) (int, error) { return d.conn.Write(p) }
+func (d deadlineOnlyRWC) Close() error                { return d.conn.Close() }
+func (d deadlineOnlyRWC) SetReadDeadline(t time.Time) error {
+	return d.conn.SetReadDeadline(t)
+}
+
+func (d deadlineOnlyRWC) SetWriteDeadline(t time.Time) error {
+	return d.conn.SetWriteDeadline(t)
+}
+
 func TestSessionOnStreamWrap(t *testing.T) {
 	rwc := bareRWC{r: bytes.NewReader(maskedTextFrame("pong")), w: new(bytes.Buffer)}
-	session := NewUpgrader().SessionOnStream(rwc, "", "")
+	session, err := NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).SessionOnStream(rwc, "", "")
+	if err != nil {
+		t.Fatalf("SessionOnStream: %v", err)
+	}
 
 	op, msg, err := session.ReadMessage()
 	if err != nil || op != OpText || string(msg) != "pong" {
 		t.Fatalf("ReadMessage = %v %q %v, want text pong", op, msg, err)
 	}
+}
+
+// TestSessionOnStreamRefusesDeadlineOptions pins the stream-side half of the
+// deadline gate: a bare stream with no deadline methods must not be
+// promised windows it cannot enforce.
+func TestSessionOnStreamRefusesDeadlineOptions(t *testing.T) {
+	rwc := bareRWC{r: bytes.NewReader(nil), w: new(bytes.Buffer)}
+
+	t.Run("idle", func(t *testing.T) {
+		_, err := NewUpgrader(WithIdleTimeout(time.Second)).SessionOnStream(rwc, "", "")
+		if !errors.Is(err, ErrNoDeadlineSupport) {
+			t.Fatalf("err = %v, want ErrNoDeadlineSupport", err)
+		}
+	})
+
+	t.Run("write", func(t *testing.T) {
+		_, err := NewUpgrader(WithWriteTimeout(time.Second)).SessionOnStream(rwc, "", "")
+		if !errors.Is(err, ErrNoDeadlineSupport) {
+			t.Fatalf("err = %v, want ErrNoDeadlineSupport", err)
+		}
+	})
+
+	t.Run("waived", func(t *testing.T) {
+		session, err := NewUpgrader(WithIdleTimeout(0), WithWriteTimeout(0)).SessionOnStream(rwc, "", "")
+		if err != nil {
+			t.Fatalf("SessionOnStream: %v", err)
+		}
+		if got := session.EffectiveIdleTimeout(); got != 0 {
+			t.Fatalf("EffectiveIdleTimeout = %v, want 0", got)
+		}
+		if got := session.EffectiveWriteTimeout(); got != 0 {
+			t.Fatalf("EffectiveWriteTimeout = %v, want 0", got)
+		}
+	})
+
+	t.Run("capable-stream", func(t *testing.T) {
+		// A stream that implements DeadlineStream keeps its deadlines in
+		// force over a nonzero window.
+		a, _ := net.Pipe()
+		defer a.Close()
+		_, err := NewUpgrader().SessionOnStream(a, "", "")
+		if err != nil {
+			t.Fatalf("SessionOnStream: %v", err)
+		}
+	})
+
+	t.Run("deadline-stream-without-addresses", func(t *testing.T) {
+		// A stream with deadlines but no address methods is adapted so its
+		// deadlines pass through, and the window is enforced.
+		a, _ := net.Pipe()
+		defer a.Close()
+		session, err := NewUpgrader(WithIdleTimeout(time.Second)).SessionOnStream(deadlineOnlyRWC{a}, "", "")
+		if err != nil {
+			t.Fatalf("SessionOnStream: %v", err)
+		}
+		if got := session.EffectiveIdleTimeout(); got != time.Second {
+			t.Fatalf("EffectiveIdleTimeout = %v, want 1s", got)
+		}
+	})
 }

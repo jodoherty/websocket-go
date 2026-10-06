@@ -26,6 +26,7 @@ const (
 	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
 	testMCDCRawWriteFrame       = "TestMCDCRawWriteFrame"
 	testMCDCTruncateReason      = "TestMCDCTruncateReason"
+	testMCDCStreamDeadlines     = "TestMCDCStreamDeadlines"
 	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
 	testMCDCDeflateControl      = "TestMCDCDeflateControl"
 	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
@@ -411,6 +412,39 @@ func serverTraces() []decisionTrace {
 				{0, []bool{true, false}, []bool{false, false}, testMCDCHandleCloseCode, "belowMin"},
 				// 5000 remapped to 1002, 4999 passed through unchanged.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCHandleCloseCode, "aboveMax"},
+			},
+		},
+		// ws.go (finishRaw): the deadline gate — a session is created only
+		// when the deadline options are zero or the channel implements
+		// DeadlineStream.
+		{
+			expr: "(u.idleTimeout > 0 || u.writeTimeout > 0) " +
+				"&& !deadlineCapable(channel)",
+			conditions: []string{"u.idleTimeout > 0", "u.writeTimeout > 0", "!deadlineCapable(channel)"},
+			pairs: []pairTrace{
+				// A bare stream with an idle window is refused; with the
+				// window zeroed it is accepted.
+				{0, []bool{false, false, true}, []bool{true, false, true}, testMCDCStreamDeadlines, "idle-set"},
+				// A bare stream with a write bound is refused; with the
+				// bound zeroed it is accepted.
+				{1, []bool{false, false, true}, []bool{false, true, true}, testMCDCStreamDeadlines, "write-set"},
+				// An idle window over a bare stream is refused; the same
+				// window over a deadline-capable stream is accepted.
+				{2, []bool{true, false, true}, []bool{true, false, false}, testMCDCStreamDeadlines, "capable"},
+			},
+		},
+		// ws.go (finishRaw, nested sub-decision of the deadline gate):
+		// u.idleTimeout > 0 || u.writeTimeout > 0
+		{
+			expr:       "u.idleTimeout > 0 || u.writeTimeout > 0",
+			conditions: []string{"u.idleTimeout > 0", "u.writeTimeout > 0"},
+			pairs: []pairTrace{
+				// An idle window over a bare stream is refused; with the
+				// window zeroed it is accepted.
+				{0, []bool{false, false}, []bool{true, false}, testMCDCStreamDeadlines, "idle-set"},
+				// A write bound over a bare stream is refused; with the
+				// bound zeroed it is accepted.
+				{1, []bool{false, false}, []bool{false, true}, testMCDCStreamDeadlines, "write-set"},
 			},
 		},
 	}

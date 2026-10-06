@@ -229,3 +229,19 @@ wakes and a hijacked conn cannot leak (pinned by
 `TestWriteTransportFailureFailsConnection` and
 `TestWriteFailureAfterConcurrentClose`, the latter also pinning that a
 concurrent `Close` that wins the race keeps its own recorded error).
+The deadline options are either enforced or absent, never silently inert
+(v0.7.0): a session is only created with a nonzero `WithIdleTimeout` or
+`WithWriteTimeout` over a channel that claims to enforce deadlines — a
+hijacked `net.Conn`, or a stream implementing `ws.DeadlineStream` (a bare
+stream is adapted only when it implements `DeadlineStream`, and its
+deadline calls pass through untouched). Every other path is refused at
+handshake: the extended-CONNECT branch of `Upgrader.Upgrade` with a 501
+before the tunnel opens, and `Upgrader.SessionOnStream` with
+`ErrNoDeadlineSupport`. The trust boundary is the claim itself: the
+library does not verify that a `DeadlineStream`'s deadlines actually fire,
+and a `WithDialer` connection is trusted by construction — a transport
+whose deadline methods are no-ops is the application's responsibility
+(pinned by `TestSessionOnStreamRefusesDeadlineOptions`,
+`TestExtendedConnectRejectsDeadlineOptions`,
+`TestExtendedConnectDeadlineWaiver`, and the
+`TestMCDCStreamDeadlines` matrix).

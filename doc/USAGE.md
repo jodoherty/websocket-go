@@ -162,17 +162,31 @@ The protocol core is transport-agnostic; only the handshake surface changes.
   over the open stream (below).
 
 Because the frame loop reads `request.Body` and writes the response body, the
-server has no per-stream deadline to set over an extended CONNECT — this
-package's keepalive read deadline and bounded-write guarantee (which hold over
-a hijacked `net.Conn`) do not apply on that path, and liveness rests on the
-transport's own idle timeout instead.
+server has no per-stream deadline to set over an extended CONNECT — and this
+package refuses to pretend otherwise. The deadline options are either
+enforced or absent, never silently inert:
+
+- `WithIdleTimeout` / `WithWriteTimeout` nonzero + extended CONNECT → the
+  upgrade is refused with a **501** before the tunnel opens.
+- `SessionOnStream` over a stream that cannot enforce the options →
+  `ws.ErrNoDeadlineSupport`.
+
+To serve a deadline-less stream, set both options to `0` and bound liveness
+in the transport's own idle timeout instead; `EffectiveIdleTimeout()` and
+`EffectiveWriteTimeout()` on a live session report the windows it actually
+enforces (zero on such a stream). A stream that *can* enforce deadlines —
+a `net.Conn`, or any stream implementing the small `ws.DeadlineStream`
+interface — keeps its deadlines in force: `SessionOnStream` adapts
+address-less deadline streams so the options bind there too.
 
 `Upgrader.SessionOnStream(stream, subprotocol, extension)` builds a session
 over a stream the library does not itself drive: the application has already
 run the extended-CONNECT handshake on it and hands the open, bidirectional
-stream over. A stream that also reports an address and deadlines (a
-`net.Conn`) is used directly; a bare stream is wrapped so it reports a nil
-address and no-op deadlines.
+stream over. It returns `(*Session, error)`. A stream that also reports an
+address and deadlines (a `net.Conn`) is used directly; a stream implementing
+`ws.DeadlineStream` without addresses is adapted so its deadlines pass
+through; a bare stream reports a nil address and no-op deadlines, so the
+deadline options must be zero over it.
 
 ## Usage: good and bad
 
@@ -188,7 +202,10 @@ arrives on the write timeout, not on the first lost message. The failure
 is also terminal: a transport-level write failure closes the connection
 with the error recorded, so later writes fast-fail, `Closed()` turns true
 for background writers, and a blocked `ReadMessage` wakes. Even an
-unchecked write is therefore bounded by a single write timeout — but the
+unchecked write is therefore bounded by a single write timeout — on a
+stream that enforces deadlines; over a deadline-less stream the bound does
+not exist (the upgrade is refused if you set one anyway — see Transports
+above) — but the
 error is still the only place the application learns *why* the session
 ended, and discarding it turns a diagnosable failure into a mystery.
 

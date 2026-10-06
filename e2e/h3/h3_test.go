@@ -41,7 +41,13 @@ func TestExtendedConnectH3RoundTrip(t *testing.T) {
 	// ConfigureTLSConfig clones the config and sets the ALPN to h3.
 	serverTLS := http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}})
 
-	upgrader := ws.NewUpgrader()
+	upgrader := ws.NewUpgrader(
+		// The tunnel wrapper reports no address and no-op deadlines, so it
+		// cannot enforce the deadline options; they are waived and liveness
+		// rests on the transport's own idle timeout. With either option
+		// nonzero SessionOnStream returns ws.ErrNoDeadlineSupport.
+		ws.WithIdleTimeout(0), ws.WithWriteTimeout(0),
+	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// quic-go surfaces the :protocol pseudo-header in r.Proto.
@@ -57,7 +63,11 @@ func TestExtendedConnectH3RoundTrip(t *testing.T) {
 		w.Header().Set("Sec-WebSocket-Accept", acceptKey(key))
 		w.WriteHeader(http.StatusOK)
 
-		session := upgrader.SessionOnStream(tunnel{read: r.Body, write: w}, "", "")
+		session, sessionErr := upgrader.SessionOnStream(tunnel{read: r.Body, write: w}, "", "")
+		if sessionErr != nil {
+			http.Error(w, sessionErr.Error(), http.StatusNotImplemented)
+			return
+		}
 		for {
 			op, msg, err := session.ReadMessage()
 			if err != nil {

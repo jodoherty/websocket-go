@@ -78,7 +78,10 @@
 //     reaches the idle timeout, [WithIdleTimeout], and the connection is
 //     considered dead if it is still silent after a second window — all
 //     inline in the read path, no background goroutines), and a local
-//     [Session.Close] call.
+//     [Session.Close] call. The read and write deadline options bind only
+//     where the stream can enforce deadlines; over a stream that cannot (the
+//     standard library's extended-CONNECT streams), a session with a nonzero
+//     window is refused at construction — never silently inert.
 //
 // # Two faces: the session and the raw connection
 //
@@ -137,7 +140,11 @@
 // writes and [Session.Close]. Cancelling a live connection is therefore
 // [Session.Close] from another goroutine — bounded, idempotent, and safe
 // from anywhere — rather than a context cancellation, which is what the
-// deadline ownership above makes the cheaper answer.
+// deadline ownership above makes the cheaper answer. The deadline options
+// bind only where the underlying stream can enforce them (a hijacked net.Conn
+// always can; see [DeadlineStream]); over a stream that cannot, a session
+// with a nonzero window is refused, so the bounds are never promised and
+// silently absent.
 //
 // # Real-world interop
 //
@@ -190,6 +197,12 @@
 // library does not drive — an HTTP/3 or QUIC stream — which the application
 // hands over after running the extended-CONNECT handshake on it itself. The
 // protocol core is transport-agnostic; only the handshake surface changes.
+// Because those streams expose no per-stream deadline, the read and write
+// deadline options bind only where the stream implements [DeadlineStream];
+// with a nonzero window on a stream that cannot enforce one, the CONNECT
+// branch refuses the upgrade with a 501 before the tunnel opens, and
+// [Upgrader.SessionOnStream] returns [ErrNoDeadlineSupport] — set both
+// options to zero and bound liveness in the transport instead.
 //
 // # File map
 //
@@ -211,7 +224,7 @@
 //  6. protocol core: terminal handling and permessage-deflate
 //  7. wire format: the frame codec (readFrame, writeFrame)
 //  8. protocol constants: close codes, frame opcodes, wire defaults
-//  9. errors: [CloseError], [CloseCode], [ErrClosed], the internal sentinels
+//  9. errors: [CloseError], [CloseCode], [ErrClosed], the sentinels
 package ws
 
 // This software is released into the public domain under the Unlicense
@@ -397,6 +410,20 @@ func (s *Session) SetWriteDeadline(t time.Time) error { return s.raw.SetWriteDea
 // [RawConn.Compressed].
 func (s *Session) Compressed() bool { return s.raw.Compressed() }
 
+// EffectiveIdleTimeout reports the idle window this session actually
+// enforces, exactly as [RawConn.EffectiveIdleTimeout]: the configured window
+// when the stream enforces read deadlines, and zero otherwise.
+func (s *Session) EffectiveIdleTimeout() time.Duration {
+	return s.raw.EffectiveIdleTimeout()
+}
+
+// EffectiveWriteTimeout reports the write bound this session actually
+// enforces, exactly as [RawConn.EffectiveWriteTimeout]: the configured bound
+// when the stream enforces write deadlines, and zero otherwise.
+func (s *Session) EffectiveWriteTimeout() time.Duration {
+	return s.raw.EffectiveWriteTimeout()
+}
+
 // ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 // 2 · Options: Option, Config, and every With* function
 
@@ -493,6 +520,12 @@ func WithMaxMessageSize(n int64) Option {
 // second window, the kill. Pass zero to disable keepalive and manage
 // deadlines via [Session.SetReadDeadline]. A negative window is invalid and is
 // replaced by the default, never by "disabled".
+//
+// The window binds only where the stream enforces read deadlines: over the
+// standard library's extended-CONNECT streams, and over a [SessionOnStream]
+// stream that does not implement [DeadlineStream], it cannot be enforced, so
+// the upgrade (or [SessionOnStream]) is refused with [ErrNoDeadlineSupport]
+// unless this option is zero — there, liveness is the transport's job.
 func WithIdleTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.IdleTimeout = d }
 }
@@ -503,6 +536,12 @@ func WithIdleTimeout(d time.Duration) Option {
 // the bound (a write then blocks until the transport completes or the
 // connection is closed). A negative bound is invalid and is replaced by
 // the default, never by "unbounded".
+//
+// The bound binds only where the stream enforces write deadlines; over a
+// stream that does not (see [WithIdleTimeout]) a session with a nonzero
+// bound is refused with [ErrNoDeadlineSupport] unless this option is zero.
+// [Session.EffectiveWriteTimeout] reports the bound a live session
+// actually enforces.
 func WithWriteTimeout(d time.Duration) Option {
 	return func(cfg *Config) { cfg.WriteTimeout = d }
 }
@@ -591,6 +630,12 @@ func WithHeader(key, value string) Option {
 //
 // Without this option the default transport is used: plain TCP for ws://
 // and TLS with the system root store for wss://.
+//
+// The library trusts the returned connection's deadline methods: if the
+// dialer hands back a transport whose SetReadDeadline/SetWriteDeadline are
+// no-ops, the read and write deadline options are unenforceable — the
+// connection must have real deadline semantics, or the options must be
+// zero.
 func WithDialer(dial func(ctx context.Context, u *url.URL) (net.Conn, error)) Option {
 	return func(cfg *Config) { cfg.dialer = dial }
 }
@@ -798,6 +843,15 @@ func writeSwitchingProtocols(conn net.Conn, protocol, accept, extension string) 
 // and returns a [*UpgradeError] for logging; the handler should simply
 // return.
 //
+// Over an extended CONNECT (HTTP/2 or HTTP/3) the connection's stream
+// carries the frames. The stream exposes no per-stream deadline, so the
+// read and write deadline options bind only where the stream can enforce
+// them: with a nonzero [WithIdleTimeout] or [WithWriteTimeout] the
+// extended-CONNECT upgrade is refused with a 501 before the tunnel opens
+// (the HTTP/1.1 upgrade is unaffected — a hijacked net.Conn always
+// enforces deadlines). Set both options to zero and bound liveness in the
+// transport instead.
+//
 // Origin checking is applied before the protocol headers are validated.
 func (u *Upgrader) Upgrade(writer http.ResponseWriter, request *http.Request) (*Session, error) {
 	raw, err := u.upgradeCore(writer, request)
@@ -889,15 +943,31 @@ func (u *Upgrader) upgradeCore(writer http.ResponseWriter, request *http.Request
 
 		return nil, fmt.Errorf("ws: write handshake response: %w", writeErr)
 	}
+	// A hijacked net.Conn always enforces deadlines, so finishRaw cannot
+	// fail here; the guard keeps the path total if that ever changes.
+	conn, finishErr := u.finishRaw(raw, buf.Reader, protocol, extension)
+	if finishErr != nil {
+		return nil, rejectOnConn(raw, http.StatusInternalServerError, finishErr.Error())
+	}
 
-	return u.finishRaw(raw, buf.Reader, protocol, extension), nil
+	return conn, nil
 }
 
 // finishRaw assembles the upgraded raw connection: the frame codec on the
 // upgraded channel with the negotiated session state and the permessage-deflate
 // switch when the extension was granted. The caller wraps it in a [*Session]
 // when the message-oriented view was asked for.
-func (u *Upgrader) finishRaw(channel transport, read io.Reader, protocol, extension string) *RawConn {
+//
+// It refuses the connection — [ErrNoDeadlineSupport] — when the upgrader has
+// a nonzero idle or write window but the channel cannot enforce deadlines
+// (does not implement [DeadlineStream]): the options must be real
+// protections or absent, never silently inert. Set both options to zero to
+// run over a deadline-less stream; liveness then rests on the transport's
+// own idle timeout.
+func (u *Upgrader) finishRaw(channel transport, read io.Reader, protocol, extension string) (*RawConn, error) {
+	if (u.idleTimeout > 0 || u.writeTimeout > 0) && !deadlineCapable(channel) {
+		return nil, ErrNoDeadlineSupport
+	}
 	conn := newRawConn(channel, read, false, u.maxMessageSize, u.idleTimeout, u.writeTimeout)
 	conn.subprotocol = protocol
 	if extension != "" {
@@ -905,7 +975,7 @@ func (u *Upgrader) finishRaw(channel transport, read io.Reader, protocol, extens
 		conn.compressLevel = u.compressLevel
 	}
 
-	return conn
+	return conn, nil
 }
 
 // upgradeConnect handles a WebSocket that arrived as an HTTP/2 or HTTP/3
@@ -935,6 +1005,14 @@ func (u *Upgrader) upgradeConnect(writer http.ResponseWriter, request *http.Requ
 	if extErr != nil {
 		return reject(writer, http.StatusBadRequest, extErr.Error())
 	}
+	// The deadline gate runs before the tunnel opens: a stream that cannot
+	// enforce the configured windows is refused up front, 501 — the options
+	// must be real protections or zero, never silently inert.
+	channel := streamTransport{body: request.Body, tunnel: writer}
+	raw, finishErr := u.finishRaw(channel, channel, protocol, extension)
+	if finishErr != nil {
+		return reject(writer, http.StatusNotImplemented, finishErr.Error())
+	}
 	// The tunnel is full-duplex: the frame loop reads request.Body and writes
 	// the response body interleaved until the stream closes.
 	err := http.NewResponseController(writer).EnableFullDuplex()
@@ -943,9 +1021,7 @@ func (u *Upgrader) upgradeConnect(writer http.ResponseWriter, request *http.Requ
 	}
 	respondExtendedConnect(writer, key, protocol, extension)
 
-	channel := streamTransport{body: request.Body, tunnel: writer}
-
-	return u.finishRaw(channel, channel, protocol, extension), nil
+	return raw, nil
 }
 
 // respondExtendedConnect writes the extended-CONNECT success response: a 200
@@ -964,13 +1040,24 @@ func respondExtendedConnect(writer http.ResponseWriter, key, protocol, extension
 	writer.WriteHeader(http.StatusOK)
 }
 
+// deadlineNoop is the [DeadlineStream] for a channel that cannot enforce
+// deadlines: the calls are error-free no-ops. A RawConn over such a channel
+// exists only with the deadline options waived, so the no-op is honest —
+// nothing is promised that is not enforced.
+type deadlineNoop struct{}
+
+func (deadlineNoop) SetReadDeadline(time.Time) error  { return nil }
+func (deadlineNoop) SetWriteDeadline(time.Time) error { return nil }
+
 // streamTransport adapts an extended-CONNECT stream to [transport]: reads come
 // from the request body and writes go to the response tunnel, which
 // [http.ResponseController.EnableFullDuplex] keeps open. The stream has no
 // address of its own, so the address accessors report nil. HTTP/2 and HTTP/3
-// expose no per-stream deadline, so the deadline methods are no-ops — liveness
-// then rests on the transport's own idle timeout rather than this package's
-// read deadline.
+// expose no per-stream deadline, so the adapter has no deadline methods at
+// all: deadline enforcement is structurally absent, and finishRaw refuses a
+// session with a nonzero deadline option over it ([ErrNoDeadlineSupport])
+// unless the options are zero, in which case liveness rests on the
+// transport's own idle timeout.
 type streamTransport struct {
 	body   io.ReadCloser
 	tunnel io.Writer
@@ -995,27 +1082,96 @@ func (s streamTransport) RemoteAddr() net.Addr { return nil }
 
 func (s streamTransport) LocalAddr() net.Addr { return nil }
 
-func (s streamTransport) SetReadDeadline(time.Time) error { return nil }
+// deadlineStream adapts a [DeadlineStream] that does not report addresses to
+// the full [transport] surface: the deadline calls pass through to the
+// stream, so the upgrader's deadline options bind, and the address accessors
+// report nil. A stream that implements neither addresses nor deadlines is
+// adapted by streamTransport instead, and its session is refused by finishRaw
+// with [ErrNoDeadlineSupport] when a deadline option is nonzero.
+type deadlineStream struct {
+	rwc io.ReadWriteCloser
+	ds  DeadlineStream
+}
 
-func (s streamTransport) SetWriteDeadline(time.Time) error { return nil }
+func (d deadlineStream) Read(p []byte) (int, error) {
+	return d.rwc.Read(p) //nolint:wrapcheck // pass-through adapter: the stream's error is the error
+}
+
+func (d deadlineStream) Write(p []byte) (int, error) {
+	return d.rwc.Write(p) //nolint:wrapcheck // pass-through adapter: the stream's error is the error
+}
+
+func (d deadlineStream) Close() error {
+	return d.rwc.Close() //nolint:wrapcheck // pass-through adapter: the stream's error is the error
+}
+
+func (d deadlineStream) RemoteAddr() net.Addr { return nil }
+func (d deadlineStream) LocalAddr() net.Addr  { return nil }
+
+func (d deadlineStream) SetReadDeadline(t time.Time) error {
+	return d.ds.SetReadDeadline(t)
+}
+
+func (d deadlineStream) SetWriteDeadline(t time.Time) error {
+	return d.ds.SetWriteDeadline(t)
+}
+
+// DeadlineStream is implemented by a stream that can enforce read and write
+// deadlines. A session built over a DeadlineStream — a stream handed to
+// [SessionOnStream], or the hijacked net.Conn behind [Upgrader.Upgrade] —
+// honors the upgrader's [WithIdleTimeout] and [WithWriteTimeout]. A stream
+// that does not implement it cannot enforce them, so with either option
+// nonzero the session is refused ([ErrNoDeadlineSupport] from
+// [SessionOnStream]; a 501 from the extended-CONNECT branch of
+// [Upgrader.Upgrade]).
+//
+// Implementing it is a claim, not a query: the library trusts that your
+// deadlines actually fire and does not verify them. Do not implement no-ops
+// to satisfy an interface — if the underlying transport cannot enforce
+// deadlines, omit the methods, set the timeout options to zero, and bound
+// liveness in your transport instead.
+type DeadlineStream interface {
+	SetReadDeadline(deadline time.Time) error
+	SetWriteDeadline(deadline time.Time) error
+}
+
+// deadlineCapable reports whether channel can enforce read and write
+// deadlines, i.e. implements [DeadlineStream]. A hijacked net.Conn always
+// does; streamTransport has no deadline methods at all, so it never does.
+func deadlineCapable(channel transport) bool {
+	_, ok := channel.(DeadlineStream)
+
+	return ok
+}
 
 // SessionOnStream builds a [*Session] over an already-established
 // extended-CONNECT stream that the standard library does not drive — typically
 // an HTTP/3 or QUIC stream from an external transport. The stream carries the
 // WebSocket frames in both directions; the subprotocol and extension must
-// already be negotiated. A stream that also reports an address and deadlines,
-// as a [net.Conn] does, is used directly; a bare stream reports a nil address
-// and no-op deadlines. Standard-library HTTP/2 callers use [Upgrader.Upgrade]
+// already be negotiated. The session is refused — [ErrNoDeadlineSupport] —
+// when the upgrader has a nonzero [WithIdleTimeout] or [WithWriteTimeout] but
+// the stream cannot enforce deadlines: a stream that also reports an address
+// and deadlines, as a [net.Conn] does, is used directly; a stream that
+// implements [DeadlineStream] without addresses is adapted so its deadlines
+// pass through; a bare stream reports a nil address and carries the no-op
+// deadline enforcement, so
+// the deadline options must be zero over it. Standard-library HTTP/2 callers use [Upgrader.Upgrade]
 // instead, which detects the extended CONNECT itself.
-func (u *Upgrader) SessionOnStream(stream io.ReadWriteCloser, subprotocol, extension string) *Session {
+func (u *Upgrader) SessionOnStream(stream io.ReadWriteCloser, subprotocol, extension string) (*Session, error) {
 	var channel transport
 	if full, ok := stream.(transport); ok {
 		channel = full
+	} else if ds, ok := stream.(DeadlineStream); ok {
+		channel = deadlineStream{rwc: stream, ds: ds}
 	} else {
 		channel = streamTransport{body: stream, tunnel: stream}
 	}
+	raw, err := u.finishRaw(channel, stream, subprotocol, extension)
+	if err != nil {
+		return nil, err
+	}
 
-	return newSession(u.finishRaw(channel, stream, subprotocol, extension), u.pongHandler)
+	return newSession(raw, u.pongHandler), nil
 }
 
 // negotiateExtensions runs permessage-deflate negotiation when compression is
@@ -1782,8 +1938,15 @@ var connSeq atomic.Uint64
 // time. Every write and [RawConn.Close] is safe from any goroutine.
 type RawConn struct {
 	nc transport
-	fc frameCodec
-	mu sync.Mutex // serializes the write path
+	// deadlines is the channel's deadline enforcement, resolved once at
+	// construction: the channel's own methods when it implements
+	// [DeadlineStream], deadlineNoop otherwise. Every read and write
+	// deadline call on the connection goes through this field, so
+	// capability is decided in one place — at creation — and the call
+	// sites never ask.
+	deadlines DeadlineStream
+	fc        frameCodec
+	mu        sync.Mutex // serializes the write path
 
 	id          uint64
 	subprotocol string
@@ -1838,18 +2001,19 @@ type RawConn struct {
 }
 
 // transport is the bidirectional channel a [RawConn] runs its frames on. It is
-// exactly the subset of [net.Conn] the protocol engine uses, factored out so a
-// hijacked HTTP/1.1 connection and an HTTP/2/3 extended-CONNECT stream share
-// one code path. A [net.Conn] satisfies transport directly; an extended-
-// CONNECT stream satisfies it via [streamTransport]. The address and deadline
-// methods may be unavailable on a stream — a nil address or a no-op deadline —
-// and [RawConn] surfaces exactly what the channel reports.
+// the subset of [net.Conn] the protocol engine needs — deliberately without
+// the deadline methods: deadline enforcement is a separate, checked
+// capability ([DeadlineStream]), not part of the channel contract. A channel
+// that cannot enforce deadlines is still a transport; a [RawConn] over it
+// carries the no-op [deadlineNoop] in its deadlines field instead. A
+// [net.Conn] satisfies transport directly; an extended-CONNECT stream
+// satisfies it via [streamTransport]. Addresses may be unavailable on a
+// stream — a nil address — and [RawConn] surfaces exactly what the channel
+// reports.
 type transport interface {
 	io.ReadWriteCloser
 	RemoteAddr() net.Addr
 	LocalAddr() net.Addr
-	SetReadDeadline(deadline time.Time) error
-	SetWriteDeadline(deadline time.Time) error
 }
 
 func newRawConn(channel transport, read io.Reader, isClient bool, maxMessageSize int64,
@@ -1861,9 +2025,14 @@ func newRawConn(channel transport, read io.Reader, isClient bool, maxMessageSize
 	} else {
 		reader = bufio.NewReaderSize(read, bufSize)
 	}
+	var deadlines DeadlineStream = deadlineNoop{}
+	if de, ok := channel.(DeadlineStream); ok {
+		deadlines = de
+	}
 
 	return &RawConn{
-		nc: channel,
+		nc:        channel,
+		deadlines: deadlines,
 		fc: frameCodec{
 			br:       reader,
 			bw:       bufio.NewWriterSize(channel, bufSize),
@@ -1945,7 +2114,7 @@ func (c *RawConn) ReadEvent() (Event, error) {
 		// Clear the keepalive deadline; a zero idle timeout never armed one,
 		// so skip the call when keepalive is disabled.
 		if c.idleTimeout > 0 {
-			_ = c.nc.SetReadDeadline(time.Time{})
+			_ = c.deadlines.SetReadDeadline(time.Time{})
 		}
 		c.lastActivity = time.Now()
 		c.probedSinceLastActivity = false
@@ -2144,7 +2313,7 @@ func (c *RawConn) armIdle() error {
 		deadline = c.probeAt.Add(c.idleTimeout)
 	}
 
-	return c.nc.SetReadDeadline(deadline)
+	return c.deadlines.SetReadDeadline(deadline)
 }
 
 // probeAction is the keepalive response to a read timeout, which can only
@@ -2308,8 +2477,8 @@ func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 		// keepalive ping) written to a stalled transport must fail on
 		// deadline, not wedge the read loop or hold the write mutex
 		// against Close. Cleared on return so the bound is per-frame.
-		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		defer func() { _ = c.nc.SetWriteDeadline(time.Time{}) }()
+		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		defer func() { _ = c.deadlines.SetWriteDeadline(time.Time{}) }()
 	}
 
 	return c.fc.writeFrame(opcode, payload, compressed, true)
@@ -2369,7 +2538,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 		// mutex forever: a stuck write must fail (releasing the mutex) so
 		// [RawConn.Close] can still tear the connection down. Cleared on return
 		// so the bound is per-write, not sticky.
-		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 	// permessage-deflate (RFC 7692 §6.1): the whole message is one raw
 	// DEFLATE stream and RSV1 marks the single frame as compressed.
@@ -2379,7 +2548,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 	if c.deflateNegotiated {
 		compressErr := c.compress(data)
 		if compressErr != nil {
-			_ = c.nc.SetWriteDeadline(time.Time{})
+			_ = c.deadlines.SetWriteDeadline(time.Time{})
 			c.mu.Unlock()
 
 			return compressErr
@@ -2392,7 +2561,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 		// frame that a peer with the same limit would fail — the connection
 		// stays open, exactly as with the other validation rejections.
 		if int64(len(frame)) > c.fc.maxMsg {
-			_ = c.nc.SetWriteDeadline(time.Time{})
+			_ = c.deadlines.SetWriteDeadline(time.Time{})
 			c.mu.Unlock()
 
 			return fmt.Errorf("%w: compressed message of %d bytes exceeds the %d byte limit",
@@ -2400,7 +2569,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 		}
 	}
 	writeErr := c.fc.writeFrame(opcode, frame, compressed, true)
-	_ = c.nc.SetWriteDeadline(time.Time{})
+	_ = c.deadlines.SetWriteDeadline(time.Time{})
 	if writeErr != nil {
 		// The transport write failed, so the pipe is broken: no later
 		// write on this connection can succeed. Fail the connection with
@@ -2475,10 +2644,10 @@ func (c *RawConn) WriteFrame(opcode Op, payload []byte, more bool) error {
 		c.fragWriting = more
 	}
 	if c.writeTimeout > 0 {
-		_ = c.nc.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 	writeErr := c.fc.writeFrame(opcode, payload, false, !more)
-	_ = c.nc.SetWriteDeadline(time.Time{})
+	_ = c.deadlines.SetWriteDeadline(time.Time{})
 	if writeErr != nil {
 		// The transport write failed, so the pipe is broken: fail the
 		// connection, as WriteMessage does.
@@ -2653,9 +2822,9 @@ func (c *RawConn) closeWith(code int, reason string) (error, error) {
 	if c.writeTimeout > 0 {
 		closeBound = c.writeTimeout
 	}
-	_ = c.nc.SetWriteDeadline(time.Now().Add(closeBound))
+	_ = c.deadlines.SetWriteDeadline(time.Now().Add(closeBound))
 	writeErr := c.fc.writeFrame(OpClose, payload, false, true)
-	_ = c.nc.SetWriteDeadline(time.Time{})
+	_ = c.deadlines.SetWriteDeadline(time.Time{})
 	c.mu.Unlock()
 	_ = c.nc.Close()
 
@@ -2729,6 +2898,20 @@ func (c *RawConn) Closed() bool {
 	return c.state.Load() == stClosed
 }
 
+// EffectiveIdleTimeout reports the idle window this connection actually
+// enforces: the configured window when the stream enforces read deadlines, and
+// zero otherwise. A session is only created with a nonzero window over a
+// stream that implements [DeadlineStream], so the reported window is the one
+// the read path arms; zero means the window was never configured or was
+// waived because the stream cannot enforce it (see [ErrNoDeadlineSupport]).
+func (c *RawConn) EffectiveIdleTimeout() time.Duration { return c.idleTimeout }
+
+// EffectiveWriteTimeout reports the write bound this connection actually
+// enforces: the configured bound when the stream enforces write deadlines, and
+// zero otherwise — see [RawConn.EffectiveIdleTimeout] for the same contract.
+// Zero means writes are unbounded on this stream.
+func (c *RawConn) EffectiveWriteTimeout() time.Duration { return c.writeTimeout }
+
 // ID returns a unique identifier for the connection (unique within this
 // process), useful as a key in session registries.
 func (c *RawConn) ID() uint64 { return c.id }
@@ -2745,11 +2928,13 @@ func (c *RawConn) LocalAddr() net.Addr { return c.nc.LocalAddr() }
 // SetReadDeadline sets the underlying connection's read deadline. When the
 // idle timeout keepalive is enabled it is overridden by the keepalive for
 // the duration of each blocking read; use WithIdleTimeout(0) to manage
-// deadlines yourself.
-func (c *RawConn) SetReadDeadline(t time.Time) error { return c.nc.SetReadDeadline(t) }
+// deadlines yourself. On a stream that cannot enforce deadlines it is a
+// no-op.
+func (c *RawConn) SetReadDeadline(t time.Time) error { return c.deadlines.SetReadDeadline(t) }
 
-// SetWriteDeadline sets the underlying connection's write deadline.
-func (c *RawConn) SetWriteDeadline(t time.Time) error { return c.nc.SetWriteDeadline(t) }
+// SetWriteDeadline sets the underlying connection's write deadline. On a
+// stream that cannot enforce deadlines it is a no-op.
+func (c *RawConn) SetWriteDeadline(t time.Time) error { return c.deadlines.SetWriteDeadline(t) }
 
 // ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
 // 6 · Protocol core: terminal handling and permessage-deflate
@@ -3364,6 +3549,16 @@ func CloseCode(err error) (int, string, bool) {
 // terminal error, so without a sentinel a write after such a close would
 // report success for a frame that is never sent.
 var ErrClosed = errors.New("ws: connection closed")
+
+// ErrNoDeadlineSupport is returned by [Upgrader.SessionOnStream] — and the
+// reason for a 501 from the extended-CONNECT branch of [Upgrader.Upgrade] —
+// when the upgrader has a nonzero [WithIdleTimeout] or [WithWriteTimeout] but
+// the stream cannot enforce read or write deadlines (does not implement
+// [DeadlineStream]). The options must be real protections or absent, never
+// silently inert: bound liveness in the transport and set both options to
+// zero to run a session over such a stream.
+var ErrNoDeadlineSupport = errors.New("ws: stream cannot enforce the configured deadline options; " +
+	"bound liveness in the transport and set WithIdleTimeout(0) and WithWriteTimeout(0)")
 
 // errProtocol marks a protocol violation that terminates the connection.
 var errProtocol = errors.New("ws: protocol violation")
