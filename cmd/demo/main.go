@@ -36,10 +36,18 @@ const (
     const log = (m) => document.body.insertAdjacentText("beforeend", m + "\n", "pre");
     log("connecting " + url + " …");
     const ws = new WebSocket(url, "vnc1");
+    // The Playwright suite waits for this signal before opening its own
+    // WebSockets: Firefox fails a new same-origin WebSocket handshake while
+    // an active same-origin WebSocket exists, so the suite never opens one
+    // while the auto-test's /ws/echo is still open.
+    window.__wsAutoTest = { done: false };
     ws.onopen = () => { log("open (subprotocol " + ws.protocol + ")"); ws.send("hello, server"); };
     ws.onmessage = (e) => { log("echo: " + e.data); ws.close(1000, "done"); };
-    ws.onclose = (e) => log("closed " + e.code + " " + e.reason);
-    ws.onerror = () => log("error — check that the page was served from this host");
+    ws.onclose = (e) => { log("closed " + e.code + " " + e.reason); window.__wsAutoTest.done = true; };
+    ws.onerror = () => {
+      log("error — check that the page was served from this host");
+      window.__wsAutoTest.done = true;
+    };
   </script>
 </body>
 </html>`

@@ -13,9 +13,17 @@ const TOKEN = process.env.DEMO_TOKEN ?? "demo-secret";
  * Browsers send Origin on WebSocket handshakes, and the demo server applies
  * the default same-origin policy, so every test first loads the page served
  * by the demo server itself.
+ *
+ * The page's auto-test holds /ws/echo open for a moment after load. Firefox
+ * fails a new same-origin WebSocket handshake while an active same-origin
+ * WebSocket exists in the context (the server completes the session normally;
+ * the browser reports close 1000 wasClean=false without firing onopen — a
+ * Firefox bug, Chromium unaffected), so wait for the auto-test to finish
+ * before any test opens its own connection.
  */
 async function sameOriginPage(page: Page) {
   await page.goto(HTTP_BASE + "/");
+  await page.waitForFunction(() => (window as any).__wsAutoTest?.done === true, undefined, { timeout: 10_000 });
 }
 
 /** Connect, send one text message, resolve with the echo and the negotiated subprotocol. */
