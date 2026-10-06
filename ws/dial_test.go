@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"net"
 	"net/http"
@@ -134,5 +135,31 @@ func TestDialTarget(t *testing.T) {
 					tc.raw, host, isTLS, tc.wantHost, tc.wantTLS)
 			}
 		})
+	}
+}
+
+// TestDialDefaultWSS pins the default wss:// transport: Dial with the default
+// transport must perform a real TLS handshake — reaching certificate-chain
+// verification against the system root store — not abort before the
+// handshake because the TLS config has no ServerName. A self-signed httptest
+// server therefore fails as unknown authority, which proves the handshake got
+// as far as verifying the certificate chain (and hence that the dial host's
+// hostname was supplied as the ServerName). That is a different, expected
+// failure from the pre-fix "either ServerName or InsecureSkipVerify must be
+// specified" error that aborted every wss dial.
+func TestDialDefaultWSS(t *testing.T) {
+	up := NewUpgrader()
+	srv := httptest.NewTLSServer(up.Handle(func(_ *http.Request, c *Session) error {
+		return c.WriteText("pong")
+	}))
+	defer srv.Close()
+
+	_, err := Dial(context.Background(), "wss"+srv.URL[len("https"):])
+	if err == nil {
+		t.Fatal("default wss dial succeeded, but the test CA is not system-trusted")
+	}
+	var uae x509.UnknownAuthorityError
+	if !errors.As(err, &uae) {
+		t.Fatalf("default wss dial error = %v; want *x509.UnknownAuthorityError (reached cert verification)", err)
 	}
 }

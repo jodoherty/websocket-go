@@ -1567,18 +1567,25 @@ func acceptKey(key string) string {
 }
 
 // dialTransport connects to host on the default transport: plain TCP for
-// ws:// URLs and TLS with the system root store for wss:// URLs (the SNI
-// server name falls back to the host the connection dialed). Custom
+// ws:// URLs and TLS with the system root store for wss:// URLs. The SNI
+// server name is serverName (the dial host's hostname), so the default
+// transport performs real hostname verification against the server's
+// certificate; a dial by IP address verifies against IP SANs. Custom
 // transport policy — custom root stores, client certificates, proxy
 // tunnels — goes through [WithDialer], which replaces this entirely.
-func dialTransport(ctx context.Context, host string, isTLS bool) (net.Conn, error) {
+func dialTransport(ctx context.Context, host, serverName string, isTLS bool) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
 		return nil, fmt.Errorf("ws: dial %s: %w", host, err)
 	}
 	if isTLS {
-		tconn := tls.Client(conn, nil)
+		// serverName is set from the dial host's hostname so the handshake
+		// verifies the server's certificate against the host (and sends SNI):
+		// crypto/tls refuses to handshake a client with neither ServerName nor
+		// InsecureSkipVerify, so an empty config would fail every wss dial.
+		// The empty otherwise (no RootCAs) keeps the system root store.
+		tconn := tls.Client(conn, &tls.Config{ServerName: serverName})
 		handshakeErr := tconn.HandshakeContext(ctx)
 		if handshakeErr != nil {
 			_ = conn.Close()
@@ -1722,7 +1729,7 @@ func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *C
 	if cfg.dialer != nil {
 		conn, err = cfg.dialer(ctx, target)
 	} else {
-		conn, err = dialTransport(ctx, host, isTLS)
+		conn, err = dialTransport(ctx, host, target.Hostname(), isTLS)
 	}
 	if err != nil {
 		return nil, nil, err

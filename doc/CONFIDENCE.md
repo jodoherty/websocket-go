@@ -182,7 +182,11 @@ oversized frame header is closed with 1002 per §7.1.7, and a message that
 overruns the limit while fragmenting or inflating terminates the
 connection at the bound), strict same-origin default, constant-time token
 comparison in the demo, TLS-only client-cert trust (verification is the
-TLS layer's, the library only checks presence), strict subprotocol token
+TLS layer's, the library only checks presence), and the default `wss://`
+client verifying the server's hostname against the system root store (the
+TLS `ServerName` is the dial host's hostname, so a hostname that does not
+match the certificate — or any untrusted chain — fails the dial; a
+`WithDialer` connection carries whatever trust policy the dialer sets), strict subprotocol token
 validation (RFC 6455 §1.9: 1#token over U+0021..U+007E minus the RFC 2616
 separators — a token containing a comma or similar could not corrupt or
 split the Sec-WebSocket-Protocol header, enforced on client offers and on
