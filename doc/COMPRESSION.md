@@ -11,8 +11,8 @@ major browser has negotiated `permessage-deflate` since ~2015–2016, and
 every major client library (Node `ws`, Python `websockets`, Java-WebSocket,
 C# System.Net.WebSockets) and proxy (nginx, Caddy, Envoy) supports it.
 Browsers send `Sec-WebSocket-Extension: permessage-deflate;
-client_max_window_bits` on every connection, so today the library simply
-leaves the negotiation unanswered and the traffic stays uncompressed.
+client_max_window_bits` on every connection, so the negotiation is part of
+every compressed handshake in the wild — and this library answers it.
 
 The other reference RFCs in `doc/` (8307, 8441, 9220) have no browser
 support and conflict with the stdlib-only invariant; they stay
@@ -44,7 +44,13 @@ reference-only (see the table in `doc/USAGE.md`).
    per-message-resetting decompressor, so per §7's general rule the
    client fails the connection instead of discovering the mismatch
    mid-stream; likewise the response must not carry
-   `client_max_window_bits`, which the offer never did (§7.1.2.2).
+   `client_max_window_bits`, which the offer never did (§7.1.2.2). The
+   response *may* set `server_max_window_bits`, even unoffered
+   (§7.1.2.1) — but then the agreed parameter caps this client's
+   compressor (RFC 7692 §7), and the full 15-bit window is the only value
+   this client supports: a cap below it fails the dial, per §7's
+   "client MUST _Fail the WebSocket Connection_" rule for an unsupported
+   configuration.
    No cross-message codec state → no memory growth, no reset protocol,
    one fewer set of MC/DC decisions.
 
@@ -53,11 +59,15 @@ reference-only (see the table in `doc/USAGE.md`).
    32 KiB window, so honoring `client_max_window_bits=N` for N < 15 would
    require a non-stdlib compressor. If a client requests an explicit
    value < 15, we simply do not answer the extension (the connection
-   works uncompressed — exactly what the RFC allows). Measured browser
+   works uncompressed — exactly what the RFC allows). The reverse
+   direction is the client-side mirror: a 101 response that sets
+   `server_max_window_bits` below 15 caps this client's own compressor
+   (RFC 7692 §7.1.2.1 allows the parameter in the response even unoffered),
+   so such a dial fails. Measured browser
    traffic never uses an explicit value: Chromium sends the parameter
    without a value (max window = default 15) and Firefox sends no
-   parameters at all, so this path is theoretical in browser traffic; it
-   is still implemented and tested.
+   parameters at all, so these paths are theoretical in browser traffic;
+   they are still implemented and tested.
 
 5. **Size guards on the expanded payload.** `WithMaxMessageSize` (default
    16 MiB) bounds the **decompressed** payload; the compressed frame must
@@ -147,7 +157,9 @@ New `ws/deflate_test.go` (internal `package ws`, using `newTestConn`/
 
 - **Handshake:** no header; bare token; each parameter individually and
   combined; an unoffered `client_max_window_bits` in a response (valued or
-  value-less) fails the dial; unknown extension alongside permessage-deflate (400 — the
+  value-less) fails the dial; a response that caps `server_max_window_bits`
+  below 15 fails the dial (the full 15-bit window is accepted); unknown
+  extension alongside permessage-deflate (400 — the
   server fails an extension it does not understand, mirroring the
   twice-listed case); permessage-deflate listed twice (400 — the RFC says
   fail).

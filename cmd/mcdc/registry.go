@@ -13,25 +13,26 @@ package main
 
 // Test names referenced by the traces.
 const (
-	testControlFrame            = "TestMCDCControlFrame"
-	testIsReadTimeout           = "TestMCDCIsReadTimeout"
-	testWriteOpcode             = "TestMCDCWriteMessageOpcode"
-	testCloseCodeRange          = "TestMCDCCloseCodeRange"
-	testDialScheme              = "TestMCDCDialScheme"
-	testMCDCCloseCode           = "TestMCDCCloseCode"
-	testMCDCWebSocketKey        = "TestMCDCWebSocketKey"
-	testMCDCSubprotocol         = "TestMCDCSubprotocol"
-	testMCDCTextUTF8            = "TestMCDCTextUTF8"
-	testMCDCUpgrade101          = "TestMCDCUpgrade101"
-	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
-	testMCDCRawWriteFrame       = "TestMCDCRawWriteFrame"
-	testMCDCTruncateReason      = "TestMCDCTruncateReason"
-	testMCDCStreamDeadlines     = "TestMCDCStreamDeadlines"
-	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
-	testMCDCDeflateControl      = "TestMCDCDeflateControl"
-	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
-	testMCDCDeflateOffered      = "TestMCDCDeflateOffered"
-	testMCDCDeflateWindowBits   = "TestMCDCDeflateWindowBits"
+	testControlFrame              = "TestMCDCControlFrame"
+	testIsReadTimeout             = "TestMCDCIsReadTimeout"
+	testWriteOpcode               = "TestMCDCWriteMessageOpcode"
+	testCloseCodeRange            = "TestMCDCCloseCodeRange"
+	testDialScheme                = "TestMCDCDialScheme"
+	testMCDCCloseCode             = "TestMCDCCloseCode"
+	testMCDCWebSocketKey          = "TestMCDCWebSocketKey"
+	testMCDCSubprotocol           = "TestMCDCSubprotocol"
+	testMCDCTextUTF8              = "TestMCDCTextUTF8"
+	testMCDCUpgrade101            = "TestMCDCUpgrade101"
+	testMCDCHandleCloseCode       = "TestMCDCHandleCloseCode"
+	testMCDCRawWriteFrame         = "TestMCDCRawWriteFrame"
+	testMCDCTruncateReason        = "TestMCDCTruncateReason"
+	testMCDCStreamDeadlines       = "TestMCDCStreamDeadlines"
+	testMCDCDeflateRSV            = "TestMCDCDeflateRSV"
+	testMCDCDeflateControl        = "TestMCDCDeflateControl"
+	testMCDCDeflateServerWindow   = "TestMCDCDeflateServerWindow"
+	testMCDCDeflateResponseWindow = "TestMCDCDeflateResponseWindow"
+	testMCDCDeflateOffered        = "TestMCDCDeflateOffered"
+	testMCDCDeflateWindowBits     = "TestMCDCDeflateWindowBits"
 )
 
 // Subtest names reused across more than one trace.
@@ -511,13 +512,39 @@ func deflateFrameTraces() []decisionTrace {
 				{1, []bool{true, false}, []bool{true, true}, testMCDCDeflateOffered, "groups"},
 			},
 		},
+		// ws.go (verifyCompressionResponse): bits != 0 && bits < maxWindowBits
+		{
+			expr:       "bits != 0 && bits < maxWindowBits",
+			conditions: []string{"bits != 0", "bits < maxWindowBits"},
+			pairs: []pairTrace{
+				// A response without a window constraint is accepted; one
+				// capping the window at 10 bits fails the dial.
+				{0, []bool{false, true}, []bool{true, true}, testMCDCDeflateResponseWindow, "bits"},
+				// A 10-bit cap fails the dial; the full 15-bit window is
+				// accepted.
+				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateResponseWindow, "belowMax"},
+			},
+		},
 	}
 }
 
-// windowBitsTraces covers the parseWindowBits decisions: the leading-zero
-// check and the range check on max_window_bits values.
+// windowBitsTraces covers the parseWindowBits decisions: the digit check,
+// the leading-zero check, and the range check on max_window_bits values.
 func windowBitsTraces() []decisionTrace {
 	return []decisionTrace{
+		// ws.go (parseWindowBits): ch < '0' || ch > '9'
+		{
+			expr:       "ch < '0' || ch > '9'",
+			conditions: []string{"ch < '0'", "ch > '9'"},
+			pairs: []pairTrace{
+				// "5" is a digit and fails the range check; "+" is not a
+				// digit and fails the numeric check (RFC 7692 §7.1.2: 1*DIGIT).
+				{0, []bool{false, false}, []bool{true, false}, testMCDCDeflateWindowBits, "plusSign"},
+				// "5" is a digit and fails the range check; "A" is not a
+				// digit and fails the numeric check.
+				{1, []bool{false, false}, []bool{false, true}, testMCDCDeflateWindowBits, "nonDigit"},
+			},
+		},
 		// ws.go (parseWindowBits): len(value) > 1 && value[0] == '0'
 		{
 			expr:       "len(value) > 1 && value[0] == '0'",

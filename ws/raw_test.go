@@ -160,6 +160,36 @@ func TestPingPongEnforceMessageSizeLimit(t *testing.T) {
 	}
 }
 
+// TestWriteFrameEnforcesMessageLimit pins the frame-size guard on the raw
+// write path: a frame payload beyond the connection's message limit is
+// refused before anything reaches the wire, and a frame exactly at the
+// limit still goes out.
+func TestWriteFrameEnforcesMessageLimit(t *testing.T) {
+	t.Parallel()
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, true, 100, 0, 0)
+	err := c.WriteFrame(OpBinary, make([]byte, 101), false)
+	if err == nil || !errors.Is(err, errMessageTooBig) {
+		t.Fatalf("101-byte frame with a 100-byte limit = %v, want the size-limit refusal", err)
+	}
+	err = c.WriteFrame(OpText, make([]byte, 101), false)
+	if err == nil || !errors.Is(err, errMessageTooBig) {
+		t.Fatalf("101-byte text frame with a 100-byte limit = %v, want the size-limit refusal", err)
+	}
+	if len(fc.written) != 0 {
+		t.Fatalf("refused frames wrote % x, want nothing", fc.written)
+	}
+	// At the limit the frame still goes out.
+	err = c.WriteFrame(OpBinary, make([]byte, 100), false)
+	if err != nil {
+		t.Fatalf("100-byte frame at a 100-byte limit: %v, want success", err)
+	}
+	// 2-byte header + 4-byte mask + 100-byte payload, masked client-side.
+	if len(fc.written) != 2+maskKeyLen+100 {
+		t.Fatalf("frame on the wire = %d bytes, want %d", len(fc.written), 2+maskKeyLen+100)
+	}
+}
+
 // TestRawFragmentedWrite pins the fragmented write contract: a start frame
 // plus a continuation frame are reassembled by the peer into the one
 // message the read reports.

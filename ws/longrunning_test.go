@@ -238,6 +238,32 @@ func TestWriteTransportFailureFailsConnection(t *testing.T) {
 	}
 }
 
+// TestWriteFrameTransportFailureFailsConnection pins the same verdict on
+// the raw frame-write path: a failed transport write marks the connection
+// closed with the error recorded, closes the transport, and later writes
+// return the recorded error at once.
+func TestWriteFrameTransportFailureFailsConnection(t *testing.T) {
+	nc := &closedConn{inner: failWriteConn{}, closed: make(chan struct{})}
+	c := newRawConn(nc, nc, true, 1<<20, 0, 0)
+
+	writeErr := c.WriteFrame(OpBinary, []byte("gone"), false)
+	if writeErr == nil {
+		t.Fatal("frame write to a failing transport succeeded")
+	}
+	if !c.Closed() {
+		t.Fatal("connection not closed after a failed frame write")
+	}
+	select {
+	case <-nc.closed:
+	default:
+		t.Fatal("transport was not closed by the failed frame write")
+	}
+	second := c.WriteFrame(OpBinary, []byte("again"), false)
+	if !errors.Is(second, writeErr) {
+		t.Fatalf("second frame write = %v, want the recorded %v", second, writeErr)
+	}
+}
+
 // closedConn wraps a net.Conn, recording when the transport was closed.
 type closedConn struct {
 	inner  net.Conn

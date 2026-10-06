@@ -259,6 +259,9 @@ func TestDeflateServerNegotiation(t *testing.T) {
 	}{
 		{offer: "", wantExt: ""},
 		{offer: "permessage-deflate", wantExt: deflateResponseHeader},
+		// Empty groups (extra commas) are dropped, not a parse error.
+		{offer: "permessage-deflate,,", wantExt: deflateResponseHeader},
+		{offer: ",,", wantExt: ""},
 		{offer: "permessage-deflate; client_max_window_bits", wantExt: deflateResponseHeader},
 		{offer: "permessage-deflate; client_max_window_bits=15", wantExt: deflateResponseHeader},
 		{offer: "permessage-deflate; server_max_window_bits=15", wantExt: deflateResponseHeader},
@@ -273,6 +276,7 @@ func TestDeflateServerNegotiation(t *testing.T) {
 		{offer: "permessage-deflate; client_max_window_bits=16", wantErr: true},
 		{offer: "permessage-deflate; client_max_window_bits=010", wantErr: true},
 		{offer: "permessage-deflate; client_max_window_bits=abc", wantErr: true},
+		{offer: "permessage-deflate; client_max_window_bits=+10", wantErr: true},
 		{offer: "permessage-deflate; client_no_context_takeover=1", wantErr: true},
 		{offer: "permessage-deflate; bogus", wantErr: true},
 		{offer: "permessage-deflate; bogus, permessage-deflate", wantErr: true},
@@ -354,8 +358,12 @@ func TestDeflateClientVerification(t *testing.T) {
 		{name: "client window full", ext: snct + "; client_max_window_bits=15", wantErr: true},
 		{name: "client window value-less", ext: snct + "; client_max_window_bits", wantErr: true},
 		// §7.1.2.1: the server MAY add server_max_window_bits even
-		// unoffered, so long as it echoes the no-takeover parameter.
-		{name: "server window constraint", ext: snct + "; server_max_window_bits=10", compress: true},
+		// unoffered — but the agreed parameter then caps this client's
+		// compressor (RFC 7692 §7), and the full 15-bit window is the only
+		// value this client supports: a cap below it fails the dial, the
+		// full value is accepted.
+		{name: "server window below full", ext: snct + "; server_max_window_bits=10", wantErr: true},
+		{name: "server window full", ext: snct + "; server_max_window_bits=15", compress: true},
 		{name: "server window alone", ext: "permessage-deflate; server_max_window_bits=10", wantErr: true},
 		{name: "smaller client window", ext: snct + "; client_max_window_bits=10", wantErr: true},
 		{name: "unknown extension", ext: "x-deflate", wantErr: true},

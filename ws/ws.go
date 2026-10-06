@@ -1431,11 +1431,18 @@ func parseCompressionParams(group string) (deflateParams, error) {
 	return params, nil
 }
 
-// parseWindowBits validates a max_window_bits value: decimal, no leading
-// zeroes, 8-15 (RFC 7692 §7.1.2).
+// parseWindowBits validates a max_window_bits value: decimal digits
+// (RFC 7692 §7.1.2: 1*DIGIT), no leading zeroes, 8-15. A value with any
+// non-digit — "+10", "1a", ".5" — is malformed, not out of range.
 func parseWindowBits(value string) (int, error) {
 	if len(value) > 1 && value[0] == '0' {
 		return 0, fmt.Errorf("%w: leading zero in window bits %q", errBadExtension, value)
+	}
+	for i := range value {
+		ch := value[i]
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("%w: non-numeric window bits %q", errBadExtension, value)
+		}
 	}
 	bits, err := strconv.Atoi(value)
 	if err != nil || bits < 8 || bits > maxWindowBits {
@@ -1494,8 +1501,12 @@ func negotiateCompression(groups []string) (string, error) {
 // response must carry it too (§7.1.1.1 — its absence means the server may
 // use context takeover, streams the per-message-resetting decompressor
 // cannot decode); and because the offer carries no client_max_window_bits,
-// the response must not either (§7.1.2.2), valued or value-less. It
-// reports whether compression was negotiated.
+// the response must not either (§7.1.2.2), valued or value-less. The
+// server may set server_max_window_bits even unoffered (§7.1.2.1), and when
+// it does the agreed parameter caps this client's compressor (RFC 7692
+// §7): this client compresses with the full 15-bit window, so a cap below
+// it is a configuration the client does not support and the dial fails.
+// It reports whether compression was negotiated.
 func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 	if !offered && len(groups) > 0 {
 		return false, fmt.Errorf("%w: 101 response selected the unoffered extension %q",
@@ -1525,6 +1536,15 @@ func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 	if params.hasClientWindowBits {
 		return false, fmt.Errorf("%w: 101 response sets the unoffered parameter client_max_window_bits",
 			errHandshakeFailed)
+	}
+	// §7.1.2.1: the server may set server_max_window_bits in the response
+	// even when the offer carried it not, and the agreed parameter then
+	// caps this client's compressor (RFC 7692 §7). This client compresses
+	// with the full 15-bit window, so a cap below it is a configuration it
+	// does not support — the connection MUST fail, per §7's general rule.
+	if bits := params.serverWindowBits; bits != 0 && bits < maxWindowBits {
+		return false, fmt.Errorf("%w: 101 response caps the window at %d bits",
+			errHandshakeFailed, bits)
 	}
 
 	return true, nil
@@ -2332,9 +2352,15 @@ func (c *RawConn) checkCompressedControl(frm frame) error {
 // keepaliveTimeout processes a read error against the keepalive clock. It
 // returns retry=true when a probe ping was sent and the read loop should
 // continue; otherwise it returns the connection error (transport error, or
-// the silence timeout that killed the connection).
+// the silence timeout that killed the connection). With keepalive disabled
+// (a zero idle window) the timeout belongs to the application's own read
+// deadline, not the idle window: no probe is sent and the read fails with
+// it, so the deadline the application manages is the one that decides.
 func (c *RawConn) keepaliveTimeout(err error) (bool, error) {
 	if !isReadTimeout(err) {
+		return false, err
+	}
+	if c.idleTimeout <= 0 {
 		return false, err
 	}
 	if probeDecision(c.probedSinceLastActivity) == probeKill {
@@ -2833,7 +2859,8 @@ func (c *RawConn) WriteJSON(v any) error {
 // closeWith performs the close sequence shared by [RawConn.Close] and
 // [RawConn.CloseFrame]: it validates the close code, builds the payload, and,
 // on an open connection, records the terminal error, sends the close frame
-// (bounded by the write timeout or the fixed fallback), and closes the
+// (bounded by the write timeout or the fixed fallback, where the stream
+// enforces deadlines), and closes the
 // transport. It returns (writeErr, terminal) — the close-frame write status
 // and the terminal error recorded on the connection. A validation failure
 // returns (error, nil) and leaves the connection untouched; an already
@@ -2879,10 +2906,13 @@ func (c *RawConn) closeWith(code int, reason string) (error, error) {
 	_ = c.deadlines.SetWriteDeadline(time.Now().Add(closeBound))
 	writeErr := c.fc.writeFrame(OpClose, payload, false, true)
 	_ = c.deadlines.SetWriteDeadline(time.Time{})
+	// Read under the lock: closeErr is written only under c.mu, and the
+	// terminal this caller reports is the one recorded on the connection.
+	terminal := terminalErr(c.closeErr)
 	c.mu.Unlock()
 	_ = c.nc.Close()
 
-	return writeErr, terminalErr(c.closeErr)
+	return writeErr, terminal
 }
 
 // Close closes the connection, sending a close frame with the given code and
@@ -2901,10 +2931,15 @@ func (c *RawConn) closeWith(code int, reason string) (error, error) {
 // allows. Concurrent Close callers all observe the same recorded error, from
 // the first one to close.
 //
-// Teardown latency on a stalled transport. The close-frame write is bounded
-// by the connection's [WithWriteTimeout] when one was set, and by a fixed
-// 5-second fallback otherwise — a silent or half-dead peer must not be able
-// to hold the close open forever. Two stacking effects are worth knowing:
+// Teardown latency on a stalled transport. Where the stream enforces
+// deadlines, the close-frame write is bounded by the connection's
+// [WithWriteTimeout] when one was set, and by a fixed 5-second fallback
+// otherwise — a silent or half-dead peer must not be able to hold the
+// close open forever. (Over a stream that cannot enforce deadlines, a
+// session only exists with both options zero — [ErrNoDeadlineSupport] —
+// and no bound applies; liveness there is the transport's job.)
+//
+// Two stacking effects are worth knowing:
 // Close takes the same write mutex as every other writer, so it queues
 // behind an in-flight data write (itself bounded by the write timeout), and
 // the read path answers the peer's close frame with its own, so a peer that

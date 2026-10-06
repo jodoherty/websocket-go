@@ -291,6 +291,34 @@ func TestKeepaliveActivityResetsClock(t *testing.T) {
 	})
 }
 
+// TestKeepaliveDisabledAppDeadlineFires pins the keepalive-off contract:
+// with WithIdleTimeout(0) the read deadline is the application's own, and
+// when it fires the read fails with the timeout error — with no keepalive
+// probe in between. A probe here would be a write the application did not
+// ask for, and the probe/kill sequence would delay the failure a second
+// window.
+func TestKeepaliveDisabledAppDeadlineFires(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		nc := newGatedConn()
+		c := newRawConn(nc, nc, true, 1<<20, 0, 0) // keepalive off
+		// The app's own read deadline (WithIdleTimeout(0)), armed before the
+		// read loop starts so the reader's first blocking read sees it.
+		err := c.SetReadDeadline(time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		errC := startRead(t, newSession(c, nil))
+		synctest.Wait() // the reader is durably blocked on the app deadline
+
+		time.Sleep(time.Second) // t = 1s: the app's deadline fires
+		requireTimeout(t, <-errC)
+		if n := nc.pingCount(); n != 0 {
+			t.Fatalf("%d pings with keepalive disabled: the application's own "+
+				"deadline must fail the read without probing", n)
+		}
+	})
+}
+
 // errUnboundedWrite is reported by a stalled gatedConn write that had no
 // write deadline armed: the exact failure mode the bounded-write
 // regression test below guards against.

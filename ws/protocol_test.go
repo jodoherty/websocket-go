@@ -375,10 +375,10 @@ func TestSubprotocolEcho(t *testing.T) {
 func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
 	t.Parallel()
 
-	// rawStatus performs a raw handshake; extra is an additional header
-	// line (including its CRLF) or "" for none, and the call reports the
-	// HTTP status of the reply.
-	rawStatus := func(t *testing.T, extra string) int {
+	// rawStatus performs a raw handshake with the given version header line
+	// ("" = no line) plus an extra header line (including its CRLF), and
+	// reports the HTTP status of the reply.
+	rawStatus := func(t *testing.T, versionLine, extra string) int {
 		t.Helper()
 		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin))
 		srv := httptest.NewServer(up.Handle(func(_ *http.Request, _ *Session) error { return nil }))
@@ -392,7 +392,7 @@ func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
 		req := "GET / HTTP/1.1\r\nHost: " + host + "\r\n" +
 			"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
 			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
-			"Sec-WebSocket-Version: 13\r\n" +
+			versionLine +
 			extra + "\r\n"
 		_, _ = conn.Write([]byte(req))
 		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -406,25 +406,36 @@ func TestHandshakeDuplicateSingleValueHeaders(t *testing.T) {
 		return resp.StatusCode
 	}
 
+	const versionLine = "Sec-WebSocket-Version: 13\r\n"
+
 	t.Run("duplicateVersion", func(t *testing.T) {
 		t.Parallel()
 		// A second Sec-WebSocket-Version line is a malformed handshake;
 		// with one line the handshake still succeeds.
-		if got := rawStatus(t, "Sec-WebSocket-Version: 13\r\n"); got != http.StatusBadRequest {
+		if got := rawStatus(t, versionLine, versionLine); got != http.StatusBadRequest {
 			t.Fatalf("duplicate version: status %d, want 400", got)
 		}
-		if got := rawStatus(t, ""); got != http.StatusSwitchingProtocols {
+		if got := rawStatus(t, versionLine, ""); got != http.StatusSwitchingProtocols {
 			t.Fatalf("single version: status %d, want 101", got)
+		}
+	})
+
+	t.Run("missingVersion", func(t *testing.T) {
+		t.Parallel()
+		// Without a Sec-WebSocket-Version line the handshake is malformed
+		// (RFC 6455 §4.1: exactly one supported version).
+		if got := rawStatus(t, "", ""); got != http.StatusBadRequest {
+			t.Fatalf("missing version: status %d, want 400", got)
 		}
 	})
 
 	t.Run("duplicateKey", func(t *testing.T) {
 		t.Parallel()
 		// A second Sec-WebSocket-Key line is a malformed handshake.
-		if got := rawStatus(t, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"); got != http.StatusBadRequest {
+		if got := rawStatus(t, versionLine, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"); got != http.StatusBadRequest {
 			t.Fatalf("duplicate key: status %d, want 400", got)
 		}
-		if got := rawStatus(t, ""); got != http.StatusSwitchingProtocols {
+		if got := rawStatus(t, versionLine, ""); got != http.StatusSwitchingProtocols {
 			t.Fatalf("single key: status %d, want 101", got)
 		}
 	})
@@ -918,6 +929,19 @@ func TestServerSubprotocolValidation(t *testing.T) {
 		}
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status %d, want 400 for an invalid advertised subprotocol", resp.StatusCode)
+		}
+	})
+	t.Run("empty token fails the handshake", func(t *testing.T) {
+		t.Parallel()
+		// An empty advertised token is not a token (RFC 2616) either: it
+		// must not be echoed onto the wire.
+		up := NewUpgrader(WithCheckOrigin(acceptAnyOrigin), WithSubprotocols(""))
+		resp := rawUpgrade(t, up)
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status %d, want 400 for an empty advertised subprotocol", resp.StatusCode)
 		}
 	})
 	t.Run("valid tokens still negotiate", func(t *testing.T) {

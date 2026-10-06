@@ -548,6 +548,47 @@ func TestMCDCDeflateOffered(t *testing.T) {
 	})
 }
 
+// TestMCDCDeflateResponseWindow traces "bits != 0 && bits < maxWindowBits"
+// in verifyCompressionResponse: a 101 response that caps this client's
+// compressor window below the full 15 bits (server_max_window_bits, which
+// RFC 7692 §7.1.2.1 allows even unoffered) fails the dial, and the full
+// 15-bit window is accepted.
+func TestMCDCDeflateResponseWindow(t *testing.T) {
+	t.Parallel()
+	snct := "permessage-deflate; server_no_context_takeover"
+
+	t.Run("bits", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=F, bits<15=T) flips to (T, T): a response without a
+		// window constraint is accepted; one capping the window at 10
+		// bits fails the dial.
+		c, err := dialWithServerExtension(t, snct)
+		if err != nil {
+			t.Fatalf("no window constraint: %v, want the dial to succeed", err)
+		}
+		_ = c.Close(StatusNormalClosure, "")
+		_, err = dialWithServerExtension(t, snct+"; server_max_window_bits=10")
+		if err == nil {
+			t.Fatal("10-bit window cap: dial succeeded, want failure")
+		}
+	})
+
+	t.Run("belowMax", func(t *testing.T) {
+		t.Parallel()
+		// (bits!=0=T, bits<15=T) flips to (T, F): a 10-bit cap fails the
+		// dial; the full 15-bit window is accepted.
+		_, err := dialWithServerExtension(t, snct+"; server_max_window_bits=10")
+		if err == nil {
+			t.Fatal("10-bit window cap: dial succeeded, want failure")
+		}
+		c, err := dialWithServerExtension(t, snct+"; server_max_window_bits=15")
+		if err != nil {
+			t.Fatalf("15-bit window: %v, want the dial to succeed", err)
+		}
+		_ = c.Close(StatusNormalClosure, "")
+	})
+}
+
 // TestMCDCDeflateWindowBits traces the two compound decisions in
 // parseWindowBits: "len(value) > 1 && value[0] == '0'" (leading zeros) and
 // "err != nil || bits < 8 || bits > maxWindowBits" (plus its nested OR)
@@ -583,13 +624,42 @@ func TestMCDCDeflateWindowBits(t *testing.T) {
 		}
 	})
 
+	t.Run("plusSign", func(t *testing.T) {
+		t.Parallel()
+		// (ch<'0'=F, ch>'9'=F) flips to (T, F): "5" is a digit and fails
+		// the range check; "+" is not a digit and fails the numeric check
+		// (RFC 7692 §7.1.2: 1*DIGIT).
+		_, err := parseWindowBits("5")
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Fatalf("5: %v, want out-of-range error", err)
+		}
+		_, err = parseWindowBits("+10")
+		if err == nil || !strings.Contains(err.Error(), "non-numeric") {
+			t.Fatalf("+10: %v, want non-numeric error", err)
+		}
+	})
+
+	t.Run("nonDigit", func(t *testing.T) {
+		t.Parallel()
+		// (ch<'0'=F, ch>'9'=F) flips to (F, T): "5" is a digit and fails
+		// the range check; "A" is not a digit and fails the numeric check.
+		_, err := parseWindowBits("5")
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Fatalf("5: %v, want out-of-range error", err)
+		}
+		_, err = parseWindowBits("1A")
+		if err == nil || !strings.Contains(err.Error(), "non-numeric") {
+			t.Fatalf("1A: %v, want non-numeric error", err)
+		}
+	})
+
 	t.Run("decode", func(t *testing.T) {
 		t.Parallel()
-		// (decodeErr=T, ..) flips to (F, F, F): "abc" is not a number; "10"
-		// decodes in range.
-		_, err := parseWindowBits("abc")
-		if err == nil {
-			t.Fatalf("abc: %v, want out-of-range error", err)
+		// (decodeErr=T, ..) flips to (F, F, F): a digit string past int
+		// range fails the decode; "10" decodes in range.
+		_, err := parseWindowBits("99999999999999999999")
+		if err == nil || !strings.Contains(err.Error(), "out of range") {
+			t.Fatalf("overflow: %v, want out-of-range error", err)
 		}
 		bits, err := parseWindowBits("10")
 		if err != nil || bits != 10 {
