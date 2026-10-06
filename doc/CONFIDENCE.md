@@ -245,3 +245,21 @@ whose deadline methods are no-ops is the application's responsibility
 `TestExtendedConnectRejectsDeadlineOptions`,
 `TestExtendedConnectDeadlineWaiver`, and the
 `TestMCDCStreamDeadlines` matrix).
+
+The client's handshake-response read is likewise bounded against a
+header-flood memory DoS. The bare `http.ReadResponse` the handshake is
+parsed with accumulates headers with no size limit — unlike the stdlib
+`http.Client`, which caps response headers at 1 MiB — so a malicious or
+compromised server (reaching a `ws://` client over an untrusted network, or
+the destination of a deliberate `wss://` dial) could exhaust client memory by
+streaming an unbounded number of handshake headers. The handshake therefore
+pre-reads the status line and headers through a line-bounded, size-capped
+reader before parsing: any single header line longer than the read buffer is
+rejected (`bufio` reports the overflow without pulling more), and the
+accumulated header set is capped at 1 MiB (`handshakeHeaderLimit`); the
+capped in-memory copy is what the parser sees, and the frame codec continues
+from the original reader, which the head read leaves positioned at the first
+frame. The server side needs no equivalent: `net/http` caps *request* headers
+at `MaxHeaderBytes` (1 MiB) before any handler — including the upgrader —
+runs. (pinned by `TestReadHandshakeResponseHead` and
+`TestDialRejectsHeaderFlood`.)

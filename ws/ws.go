@@ -1825,13 +1825,60 @@ func writeHandshakeRequest(conn io.Writer, path, host string, subprotocols []str
 	return key, nil
 }
 
+// handshakeHeaderLimit bounds the total byte size of the handshake
+// response's status line and headers. A legitimate 101 is a handful of
+// short headers (well under a KiB); the cap exists only so a malicious or
+// compromised server cannot exhaust client memory by streaming an unbounded
+// number of handshake headers, which the bare http.ReadResponse would
+// otherwise accumulate without limit. It matches the stdlib http client's
+// default response-header cap.
+const handshakeHeaderLimit = 1 << 20
+
+// readHandshakeResponseHead reads the handshake response's status line and
+// headers from reader, bounded, and returns the raw bytes up to and
+// including the terminating blank line. The reader is left positioned
+// immediately after that blank line — at the first frame — so the frame
+// codec can continue from it.
+//
+// The bound is enforced two ways: any single header line longer than the
+// reader's buffer is rejected (bufio.ReadSlice reports ErrBufferFull without
+// pulling more), and the accumulated header set is capped at
+// handshakeHeaderLimit. A bare http.ReadResponse has neither limit, so this
+// pre-read is what stops a hostile server from a header-flood memory DoS.
+func readHandshakeResponseHead(reader *bufio.Reader) ([]byte, error) {
+	head := make([]byte, 0, bufSize)
+	for {
+		line, err := reader.ReadSlice('\n')
+		if err != nil {
+			return nil, fmt.Errorf("%w: handshake response ended without a complete header set: %w", errHandshakeFailed, err)
+		}
+		head = append(head, line...)
+		if len(head) > handshakeHeaderLimit {
+			return nil, fmt.Errorf(
+				"%w: handshake response headers exceed the %d byte limit", errHandshakeFailed, handshakeHeaderLimit)
+		}
+		if string(line) == "\r\n" {
+			return head, nil
+		}
+	}
+}
+
 // readHandshakeResponse reads and verifies the server's 101 response,
 // returning the negotiated subprotocol and whether permessage-deflate was
 // negotiated.
 func readHandshakeResponse(reader *bufio.Reader, key string, offered []string,
 	compressionOffered bool,
 ) (string, bool, error) {
-	resp, err := http.ReadResponse(reader, nil)
+	// Bound the status line + headers before parsing: see
+	// readHandshakeResponseHead. The response is parsed from the bounded
+	// in-memory copy, not the live reader — for a 101 the parser records no
+	// body, and the frames are read from the original reader, which the
+	// head read positioned right after the terminating blank line.
+	head, headErr := readHandshakeResponseHead(reader)
+	if headErr != nil {
+		return "", false, headErr
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(head)), nil)
 	if err != nil {
 		return "", false, fmt.Errorf("ws: read handshake response: %w", err)
 	}
