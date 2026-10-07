@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGB1, ping); frames: bin0, ping",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "ping",
+      "t": "event"
+    }
+  ],
+  "frame": "ping",
+  "frames": [
+    "020141",
+    "8900"
+  ],
+  "fromState": "FGB1",
+  "id": "T_FGB1_ping_client",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.4",
+    "RFC 6455 5.5"
+  ],
+  "side": "client",
+  "terminal": null
+}

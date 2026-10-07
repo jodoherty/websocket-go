@@ -227,6 +227,17 @@ ws/writehelpers_test.go WriteText/WriteBinary/WriteJSON wire format and
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
+ws/mbt_test.go     model-based validation runner: replays the committed
+                    frame-reassembly traces (ws/testdata/mbt/*.json) against a
+                    RawConn. Asserts the MUST outcomes hard and measures the
+                    RFC 6455 7.1.7 SHOULD/MAY layer as a counted warning
+                    ledger (checked against ws/testdata/mbt/NOTES.json; fail
+                    on an unaccepted or stale entry). Data, not generated
+                    code — traces come from model/gen/gen_traces.py, the
+                    runner is hand-written (doc/STATES.md)
+ws/testdata/mbt/   committed model-based traces (JSON): one per (transition,
+                    side); plus NOTES.json, the allowlist of accepted SHOULD/
+                    MAY divergences (each with its RFC basis + reason)
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
@@ -246,6 +257,31 @@ doc/LINTING.md    the lint gate and its documented exclusions
 doc/rfc6455.txt   the RFC 6455 reference
 doc/rfc7692.txt   the RFC 7692 reference (permessage-deflate)
 doc/COMPRESSION.md permessage-deflate design + interop evidence
+doc/STATES.md     the frame-reassembly state machine: the RFC 6455
+                    transformation, the properties (P1/P2/completeness), trace
+                    generation, and the behaviors the model pins
+                h3/             separate module: a real quic-go HTTP/3 extended-
+                                CONNECT (RFC 9220) round-trip over SessionOnStream
+                                (make e2e-h3)
+model/          model-based validation suite (doc/STATES.md): the RFC 6455
+                frame-reassembly machine, generated traces, and the nuXmv
+                container. Not a Go module (Python + SMV only), so the root
+                go.mod stays dependency-free.
+                Containerfile    nuXmv 2.2 (FBK tarball, SHA-256 verified)
+                gen/common.py    the transition function trans(state, frame) +
+                                 wire_close(state, frame): the single source
+                                 of truth (states, 32 frame classes, the check
+                                 order, and the RFC citations)
+                gen/gen_model.py emits the SMV model from common.trans (nuXmv
+                                 encodes the machine independently for the
+                                 reachability cross-check)
+                gen/gen_traces.py minimal frame traces by BFS over the machine,
+                                 cross-checked against nuXmv, one JSON per
+                                 (transition, side) -> ws/testdata/mbt/
+                gen/check_props.py model self-consistency (P1/P2/completeness/
+                                 encoding), pure Python
+                gen/check_traces.py committed-trace <-> model consistency,
+                                 pure Python
 e2e/            e2e suites:
                 ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
                                  binary, bearer accept/reject, mTLS rejection, close codes
@@ -263,7 +299,8 @@ e2e/            e2e suites:
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make gate (the full set) plus the
                     individual lint / staticcheck / test / race / fuzz /
-                    mut / bench / mcdc / branchcov / coverage / e2e targets
+                    mut / bench / mcdc / model / model-image / mbt-gen /
+                    mbt-report / branchcov / coverage / e2e targets
 ```
 
 ## Workflow

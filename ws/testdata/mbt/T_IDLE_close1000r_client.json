@@ -1,0 +1,35 @@
+{
+  "desc": "transition (IDLE, close1000r); frames: close1000r",
+  "events": [
+    {
+      "code": 1000,
+      "kind": "close",
+      "reason": "o",
+      "t": "event"
+    }
+  ],
+  "frame": "close1000r",
+  "frames": [
+    "880303e86f"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_close1000r_client",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "mod": "must",
+        "term": "eof",
+        "wire": {
+          "code": 1000,
+          "kind": "coded"
+        }
+      }
+    ]
+  }
+}

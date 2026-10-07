@@ -1,0 +1,24 @@
+{
+  "desc": "transition (IDLE, text1); frames: text1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "text1",
+  "frames": [
+    "810141"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_text1_client",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.5"
+  ],
+  "side": "client",
+  "terminal": null
+}

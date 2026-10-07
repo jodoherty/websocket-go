@@ -1,6 +1,7 @@
 GOLANGCI ?= golangci-lint
+MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc model model-image mbt-gen mbt-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -8,7 +9,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc mut branchcov coverage multiver e2e e2e-connect
+gate: all race fuzz bench mcdc model mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -70,6 +71,45 @@ branchcov:
 # untraced compound condition.
 mcdc:
 	go run ./cmd/mcdc ws
+
+# Model-based validation suite (model/, doc/STATES.md): the RFC 6455
+# frame-reassembly machine is transformed into a formal model (model/gen/
+# common.py), encoded independently in nuXmv (gen_model.py), and its
+# transitions drive a set of committed traces (ws/testdata/mbt/) replayed by
+# ws/mbt_test.go. `model` is pure Python (no container): it checks the
+# model's self-consistency (P1 wire close-code legitimacy, P2 terminal
+# absorbing, table completeness, encoding round-trip) and that every
+# committed trace is a faithful artifact of the model. The Go test runs in
+# the normal suite (`make test`); only regeneration needs the container.
+model:
+	python3 model/gen/check_props.py
+	python3 model/gen/check_traces.py
+
+# The MBT warning count: replay the committed traces and print the assessable
+# summary line (the SHOULD/MAY divergences and their counts). Pure `go test`,
+# no container. The gate enforces the NOTES.json allowlist; this just shows
+# the count it is policing, so the divergences can be watched down to zero.
+mbt-report:
+	@go test ./ws/ -run TestMBTReassembly -v 2>&1 | \
+		grep -E "MBT-WARNINGS:|NOTES.json|not accepted" | \
+		sed 's/^[[:space:]]*mbt_test.go:[0-9]*: //' || true
+
+# Build the model container (nuXmv). Rebuild only when model/Containerfile
+# changes, not when the model does (the model is mounted at run time).
+model-image:
+	podman build -t $(MBT_IMAGE) model/
+
+# Regenerate the committed traces from the model: minimal frame sequences by
+# BFS over the machine, cross-checked for reachability against the
+# independent nuXmv encoding. Fails if the committed traces would change
+# without a clean working tree (regeneration must be deterministic).
+mbt-gen: model-image
+	@MBT_IMAGE=$(MBT_IMAGE) python3 model/gen/gen_traces.py ws/testdata/mbt
+	@if git diff --quiet -- ws/testdata/mbt 2>/dev/null; then \
+		echo "mbt-gen: committed traces unchanged"; \
+	else \
+		echo "mbt-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/mbt; exit 1; \
+	fi
 
 # Multi-toolchain check: on the oldest supported Go (go.mod's floor — the
 # test suite uses testing/synctest, new in 1.25; ws.go vendored by copying

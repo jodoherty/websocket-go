@@ -1,0 +1,23 @@
+{
+  "desc": "transition (IDLE, pong); frames: pong",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "pong",
+      "t": "event"
+    }
+  ],
+  "frame": "pong",
+  "frames": [
+    "8a8001020304"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_pong_server",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.5"
+  ],
+  "side": "server",
+  "terminal": null
+}

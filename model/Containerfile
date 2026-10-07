@@ -1,0 +1,28 @@
+# Toolchain for the model-based validation suite (doc/STATES.md, model/).
+#
+# Debian trixie carries no SPIN package and the official SPIN mirrors are
+# unreachable, so the model checker is nuXmv (Fondazione Bruno Kessler),
+# installed from the vendor tarball and verified against the published
+# SHA-256 sum before extraction. python3 (stdlib only) runs the trace
+# generator and converter.
+#
+# The image carries no repository content: model/ is mounted at build/run
+# time, so the image only needs rebuilding when the toolchain, not the
+# model, changes.
+FROM debian:trixie
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl python3 xz-utils libxml2 libgmp10 libmpfr6 libedit2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# nuXmv 2.2.0, linux x86-64, vendor-verified.
+WORKDIR /opt
+RUN curl -fsSL -O https://nuxmv.fbk.eu/downloads/2.2.0/nuXmv-2.2.0-linux64.tar.xz \
+    && curl -fsSL -O https://nuxmv.fbk.eu/downloads/2.2.0/nuXmv-2.2.0-linux64.tar.xz.sha256sum \
+    && sha256sum -c nuXmv-2.2.0-linux64.tar.xz.sha256sum \
+    && tar xf nuXmv-2.2.0-linux64.tar.xz \
+    && rm nuXmv-2.2.0-linux64.tar.xz nuXmv-2.2.0-linux64.tar.xz.sha256sum
+
+ENV PATH="/opt/nuXmv-2.2.0-linux64/usr/local/bin:${PATH}"
+WORKDIR /src

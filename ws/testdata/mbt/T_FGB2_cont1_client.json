@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGB2, cont1); frames: bin02, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "binary",
+      "payload": "414241",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "02024142",
+    "800141"
+  ],
+  "fromState": "FGB2",
+  "id": "T_FGB2_cont1_client",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.4"
+  ],
+  "side": "client",
+  "terminal": null
+}

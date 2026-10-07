@@ -1,0 +1,36 @@
+{
+  "desc": "transition (IDLE, close3000); frames: close3000",
+  "events": [
+    {
+      "code": 3000,
+      "kind": "close",
+      "reason": "r",
+      "t": "event"
+    }
+  ],
+  "frame": "close3000",
+  "frames": [
+    "8883010203040aba71"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_close3000_server",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "side": "server",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 3000,
+        "mod": "must",
+        "term": "closeErr",
+        "wire": {
+          "code": 3000,
+          "kind": "coded"
+        }
+      }
+    ]
+  }
+}

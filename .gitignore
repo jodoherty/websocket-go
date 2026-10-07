@@ -14,3 +14,7 @@ e2e/.test/
 # local build artifacts
 /branchcov
 /mcdc
+
+# python bytecode (model/gen)
+__pycache__/
+*.pyc

@@ -1,0 +1,38 @@
+{
+  "desc": "transition (IDLE, close1005); frames: close1005",
+  "events": [],
+  "frame": "close1005",
+  "frames": [
+    "880203ed"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_close1005_client",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 7.4"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 1002,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1002,
+          "kind": "coded"
+        }
+      },
+      {
+        "id": "MAY:close-frame-omitted",
+        "mod": "may",
+        "note": "RFC 6455 7.1.7 MAY: omit the Close frame; expected when the error corrupts message state, so the peer is unlikely to receive and process it. To eliminate: send the SHOULD 1002 close frame on message-level violations, uniform with header-level ones.",
+        "term": "proto",
+        "wire": {
+          "kind": "none"
+        }
+      }
+    ]
+  }
+}
