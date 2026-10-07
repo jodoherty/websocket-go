@@ -21,11 +21,13 @@ type connectWriter struct {
 	fullDuplex bool
 	closed     bool
 	body       *bytes.Buffer
+	flushed    int
 }
 
 func (w *connectWriter) Header() http.Header         { return w.header }
 func (w *connectWriter) WriteHeader(code int)        { w.code = code }
 func (w *connectWriter) Write(p []byte) (int, error) { return w.body.Write(p) }
+func (w *connectWriter) Flush()                      { w.flushed++ }
 func (w *connectWriter) EnableFullDuplex() error     { w.fullDuplex = true; return nil }
 func (w *connectWriter) Close() error                { w.closed = true; return nil }
 
@@ -35,6 +37,7 @@ type failDuplexWriter struct{ inner *connectWriter }
 func (w failDuplexWriter) Header() http.Header         { return w.inner.Header() }
 func (w failDuplexWriter) WriteHeader(code int)        { w.inner.WriteHeader(code) }
 func (w failDuplexWriter) Write(p []byte) (int, error) { return w.inner.Write(p) }
+func (w failDuplexWriter) Flush()                      { w.inner.Flush() }
 func (w failDuplexWriter) EnableFullDuplex() error     { return errors.New("full-duplex unavailable") }
 func (w failDuplexWriter) Close() error                { return w.inner.Close() }
 
@@ -135,8 +138,10 @@ func TestExtendedConnectUpgradesAndEchoes(t *testing.T) {
 	if w.code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.code)
 	}
-	if got := w.header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, acceptKey(key))
+	// RFC 8441 §5: over extended CONNECT the handshake key is superseded by
+	// :protocol, so no Sec-WebSocket-Accept is generated.
+	if got := w.header.Get("Sec-WebSocket-Accept"); got != "" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want none", got)
 	}
 	if got := w.header.Get("Sec-WebSocket-Protocol"); got != "chat" {
 		t.Fatalf("Sec-WebSocket-Protocol = %q, want chat", got)
@@ -152,13 +157,17 @@ func TestExtendedConnectUpgradesAndEchoes(t *testing.T) {
 		t.Fatalf("ReadMessage = %v %q %v, want text hello", op, msg, err)
 	}
 
-	// Server-to-client: the session writes to the response tunnel.
+	// Server-to-client: the session writes to the response tunnel, which the
+	// adapter flushes so the frame is delivered while the tunnel stays open.
 	writeErr := session.WriteText("world")
 	if writeErr != nil {
 		t.Fatalf("WriteText: %v", writeErr)
 	}
 	if got := readTextFrame(t, w.body); string(got) != "world" {
 		t.Fatalf("tunnel frame = %q, want world", got)
+	}
+	if w.flushed == 0 {
+		t.Fatal("the response writer was never flushed after a frame write")
 	}
 }
 
@@ -171,21 +180,32 @@ func TestExtendedConnectRejectsOtherProtocol(t *testing.T) {
 	}
 }
 
-func TestExtendedConnectRejectsMissingKey(t *testing.T) {
-	request := connectRequest(testKey())
+func TestExtendedConnectMissingKeyAccepted(t *testing.T) {
+	// RFC 8441 §5: the handshake key is HTTP/1-only and superseded by
+	// :protocol, so a standards-shaped request that omits it is accepted.
+	request := connectRequest("")
 	request.Header.Del("Sec-WebSocket-Key")
-	_, err := NewUpgrader().Upgrade(newConnectWriter(), request)
-	if status := upgradeStatus(t, err); status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	request.Body = io.NopCloser(new(bytes.Buffer))
+	session, w := runConnect(t, request)
+	if w.code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the key must not be required", w.code)
 	}
+	if got := w.header.Get("Sec-WebSocket-Accept"); got != "" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want none", got)
+	}
+	_ = session
 }
 
-func TestExtendedConnectRejectsMalformedKey(t *testing.T) {
+func TestExtendedConnectMalformedKeyIgnored(t *testing.T) {
+	// The key is not validated over a tunnel, so a malformed value is
+	// simply ignored rather than rejected.
 	request := connectRequest("!!!not-base64!!!")
-	_, err := NewUpgrader().Upgrade(newConnectWriter(), request)
-	if status := upgradeStatus(t, err); status != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	request.Body = io.NopCloser(new(bytes.Buffer))
+	session, w := runConnect(t, request)
+	if w.code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the key is not validated over a tunnel", w.code)
 	}
+	_ = session
 }
 
 func TestExtendedConnectOriginPolicy(t *testing.T) {

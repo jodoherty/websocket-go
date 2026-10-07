@@ -3,6 +3,7 @@
 // reproduces a finding from doc/../websocket-go-findings.md. They are
 // regression tests: keep them, fix the implementation, do not weaken the
 // assertions to make the implementation pass.
+
 package ws
 
 import (
@@ -13,21 +14,21 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"strings"
 	"testing"
 	"time"
 )
 
-// fakeTimeout stands in for a read-deadline expiry on a transport: it
+// fakeTimeoutError stands in for a read-deadline expiry on a transport: it
 // implements net.Error with Timeout() true, which is all isReadTimeout
 // looks for.
-type fakeTimeout struct{}
+type fakeTimeoutError struct{}
 
-func (fakeTimeout) Error() string   { return "i/o timeout" }
-func (fakeTimeout) Timeout() bool   { return true }
-func (fakeTimeout) Temporary() bool { return true }
+func (fakeTimeoutError) Error() string   { return "i/o timeout" }
+func (fakeTimeoutError) Timeout() bool   { return true }
+func (fakeTimeoutError) Temporary() bool { return true }
 
 // ── Finding 1: keepalive retry after a partially consumed frame ─────────
 
@@ -47,7 +48,7 @@ func (m *midFrameTimeoutConn) Read(p []byte) (int, error) {
 	case 1:
 		m.readStep = 2
 
-		return 0, fakeTimeout{}
+		return 0, fakeTimeoutError{}
 	}
 	if n := copy(p, m.step2); n > 0 {
 		m.readStep = 3
@@ -58,9 +59,9 @@ func (m *midFrameTimeoutConn) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 func (m *midFrameTimeoutConn) Write(p []byte) (int, error) { return len(p), nil }
-func (m *midFrameTimeoutConn) Close() error               { return nil }
-func (m *midFrameTimeoutConn) RemoteAddr() net.Addr       { return fakeAddr{} }
-func (m *midFrameTimeoutConn) LocalAddr() net.Addr        { return fakeAddr{} }
+func (m *midFrameTimeoutConn) Close() error                { return nil }
+func (m *midFrameTimeoutConn) RemoteAddr() net.Addr        { return fakeAddr{} }
+func (m *midFrameTimeoutConn) LocalAddr() net.Addr         { return fakeAddr{} }
 func (m *midFrameTimeoutConn) SetDeadline(time.Time) error {
 	return nil
 }
@@ -75,17 +76,41 @@ func (m *midFrameTimeoutConn) SetWriteDeadline(time.Time) error { return nil }
 // frame header.
 func TestAuditKeepaliveRetryAfterPartialFrame(t *testing.T) {
 	t.Parallel()
-	m := &midFrameTimeoutConn{
-		step1: []byte{0x82, 0x04, 0x41}, // header + first payload byte "A"
-		step2: []byte{0x82, 0x01, 0x58}, // the remaining payload bytes
-	}
-	raw := newRawConn(m, m, true, 1<<20, time.Second, 0)
-	ev, err := raw.ReadEvent()
-	if err == nil && string(ev.Payload) == "X" {
-		t.Fatalf("keepalive retry delivered %q: the partially consumed frame's "+
-			"remaining bytes were re-read as a new frame, corrupting the message boundary",
-			ev.Payload)
-	}
+	t.Run("partial-frame", func(t *testing.T) {
+		t.Parallel()
+		m := &midFrameTimeoutConn{
+			step1: []byte{0x82, 0x04, 0x41}, // header + first payload byte "A"
+			step2: []byte{0x82, 0x01, 0x58}, // the remaining payload bytes
+		}
+		raw := newRawConn(m, m, true, 1<<20, time.Second, 0)
+		ev, err := raw.ReadEvent()
+		if err == nil && string(ev.Payload) == "X" {
+			t.Fatalf("keepalive retry delivered %q: the partially consumed frame's "+
+				"remaining bytes were re-read as a new frame, corrupting the message boundary",
+				ev.Payload)
+		}
+		if !raw.Closed() {
+			t.Error("a retry that would re-read a partially consumed frame must make the connection terminal")
+		}
+	})
+	t.Run("clean-retry", func(t *testing.T) {
+		t.Parallel()
+		// The timeout fires before any payload byte is pulled (step1 empty),
+		// so the retry is safe: the probe is sent and the next frame is read
+		// normally from step2.
+		m := &midFrameTimeoutConn{
+			step1: []byte{},                                   // nothing pulled before the timeout
+			step2: []byte{0x82, 0x04, 0x41, 0x42, 0x43, 0x44}, // a whole frame
+		}
+		raw := newRawConn(m, m, true, 1<<20, time.Second, 0)
+		ev, err := raw.ReadEvent()
+		if err != nil || len(ev.Payload) != 4 || string(ev.Payload) != "ABCD" {
+			t.Fatalf("clean retry read = (%q, %v), want %q, nil", ev.Payload, err, "ABCD")
+		}
+		if raw.Closed() {
+			t.Error("a clean retry must keep the connection open")
+		}
+	})
 }
 
 // ── Finding 2: failed application ping/pong leaves the connection open ──
@@ -95,12 +120,12 @@ type failedWriteConn struct {
 	closed bool
 }
 
-func (f *failedWriteConn) Read(p []byte) (int, error)    { return 0, io.EOF }
-func (f *failedWriteConn) Write(p []byte) (int, error)  { return 0, io.ErrClosedPipe }
-func (f *failedWriteConn) Close() error                 { f.closed = true; return nil }
-func (f *failedWriteConn) RemoteAddr() net.Addr         { return fakeAddr{} }
-func (f *failedWriteConn) LocalAddr() net.Addr          { return fakeAddr{} }
-func (f *failedWriteConn) SetDeadline(time.Time) error  { return nil }
+func (f *failedWriteConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (f *failedWriteConn) Write(_ []byte) (int, error) { return 0, io.ErrClosedPipe }
+func (f *failedWriteConn) Close() error                { f.closed = true; return nil }
+func (f *failedWriteConn) RemoteAddr() net.Addr        { return fakeAddr{} }
+func (f *failedWriteConn) LocalAddr() net.Addr         { return fakeAddr{} }
+func (f *failedWriteConn) SetDeadline(time.Time) error { return nil }
 func (f *failedWriteConn) SetReadDeadline(time.Time) error {
 	return nil
 }
@@ -110,6 +135,7 @@ func (f *failedWriteConn) SetWriteDeadline(time.Time) error { return nil }
 // write failure must fail the connection exactly as a data-write failure
 // does (terminal state, transport closed), not just return an error.
 func TestAuditControlWriteFailureIsTerminal(t *testing.T) {
+	t.Parallel()
 	for name, call := range map[string]func(*RawConn) error{
 		"Ping": func(c *RawConn) error { return c.Ping([]byte("x")) },
 		"Pong": func(c *RawConn) error { return c.Pong([]byte("x")) },
@@ -118,7 +144,8 @@ func TestAuditControlWriteFailureIsTerminal(t *testing.T) {
 			t.Parallel()
 			f := &failedWriteConn{}
 			raw := newRawConn(f, f, true, 1<<20, 0, 0)
-			if err := call(raw); err == nil {
+			callErr := call(raw)
+			if callErr == nil {
 				t.Fatal("control write unexpectedly succeeded")
 			}
 			if !raw.Closed() {
@@ -140,29 +167,36 @@ func TestAuditControlWriteFailureIsTerminal(t *testing.T) {
 func TestAuditFragmentedWriteRejectsNewDataStart(t *testing.T) {
 	t.Parallel()
 	raw := newTestRawConn(nil, true)
-	if err := raw.WriteFrame(OpBinary, []byte("start"), true); err != nil {
-		t.Fatalf("fragment start: %v", err)
+	startErr := raw.WriteFrame(OpBinary, []byte("start"), true)
+	if startErr != nil {
+		t.Fatalf("fragment start: %v", startErr)
 	}
-	if err := raw.WriteFrame(OpBinary, []byte("new"), false); err == nil {
+	newFrameErr := raw.WriteFrame(OpBinary, []byte("new"), false)
+	if newFrameErr == nil {
 		t.Error("WriteFrame started a new data message while another was mid-fragment")
 	}
-	if err := raw.WriteMessage(OpBinary, []byte("new")); err == nil {
+	newMsgErr := raw.WriteMessage(OpBinary, []byte("new"))
+	if newMsgErr == nil {
 		t.Error("WriteMessage started a new data message while another was mid-fragment")
 	}
 	// Control traffic stays legal mid-fragment (RFC 6455 §5.5).
-	if err := raw.Ping(nil); err != nil {
-		t.Errorf("ping mid-fragment must stay legal: %v", err)
+	pingErr := raw.Ping(nil)
+	if pingErr != nil {
+		t.Errorf("ping mid-fragment must stay legal: %v", pingErr)
 	}
 	// Finishing the fragment re-opens normal writes.
 	fresh := newTestRawConn(nil, true)
-	if err := fresh.WriteFrame(OpBinary, []byte("start"), true); err != nil {
-		t.Fatalf("fragment start (fresh): %v", err)
+	freshStartErr := fresh.WriteFrame(OpBinary, []byte("start"), true)
+	if freshStartErr != nil {
+		t.Fatalf("fragment start (fresh): %v", freshStartErr)
 	}
-	if err := fresh.WriteFrame(OpContinuation, []byte("end"), false); err != nil {
-		t.Fatalf("continuation: %v", err)
+	contErr := fresh.WriteFrame(OpContinuation, []byte("end"), false)
+	if contErr != nil {
+		t.Fatalf("continuation: %v", contErr)
 	}
-	if err := fresh.WriteMessage(OpBinary, []byte("next")); err != nil {
-		t.Errorf("write after the fragment completed: %v", err)
+	nextErr := fresh.WriteMessage(OpBinary, []byte("next"))
+	if nextErr != nil {
+		t.Errorf("write after the fragment completed: %v", nextErr)
 	}
 }
 
@@ -258,12 +292,14 @@ func TestAuditNonminimalFrameLengthRejected(t *testing.T) {
 	t.Parallel()
 	// One-byte payload in the 16-bit form: must be rejected.
 	c := newTestCodec([]byte{0x82, 0x7e, 0x00, 0x01, 0x58}, true)
-	if _, err := c.readFrame(); err == nil {
+	_, frame16Err := c.readFrame()
+	if frame16Err == nil {
 		t.Error("16-bit length form for a 1-byte payload accepted; want protocol rejection")
 	}
 	// One-byte payload in the 64-bit form: must be rejected.
 	c = newTestCodec([]byte{0x82, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58}, true)
-	if _, err := c.readFrame(); err == nil {
+	_, frame64Err := c.readFrame()
+	if frame64Err == nil {
 		t.Error("64-bit length form for a 1-byte payload accepted; want protocol rejection")
 	}
 	// Boundary: exactly 126 bytes must use the 16-bit form and is legal.
@@ -283,20 +319,20 @@ func TestAuditNonminimalFrameLengthRejected(t *testing.T) {
 
 // TestAuditMultipleFinalDeflateBlocks: RFC 7692 §7.2.1 permits byte-aligned
 // final DEFLATE blocks followed by more blocks. A peer sending two final
-// stored blocks (payload "AB") plus the §7.2.3.4 tail must deliver the full
-// message, not just the first block.
+// stored blocks (payload "AB") plus the §7.2.3.4 trailing empty block must
+// deliver the full message, not just the first block.
 func TestAuditMultipleFinalDeflateBlocks(t *testing.T) {
 	t.Parallel()
-	// Two final stored blocks: "A" then "B", then the permessage-deflate
-	// tail (00 00 FF FF + the extra BFINAL empty block this decoder appends
-	// for real peers is not present here — the RFC tail suffices for the
-	// wire form the audit reproduced, extended to the decoder's tail).
+	// Two final stored blocks: "A" then "B", then the truncated §7.2.2
+	// trailing empty block — a single 0x00 header byte, the length and its
+	// complement having been dropped by the compressor (see
+	// deflateTailBytes, which restores them on receipt).
 	payload := []byte{
 		0x01, 0x01, 0x00, 0xfe, 0xff, 0x41, // final stored block: "A"
 		0x01, 0x01, 0x00, 0xfe, 0xff, 0x42, // final stored block: "B"
-		0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff,
+		0x00, // truncated trailing empty block header
 	}
-	wire := append([]byte{0xc2, 0x7e, 0x00, byte(len(payload))}, payload...) // RSV1 + binary
+	wire := append([]byte{0xc2, byte(len(payload))}, payload...) //nolint:gosec // test frame: handful of bytes
 	raw := newTestRawConn(wire, true)
 	raw.applyCompression()
 	ev, err := raw.ReadEvent()
@@ -333,7 +369,8 @@ func TestAuditAbruptEOFIsNotCleanClose(t *testing.T) {
 	}
 	// Contrast: a normal close frame IS the clean close.
 	sess := newTestConn([]byte{0x88, 0x02, 0x03, 0xe8}, true) // close 1000
-	if _, _, cleanErr := sess.ReadMessage(); !errors.Is(cleanErr, io.EOF) {
+	_, _, cleanErr := sess.ReadMessage()
+	if !errors.Is(cleanErr, io.EOF) {
 		t.Fatalf("normal close frame should read as io.EOF, got %v", cleanErr)
 	}
 }
@@ -342,6 +379,7 @@ func TestAuditAbruptEOFIsNotCleanClose(t *testing.T) {
 
 type trackedListener struct {
 	net.Listener
+
 	mu    sync.Mutex
 	conns []*closingConn
 }
@@ -381,6 +419,7 @@ func (l *trackedListener) allClosed(d time.Duration) bool {
 
 type closingConn struct {
 	net.Conn
+
 	closed atomic.Bool
 }
 
@@ -425,6 +464,7 @@ func TestAuditHandlerPanicClosesConnection(t *testing.T) {
 
 type writeDeadlineProbe struct {
 	net.Conn
+
 	mu   sync.Mutex
 	last time.Time
 }
@@ -455,15 +495,17 @@ func TestAuditWritePreservesApplicationDeadline(t *testing.T) {
 	probe := &writeDeadlineProbe{Conn: clientConn}
 	raw := newRawConn(probe, clientConn, true, 1<<20, 0, 0)
 	appDeadline := time.Now().Add(10 * time.Second)
-	if err := raw.SetWriteDeadline(appDeadline); err != nil {
-		t.Fatalf("SetWriteDeadline: %v", err)
+	deadlineErr := raw.SetWriteDeadline(appDeadline)
+	if deadlineErr != nil {
+		t.Fatalf("SetWriteDeadline: %v", deadlineErr)
 	}
 	go func() {
 		buf := make([]byte, 32)
 		_, _ = io.ReadFull(serverConn, buf)
 	}()
-	if err := raw.WriteMessage(OpBinary, []byte("hello")); err != nil {
-		t.Fatalf("write: %v", err)
+	writeErr := raw.WriteMessage(OpBinary, []byte("hello"))
+	if writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
 	}
 	if last := probe.lastWriteDeadline(); !last.Equal(appDeadline) {
 		t.Fatalf("write deadline after a successful write = %v, want the preserved %v: "+
@@ -485,7 +527,8 @@ func TestAuditQuotedWindowBitsValue(t *testing.T) {
 		t.Fatalf("window bits = %d, want 15", params.serverWindowBits)
 	}
 	// A quoted value that is not a token must still be rejected.
-	if _, err := parseCompressionParams(`permessage-deflate; server_max_window_bits="15x"`); err == nil {
+	_, quotedErr := parseCompressionParams(`permessage-deflate; server_max_window_bits="15x"`)
+	if quotedErr == nil {
 		t.Error("quoted non-numeric window bits accepted; want rejection")
 	}
 }

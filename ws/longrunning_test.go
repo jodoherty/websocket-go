@@ -395,19 +395,20 @@ func TestClosedSignal(t *testing.T) {
 // be in a torn state: the terminal error recorded but the connection still
 // open, so the later write would silently succeed.
 func TestTerminalReadErrorLeavesConnectionClosed(t *testing.T) {
-	// An empty stream: the first read hits EOF, a terminal transport error.
+	// An empty stream: the first read hits EOF, an abrupt transport closure
+	// with no close frame — an abnormal closure (1006), not a clean close.
 	fc := &fakeConn{}
 	c := newSession(newRawConn(fc, fc, true, 1<<20, 0, 0), nil)
 	_, _, err := c.ReadMessage()
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("terminal read = %v, want io.EOF", err)
+	if code, _, ok := CloseCode(err); !ok || code != StatusAbnormalClosure {
+		t.Fatalf("terminal read = %v, want close code 1006 (abnormal closure)", err)
 	}
 	if !c.Closed() {
 		t.Fatal("Closed() false after the terminal read error")
 	}
 	err = c.WriteText("late")
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("write after terminal error = %v, want the recorded error (io.EOF)", err)
+	if code, _, ok := CloseCode(err); !ok || code != StatusAbnormalClosure {
+		t.Fatalf("write after terminal error = %v, want the recorded close code 1006", err)
 	}
 }
 

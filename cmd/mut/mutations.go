@@ -507,9 +507,10 @@ func compressionNegotiationMutations() []mutation {
 		},
 		{
 			Name:        "deflate-double-offer-allow",
-			Pattern:     "if idx > 0 {",
-			Replacement: "if idx > 1 {",
-			Invariant:   "permessage-deflate offered more than once must fail the handshake",
+			Pattern:     "if len(groups) > 1 {",
+			Replacement: "if len(groups) > 2 {",
+			Invariant: "a 101 response that selects more than one permessage-deflate extension " +
+				"must be refused (RFC 7692 §7); the client accepts at most one",
 		},
 		{
 			Name:        "unoffered-extension-drop",

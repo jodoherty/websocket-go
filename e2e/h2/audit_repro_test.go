@@ -11,7 +11,6 @@ package h2e2e
 
 import (
 	"crypto/tls"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -66,20 +65,18 @@ func TestAuditPersistentH2Exchange(t *testing.T) {
 	defer conns.CloseAll()
 	tr := h2Transport(t)
 
-	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
 	req, _ := http.NewRequest(http.MethodConnect, ts.URL, pr)
 	req.Header.Set(":protocol", "websocket")
-	req.Header.Set("Sec-WebSocket-Key", key)
 	req.Header.Set("Sec-WebSocket-Version", "13")
 
 	res := boundedRoundTrip(t, tr, req, 5*time.Second)
 	if res == nil {
 		return
 	}
-	if got := res.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, acceptKey(key))
+	if got := res.Header.Get("Sec-WebSocket-Accept"); got != "" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want none (the key is HTTP/1-only)", got)
 	}
 
 	// Three small exchanges while the upload stays open in both directions.

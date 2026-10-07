@@ -237,13 +237,18 @@ func TestWriteFramePayloadFailure(t *testing.T) {
 // header announcing a 64-bit length with no following bytes must yield a
 // wrapped I/O error.
 func TestReadFrameTruncatedLength64(t *testing.T) {
-	// 0x81 = fin+text, 0x7f = 127 = "next 8 bytes are the length" — but
-	// there are no length bytes.
+	// 0x81 = fin+text, 0x7f = 127 = "next 8 bytes are the length" — but the
+	// connection is closed before any length bytes arrive. Reading a frame
+	// that the transport cut off is an abnormal closure (1006), not a clean
+	// close: the peer dropped the connection mid-frame.
 	c := newTestConn([]byte{0x81, 0x7f}, true)
 
 	_, _, err := c.ReadMessage()
-	if err == nil || !strings.Contains(err.Error(), "read 64-bit length") {
-		t.Fatalf("ReadMessage on truncated 64-bit length = %v, want a length read error", err)
+	if err == nil {
+		t.Fatal("ReadMessage on a truncated 64-bit length returned no error")
+	}
+	if code, _, ok := CloseCode(err); !ok || code != StatusAbnormalClosure {
+		t.Fatalf("ReadMessage = %v, want close code 1006 (abnormal closure)", err)
 	}
 }
 

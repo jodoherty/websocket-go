@@ -24,7 +24,8 @@ import (
 func TestAuditLoopExitNotProvenByBodyCount(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)
+		if err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
@@ -35,11 +36,12 @@ func TestAuditLoopExitNotProvenByBodyCount(t *testing.T) {
 		"func TestLoop(t *testing.T) { Loop(true) }\n")
 
 	profile := filepath.Join(dir, "cover.out")
-	cmd := exec.Command("go", "test", "-count=1", "-covermode=count",
+	cmd := exec.Command("go", "test", "-count=1", "-covermode=count", //nolint:gosec // fixed args on a temp dir
 		"-coverprofile="+profile, ".")
 	cmd.Dir = dir
 	cmd.Env = append(cmd.Environ(), "GOCACHE="+filepath.Join(dir, ".cache"))
-	if out, err := cmd.CombinedOutput(); err != nil {
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("go test on the fixture: %v\n%s", err, out)
 	}
 

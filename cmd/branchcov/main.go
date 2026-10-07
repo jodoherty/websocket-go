@@ -312,9 +312,15 @@ func measureFile(fset *token.FileSet, file *ast.File, blocks []block) []outcome 
 		case *ast.ForStmt:
 			header := countAt(fset, blocks, stmt.For)
 			body := bodyCount(fset, blocks, stmt.Body)
+			// The exit outcome is a false evaluation of the condition, which
+			// count-mode proves only as a condition evaluation that did not
+			// lead into the body (header > body). Body execution alone does
+			// not prove it: a body that returns, breaks, or otherwise exits
+			// never re-evaluates the condition, so a loop that always leaves
+			// through the body has header == body and no proven exit.
 			out = append(out,
 				outcome{what: labelForEntry, line: lineAt(fset, stmt.For), covered: header > 0},
-				outcome{what: labelForExit, line: lineAt(fset, stmt.For), covered: body > 0})
+				outcome{what: labelForExit, line: lineAt(fset, stmt.For), covered: header > body})
 		case *ast.SwitchStmt:
 			out = append(out, switchOutcomes(fset, blocks, stmt)...)
 		case *ast.TypeSwitchStmt:

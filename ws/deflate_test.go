@@ -280,7 +280,10 @@ func TestDeflateServerNegotiation(t *testing.T) {
 		{offer: "permessage-deflate; client_no_context_takeover=1", wantErr: true},
 		{offer: "permessage-deflate; bogus", wantErr: true},
 		{offer: "permessage-deflate; bogus, permessage-deflate", wantErr: true},
-		{offer: "permessage-deflate, permessage-deflate", wantErr: true},
+		// Multiple permessage-deflate groups are alternative configurations
+		// (RFC 7692 §5.1); the first honorable one wins — including two
+		// identical alternatives, which simply select the first.
+		{offer: "permessage-deflate, permessage-deflate", wantExt: deflateResponseHeader},
 		{offer: "permessage-deflate; client_max_window_bits; client_max_window_bits", wantErr: true},
 		{offer: "x-deflate", wantErr: true},
 		{offer: "permessage-deflate;", wantErr: true},
@@ -358,12 +361,16 @@ func TestDeflateClientVerification(t *testing.T) {
 		{name: "client window full", ext: snct + "; client_max_window_bits=15", wantErr: true},
 		{name: "client window value-less", ext: snct + "; client_max_window_bits", wantErr: true},
 		// §7.1.2.1: the server MAY add server_max_window_bits even
-		// unoffered — but the agreed parameter then caps this client's
-		// compressor (RFC 7692 §7), and the full 15-bit window is the only
-		// value this client supports: a cap below it fails the dial, the
-		// full value is accepted.
-		{name: "server window below full", ext: snct + "; server_max_window_bits=10", wantErr: true},
+		// unoffered. The value configures the server's compressor window;
+		// this client decodes with the full window unconditionally (RFC
+		// 7692 §7), so any supported value (8–15) is accepted without
+		// restricting this client.
+		{name: "server window below full", ext: snct + "; server_max_window_bits=10", compress: true},
+		{name: "server window min", ext: snct + "; server_max_window_bits=8", compress: true},
 		{name: "server window full", ext: snct + "; server_max_window_bits=15", compress: true},
+		// server_max_window_bits without the required
+		// server_no_context_takeover still fails: the §7.1.1.1 check is
+		// independent of the window value.
 		{name: "server window alone", ext: "permessage-deflate; server_max_window_bits=10", wantErr: true},
 		{name: "smaller client window", ext: snct + "; client_max_window_bits=10", wantErr: true},
 		{name: "unknown extension", ext: "x-deflate", wantErr: true},
@@ -746,6 +753,9 @@ func TestCompressedAllocationBudget(t *testing.T) {
 	})
 
 	t.Run("decompress", func(t *testing.T) {
+		if raceDetectorOn() {
+			t.Skip("flate alloc count is inflated under the race detector; pinned on the non-race run")
+		}
 		c := deflateTestConn(nil, true)
 		compressed := deflateStream(t, payload)
 		for range 3 { // warm up the decompressor and grow the scratch
@@ -869,4 +879,129 @@ func TestDecompressedMessageAtLimitSucceeds(t *testing.T) {
 		t.Fatalf("read at the decompressed limit = (%d, %d bytes, %v), want %d bytes, nil",
 			op, len(data), err, limit)
 	}
+}
+
+// TestUnquoteExtensionValue pins the RFC 6455 §9.1 quoted-string
+// handling: a quoted parameter value is unescaped (\" and \\), tab is
+// the only control character permitted, and any other control or high
+// byte — bare or after a backslash — is a malformed extension.
+func TestUnquoteExtensionValue(t *testing.T) {
+	t.Parallel()
+	check := func(value, want string) {
+		got, err := unquoteExtensionValue(value)
+		if err != nil {
+			t.Fatalf("unquoteExtensionValue(%q) = (%q, %v), want %q", value, got, err, want)
+		}
+		if got != want {
+			t.Fatalf("unquoteExtensionValue(%q) = %q, want %q", value, got, want)
+		}
+	}
+	checkErr := func(value, sub string) {
+		_, unquoteErr := unquoteExtensionValue(value)
+		if unquoteErr == nil || !strings.Contains(unquoteErr.Error(), sub) {
+			t.Fatalf("unquoteExtensionValue(%q) = %v, want an error containing %q", value, unquoteErr, sub)
+		}
+	}
+	// Structural cases: valid values and the rejections the MC/DC matrix
+	// does not trace (truncated escapes, unterminated strings, trailing
+	// characters).
+	plain := []struct {
+		subtest string
+		value   string
+		want    string
+	}{
+		{"quoted-digits", `"15"`, "15"},
+		{"escape-printable", `"a\Zb"`, "aZb"},
+	}
+	for _, pc := range plain {
+		t.Run(pc.subtest, func(t *testing.T) {
+			t.Parallel()
+			check(pc.value, pc.want)
+		})
+	}
+	// The not-quoted / empty short-circuit (value == "" || value[0] != '"'): each
+	// is passed through untouched.
+	t.Run("empty-string", func(t *testing.T) {
+		t.Parallel()
+		// (value==""=T, value[0]!="'"=F) vs (F, F): an empty value short-circuits.
+		check("", "")
+	})
+	t.Run("plain-token", func(t *testing.T) {
+		t.Parallel()
+		// (value[0]!="'"=T) vs (F): an unquoted token is returned as-is; a
+		// quoted value is unescaped (the quote condition flips the guard).
+		check("15", "15")
+		check(`"15"`, "15")
+	})
+	structural := []struct {
+		subtest string
+		value   string
+		want    string
+	}{
+		{"dangling-escape", `"a\`, "dangling escape"},
+		{"unterminated", `"ab`, "unterminated"},
+		{"trailing", `"a"b`, "trailing characters"},
+	}
+	for _, pc := range structural {
+		t.Run(pc.subtest, func(t *testing.T) {
+			t.Parallel()
+			checkErr(pc.value, pc.want)
+		})
+	}
+	// MC/DC matrix: each subtest asserts the observable outcome of one
+	// condition flip in the escape / character checks.
+	t.Run("escape-quote", func(t *testing.T) {
+		t.Parallel()
+		// A \" escape is legal; a control-char escape is rejected. The quote
+		// condition (the escaped byte is a DQUOTE) flips the invalid-escape
+		// check off then on.
+		check(`"a\"b"`, "a\"b")
+		checkErr("\"a\\\x01\"", "invalid escape")
+	})
+	t.Run("escape-backslash", func(t *testing.T) {
+		t.Parallel()
+		// (next!=\\=F, ...) vs (T, ...): a \\\\ escape is legal, a
+		// control-char escape is rejected — the backslash condition flips
+		// the invalid-escape check.
+		check(`"a\\b"`, "a\\b")
+		checkErr("\"a\\\x01\"", "invalid escape")
+	})
+	t.Run("escape-control", func(t *testing.T) {
+		t.Parallel()
+		// (next<0x20=T) vs (F): a control char after a backslash is
+		// rejected, a printable char after a backslash is legal — the low
+		// condition flips the check.
+		checkErr("\"a\\\x01b\"", "invalid escape")
+		check(`"a\Zb"`, "aZb")
+	})
+	t.Run("escape-high", func(t *testing.T) {
+		t.Parallel()
+		// (next>0x7e=T) vs (F): a high char after a backslash is rejected,
+		// a printable char after a backslash is legal — the high condition
+		// flips the check.
+		checkErr("\"a\\\x7fb\"", "invalid escape")
+		check(`"a\Zb"`, "aZb")
+	})
+	t.Run("tab-char", func(t *testing.T) {
+		t.Parallel()
+		// (ch!=0x09=F, ch<0x20=T, ch>0x7e=F) vs (T, T, F): tab is the one
+		// permitted control char, a NUL is rejected — the tab condition
+		// flips the invalid-character check.
+		check("\"a\tb\"", "a\tb")
+		checkErr("\"a\x00\"", "invalid character")
+	})
+	t.Run("control-char", func(t *testing.T) {
+		t.Parallel()
+		// (ch<0x20=T) vs (F): a NUL is rejected, a printable char is legal
+		// — the low condition flips the check.
+		checkErr("\"a\x00\"", "invalid character")
+		check("\"aZ\"", "aZ")
+	})
+	t.Run("high-char", func(t *testing.T) {
+		t.Parallel()
+		// (ch>0x7e=T) vs (F): a high char is rejected, a printable char is
+		// legal — the high condition flips the check.
+		checkErr("\"a\x7f\"", "invalid character")
+		check("\"aZ\"", "aZ")
+	})
 }

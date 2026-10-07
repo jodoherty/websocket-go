@@ -766,20 +766,33 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 // line. Each rejection writes the HTTP error response itself; the
 // version-mismatch response additionally names the version(s) the server
 // understands, per §4.2.
-func checkWebSocketKey(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
+// checkWebSocketVersion validates the Sec-WebSocket-Version header. It is
+// shared by the HTTP/1.1 upgrade and the RFC 8441 extended-CONNECT path:
+// the version is still required over a tunnel, but the handshake key is
+// not — the key and its accept value are HTTP/1-only (RFC 8441 §5).
+func checkWebSocketVersion(writer http.ResponseWriter, request *http.Request) *UpgradeError {
 	versions := request.Header.Values("Sec-WebSocket-Version")
 	if len(versions) == 0 {
-		return "", rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Version header")
+		return rejectStatus(writer, http.StatusBadRequest, "missing Sec-WebSocket-Version header")
 	}
 	if len(versions) > 1 {
-		return "", rejectStatus(writer, http.StatusBadRequest, "multiple Sec-WebSocket-Version headers")
+		return rejectStatus(writer, http.StatusBadRequest, "multiple Sec-WebSocket-Version headers")
 	}
 	if versions[0] != websocketVer {
 		// RFC 6455 §4.2: the version-mismatch response names the
 		// version(s) the server understands.
 		writer.Header().Add("Sec-WebSocket-Version", websocketVer)
 
-		return "", rejectStatus(writer, http.StatusUpgradeRequired, "unsupported websocket version")
+		return rejectStatus(writer, http.StatusUpgradeRequired, "unsupported websocket version")
+	}
+
+	return nil
+}
+
+func checkWebSocketKey(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
+	versionErr := checkWebSocketVersion(writer, request)
+	if versionErr != nil {
+		return "", versionErr
 	}
 	keys := request.Header.Values("Sec-WebSocket-Key")
 	if len(keys) == 0 {
@@ -992,9 +1005,12 @@ func (u *Upgrader) upgradeConnect(writer http.ResponseWriter, request *http.Requ
 	if rejection != nil {
 		return nil, rejection
 	}
-	key, rejection := checkWebSocketKey(writer, request)
-	if rejection != nil {
-		return nil, rejection
+	// RFC 8441 §5: over extended CONNECT the handshake key is superseded by
+	// :protocol — no key is required and no accept value is generated. Only
+	// the version is still validated.
+	versionErr := checkWebSocketVersion(writer, request)
+	if versionErr != nil {
+		return nil, versionErr
 	}
 	protocol, protoErr := negotiateProtocol(u.subprotocols,
 		strings.Join(request.Header.Values("Sec-WebSocket-Protocol"), ", "))
@@ -1005,32 +1021,42 @@ func (u *Upgrader) upgradeConnect(writer http.ResponseWriter, request *http.Requ
 	if extErr != nil {
 		return reject(writer, http.StatusBadRequest, extErr.Error())
 	}
+	// The response writer buffers separately from the frame codec's bufio, so
+	// both the success headers and every frame write must be flushed at the
+	// HTTP layer — without that, interactive traffic stalls (the 200 headers
+	// and small frames were never delivered while the tunnel stayed open).
+	controller := http.NewResponseController(writer)
+	flush := func() error { return controller.Flush() }
 	// The deadline gate runs before the tunnel opens: a stream that cannot
 	// enforce the configured windows is refused up front, 501 — the options
 	// must be real protections or zero, never silently inert.
-	channel := streamTransport{body: request.Body, tunnel: writer}
+	channel := streamTransport{body: request.Body, tunnel: writer, flush: flush}
 	raw, finishErr := u.finishRaw(channel, channel, protocol, extension)
 	if finishErr != nil {
 		return reject(writer, http.StatusNotImplemented, finishErr.Error())
 	}
 	// The tunnel is full-duplex: the frame loop reads request.Body and writes
 	// the response body interleaved until the stream closes.
-	err := http.NewResponseController(writer).EnableFullDuplex()
-	if err != nil {
+	duplexErr := controller.EnableFullDuplex()
+	if duplexErr != nil {
 		return reject(writer, http.StatusInternalServerError, "full-duplex unsupported")
 	}
-	respondExtendedConnect(writer, key, protocol, extension)
+	respondErr := respondExtendedConnect(writer, protocol, extension, flush)
+	if respondErr != nil {
+		return nil, rejectStatus(writer, http.StatusInternalServerError, respondErr.Error())
+	}
 
 	return raw, nil
 }
 
 // respondExtendedConnect writes the extended-CONNECT success response: a 200
-// carrying the accept key and any negotiated headers. Unlike the HTTP/1.1 path
-// there is no "Switching Protocols" status and no Upgrade/Connection headers —
-// the stream simply becomes the tunnel after the headers.
-func respondExtendedConnect(writer http.ResponseWriter, key, protocol, extension string) {
+// carrying any negotiated headers and, critically, a flush that delivers them
+// before the tunnel carries frames. Unlike the HTTP/1.1 path there is no
+// "Switching Protocols" status, no Upgrade/Connection headers, and no
+// Sec-WebSocket-Accept — RFC 8441 §5 supersedes the handshake key with
+// :protocol, so there is no key to accept.
+func respondExtendedConnect(writer http.ResponseWriter, protocol, extension string, flush func() error) error {
 	hdr := writer.Header()
-	hdr.Set("Sec-WebSocket-Accept", acceptKey(key))
 	if protocol != "" {
 		hdr.Set("Sec-WebSocket-Protocol", protocol)
 	}
@@ -1038,6 +1064,10 @@ func respondExtendedConnect(writer http.ResponseWriter, key, protocol, extension
 		hdr.Set("Sec-WebSocket-Extensions", extension)
 	}
 	writer.WriteHeader(http.StatusOK)
+
+	// Deliver the 200 before the tunnel carries any frame: a client that
+	// waits on the handshake response stalls forever without this flush.
+	return flush()
 }
 
 // deadlineNoop is the [DeadlineStream] for a channel that cannot enforce
@@ -1061,14 +1091,27 @@ func (deadlineNoop) SetWriteDeadline(time.Time) error { return nil }
 type streamTransport struct {
 	body   io.ReadCloser
 	tunnel io.Writer
+	// flush delivers buffered bytes at the HTTP response-writer layer; nil
+	// (the SessionOnStream path) means the tunnel needs no separate flush.
+	flush func() error
 }
 
 // Read, Write and Close are thin pass-throughs to the underlying transport:
 // the frame codec already wraps their errors, and Read must deliver io.EOF
-// unwrapped for the read loop's clean-end detection.
+// unwrapped for the read loop's clean-end detection. Write also flushes the
+// HTTP writer so a completed frame reaches the peer while the tunnel is open.
 func (s streamTransport) Read(p []byte) (int, error) { return s.body.Read(p) } //nolint:wrapcheck
 
-func (s streamTransport) Write(p []byte) (int, error) { return s.tunnel.Write(p) } //nolint:wrapcheck
+func (s streamTransport) Write(p []byte) (int, error) {
+	written, err := s.tunnel.Write(p)
+	if err == nil {
+		if s.flush != nil {
+			err = s.flush()
+		}
+	}
+
+	return written, err
+}
 
 func (s streamTransport) Close() error {
 	if closer, ok := s.tunnel.(io.Closer); ok {
@@ -1208,6 +1251,18 @@ func (u *Upgrader) Handle(handler func(request *http.Request, c *Session) error)
 		if err != nil {
 			return
 		}
+		// The teardown is armed the moment the upgrade succeeds, so an
+		// application panic still closes the connection: net/http's
+		// recovery path deliberately skips hijacked connections and would
+		// otherwise leak the transport. The panic propagates after the
+		// cleanup — never swallowed.
+		defer func() {
+			if panicked := recover(); panicked != nil {
+				_ = conn.Close(StatusUnexpectedCondition, "handler panic")
+
+				panic(panicked)
+			}
+		}()
 
 		closeAfterHandler(conn, handler(request, conn))
 	})
@@ -1223,6 +1278,16 @@ func (u *Upgrader) HandleRaw(handler func(request *http.Request, c *RawConn) err
 		if err != nil {
 			return
 		}
+		// Same panic-safety as [Upgrader.Handle]: the teardown is armed
+		// immediately after the upgrade so a panicking callback cannot leak
+		// the hijacked transport; the panic propagates after cleanup.
+		defer func() {
+			if panicked := recover(); panicked != nil {
+				_ = conn.Close(StatusUnexpectedCondition, "handler panic")
+
+				panic(panicked)
+			}
+		}()
 
 		closeAfterHandler(conn, handler(request, conn))
 	})
@@ -1407,17 +1472,12 @@ func parseCompressionParams(group string) (deflateParams, error) {
 			}
 		case "client_max_window_bits":
 			params.hasClientWindowBits = true
-			if hasValue {
-				_, err := parseWindowBits(value)
-				if err != nil {
-					return params, err
-				}
+			_, windowErr := checkWindowBits(key, value, hasValue, false)
+			if windowErr != nil {
+				return params, windowErr
 			}
 		case "server_max_window_bits":
-			if !hasValue {
-				return params, fmt.Errorf("%w: %q requires a value", errBadExtension, key)
-			}
-			bits, err := parseWindowBits(value)
+			bits, err := checkWindowBits(key, value, hasValue, true)
 			if err != nil {
 				return params, err
 			}
@@ -1429,6 +1489,89 @@ func parseCompressionParams(group string) (deflateParams, error) {
 	}
 
 	return params, nil
+}
+
+// unquoteExtensionValue applies RFC 6455 §9.1 to one extension parameter
+// value: a quoted-string value is unescaped before the parameter-specific
+// validation, and the quoting itself is validated — a closing DQUOTE at the
+// end of the value, every backslash escaping a legal character (SP / HTAB /
+// %x21-7E), and only token-compatible characters (HTAB, SP, %x21-7E)
+// unescaped. Unquoted values pass through unchanged.
+func unquoteExtensionValue(value string) (string, error) {
+	if value == "" || value[0] != '"' {
+		return value, nil
+	}
+	var out strings.Builder
+	for idx := 1; idx < len(value); idx++ {
+		switch cur := value[idx]; cur {
+		case '"':
+			if idx+1 != len(value) {
+				return "", fmt.Errorf("%w: trailing characters after quoted value %q", errBadExtension, value)
+			}
+
+			return out.String(), nil
+		case '\\':
+			if idx+1 >= len(value) {
+				return "", fmt.Errorf("%w: dangling escape in quoted value %q", errBadExtension, value)
+			}
+			next := value[idx+1]
+			escapeErr := invalidEscape(next, value)
+			if escapeErr != nil {
+				return "", escapeErr
+			}
+			out.WriteByte(next)
+			idx++
+		default:
+			quotedErr := invalidQuoted(cur, value)
+			if quotedErr != nil {
+				return "", quotedErr
+			}
+			out.WriteByte(cur)
+		}
+	}
+
+	return "", fmt.Errorf("%w: unterminated quoted value %q", errBadExtension, value)
+}
+
+// invalidEscape reports whether a backslash escapes an illegal character in
+// an RFC 6455 §9.1 quoted value: anything but a double-quote, a backslash,
+// or a printable ASCII byte (SP .. ~).
+func invalidEscape(next byte, value string) error {
+	if next != '"' && next != '\\' && (next < 0x20 || next > 0x7e) {
+		return fmt.Errorf("%w: invalid escape in quoted value %q", errBadExtension, value)
+	}
+
+	return nil
+}
+
+// invalidQuoted reports whether a bare character is illegal in an RFC 6455
+// §9.1 quoted value: anything but HTAB or a printable ASCII byte (SP .. ~).
+func invalidQuoted(ch byte, value string) error {
+	if ch != 0x09 && (ch < 0x20 || ch > 0x7e) {
+		return fmt.Errorf("%w: invalid character in quoted value %q", errBadExtension, value)
+	}
+
+	return nil
+}
+
+// checkWindowBits validates a max_window_bits parameter value, unquoting a
+// quoted value first (RFC 6455 §9.1). required reports whether the key
+// demands a value: server_max_window_bits does, client_max_window_bits does
+// not. A missing value on a non-required key is valid and returns zero.
+func checkWindowBits(key, value string, hasValue, required bool) (int, error) {
+	if !hasValue {
+		if required {
+			return 0, fmt.Errorf("%w: %q requires a value", errBadExtension, key)
+		}
+
+		return 0, nil
+	}
+	unquoted, unquoteErr := unquoteExtensionValue(value)
+	if unquoteErr != nil {
+		return 0, unquoteErr
+	}
+
+	return parseWindowBits(unquoted)
 }
 
 // parseWindowBits validates a max_window_bits value: decimal digits
@@ -1456,18 +1599,17 @@ func parseWindowBits(value string) (int, error) {
 // Sec-WebSocket-Extension offer and returns the header value for the 101
 // response ("" = no extension: the connection runs uncompressed).
 //
-// A malformed offer — an unrecognized extension (RFC 6455 §9.1), permessage-
-// deflate offered twice, or an invalid parameter — fails the handshake. An
-// offer that is well-formed but demands a smaller compressor window than
-// this implementation can use (server_max_window_bits below the full 15
-// bits) is declined (RFC 7692 §7.1.2.1): the response carries no extension
-// and the connection proceeds uncompressed.
+// A malformed offer — an unrecognized extension (RFC 6455 §9.1) or an
+// invalid parameter — fails the handshake. RFC 7692 §7 permits several
+// permessage-deflate offers as alternative configurations, ordered by
+// preference: the first alternative the server can honor wins. An
+// alternative that is well-formed but demands a smaller compressor window
+// than this implementation can use (server_max_window_bits below the full
+// 15 bits) is skipped, and the offer is declined — the response carries no
+// extension and the connection proceeds uncompressed — when no alternative
+// can be honored (RFC 7692 §7.1.2.1).
 func negotiateCompression(groups []string) (string, error) {
-	if len(groups) == 0 {
-		return "", nil // no extension offered; the connection runs uncompressed
-	}
-	declined := false
-	for idx, group := range groups {
+	for _, group := range groups {
 		name, _, _ := strings.Cut(group, ";")
 		name = strings.TrimSpace(name)
 		if !strings.EqualFold(name, extPerMessageDeflate) {
@@ -1477,20 +1619,17 @@ func negotiateCompression(groups []string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if idx > 0 {
-			return "", fmt.Errorf("%w: offered more than once", errBadExtension)
-		}
 		// Our compressor always uses the full 32 KiB window, so a limit
-		// below 15 bits cannot be honored: decline, per the doc comment.
+		// below 15 bits cannot be honored: try the next alternative
+		// (declining when this was the last one), per the doc comment.
 		if bits := params.serverWindowBits; bits != 0 && bits < maxWindowBits {
-			declined = true
+			continue
 		}
-	}
-	if declined {
-		return "", nil
+
+		return deflateResponseHeader, nil
 	}
 
-	return deflateResponseHeader, nil
+	return "", nil // no extension offered, or every alternative declined
 }
 
 // verifyCompressionResponse validates the Sec-WebSocket-Extension header
@@ -1502,10 +1641,11 @@ func negotiateCompression(groups []string) (string, error) {
 // use context takeover, streams the per-message-resetting decompressor
 // cannot decode); and because the offer carries no client_max_window_bits,
 // the response must not either (§7.1.2.2), valued or value-less. The
-// server may set server_max_window_bits even unoffered (§7.1.2.1), and when
-// it does the agreed parameter caps this client's compressor (RFC 7692
-// §7): this client compresses with the full 15-bit window, so a cap below
-// it is a configuration the client does not support and the dial fails.
+// server may set server_max_window_bits even unoffered (§7.1.2.1): that
+// parameter configures the SERVER's compressor and client decompressor
+// (RFC 7692 §7), and this client decodes with the full window, so any
+// supported smaller server window is accepted without restricting this
+// client's compressor.
 // It reports whether compression was negotiated.
 func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 	if !offered && len(groups) > 0 {
@@ -1537,15 +1677,10 @@ func verifyCompressionResponse(offered bool, groups []string) (bool, error) {
 		return false, fmt.Errorf("%w: 101 response sets the unoffered parameter client_max_window_bits",
 			errHandshakeFailed)
 	}
-	// §7.1.2.1: the server may set server_max_window_bits in the response
-	// even when the offer carried it not, and the agreed parameter then
-	// caps this client's compressor (RFC 7692 §7). This client compresses
-	// with the full 15-bit window, so a cap below it is a configuration it
-	// does not support — the connection MUST fail, per §7's general rule.
-	if bits := params.serverWindowBits; bits != 0 && bits < maxWindowBits {
-		return false, fmt.Errorf("%w: 101 response caps the window at %d bits",
-			errHandshakeFailed, bits)
-	}
+	// §7.1.2.1: server_max_window_bits may appear in the response even
+	// unoffered. It bounds the server's compressor window, which this
+	// client's full-window decompressor decodes unconditionally — no
+	// rejection here, whatever the supported value.
 
 	return true, nil
 }
@@ -1763,18 +1898,36 @@ func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *C
 	}
 
 	reader := bufio.NewReaderSize(conn, bufSize)
+	// The cancellation hook bounds the handshake itself, not just the
+	// connect: once the transport is up, a cancelled context must be able
+	// to unblock a pending handshake on a stalled transport — with or
+	// without a deadline. The hook is disarmed before a live connection is
+	// returned, so cancelling the establishment context afterwards cannot
+	// close an established session.
+	hook := installCancelHook(ctx, conn)
 	key, reqErr := writeHandshakeRequest(conn, path, host,
 		cfg.Subprotocols, cfg.Compression, cfg.Headers)
 	if reqErr != nil {
+		hook.stop()
 		_ = conn.Close()
 
 		return nil, nil, reqErr
 	}
 	subprotocol, compressed, respErr := readHandshakeResponse(reader, key, cfg.Subprotocols, cfg.Compression)
 	if respErr != nil {
+		hook.stop()
 		_ = conn.Close()
 
 		return nil, nil, respErr
+	}
+	if !hook.stop() {
+		// The establishment was cancelled between the handshake finishing
+		// and the hook being disarmed: the hook already closed the
+		// transport, and the dial fails rather than handing over a dead
+		// session.
+		_ = conn.Close()
+
+		return nil, nil, fmt.Errorf("ws: handshake cancelled: %w", ctx.Err())
 	}
 
 	// The handshake is done; clear the connect deadline so the session is
@@ -1790,6 +1943,74 @@ func dialConnWith(ctx context.Context, rawurl string, cfg *Config) (*RawConn, *C
 	}
 
 	return raw, cfg, nil
+}
+
+// cancelHook closes conn if the establishment context is cancelled while
+// the handshake is in flight, and synchronizes the disarm (stop) against
+// the cancel exactly once: whichever outcome wins first is the only one
+// that takes effect, so a cancel racing the disarm can neither close an
+// established session nor slip past the failed-dial report.
+type cancelHook struct {
+	mu      sync.Mutex
+	outcome int // 0 pending, 1 cancelled, 2 stopped
+	conn    net.Conn
+	// stopped is closed by stop to release the watcher goroutine. It is a
+	// plain channel, deliberately NOT derived from the establishment
+	// context: a child context would become ready at the same instant the
+	// parent is cancelled, and the watcher's select could then take the
+	// disarm branch and exit without closing the transport.
+	stopped chan struct{}
+}
+
+// installCancelHook arms the hook and starts its watcher goroutine. The
+// watcher exits when the hook is disarmed (stop) or when the establishment
+// context is cancelled (it closes the transport first), so no goroutine
+// outlives the handshake.
+func installCancelHook(ctx context.Context, conn net.Conn) *cancelHook {
+	hook := &cancelHook{conn: conn, stopped: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			hook.fire()
+		case <-hook.stopped:
+			// disarmed; the watcher exits with the handshake
+		}
+	}()
+
+	return hook
+}
+
+// fire records the cancellation win and closes the transport.
+func (h *cancelHook) fire() {
+	h.mu.Lock()
+	if h.outcome != 0 {
+		h.mu.Unlock()
+
+		return
+	}
+	h.outcome = 1
+	h.mu.Unlock()
+	_ = h.conn.Close()
+}
+
+// stop disarms the hook, synchronizing against a concurrent cancellation
+// exactly once: whichever outcome wins first is the only one that takes
+// effect. It reports true when the connection may live on as an
+// established session, and false when the establishment was cancelled (the
+// hook closed the transport).
+func (h *cancelHook) stop() bool {
+	h.mu.Lock()
+	if h.outcome != 0 {
+		cancelled := h.outcome == 1
+		h.mu.Unlock()
+
+		return !cancelled
+	}
+	h.outcome = 2
+	h.mu.Unlock()
+	close(h.stopped)
+
+	return true
 }
 
 // writeHandshakeRequest writes the client's opening HTTP request to conn and
@@ -2249,8 +2470,26 @@ func (c *RawConn) readNextFrame() (frame, error) {
 			return frm, nil
 		}
 		retry, connErr := c.keepaliveTimeout(err)
+		if retry && c.fc.pulled > 0 {
+			// A keepalive timeout interrupted a frame whose bytes were
+			// already consumed: a retry would re-read the remaining
+			// payload as a new frame and could deliver a corrupted
+			// success. The only safe recovery is to fail the
+			// connection; bytes of an interrupted frame are never
+			// reinterpreted as protocol structure.
+			return frame{}, c.finish(err)
+		}
 		if retry {
 			continue
+		}
+		if errors.Is(connErr, io.EOF) {
+			// The transport ended without a close frame: an abnormal
+			// closure (RFC 6455 §7.1.5). Report status 1006 — a code
+			// that is never transmitted on the wire — and never as
+			// io.EOF, the documented clean-close signal, so transport
+			// loss stays distinguishable from a normal protocol
+			// shutdown.
+			return frame{}, c.finish(errTransportAbnormalClose)
 		}
 		if errors.Is(connErr, errProtocol) {
 			return frame{}, c.failProtocol(
@@ -2542,10 +2781,17 @@ func (c *RawConn) closedWriteErr() error {
 }
 
 // writeFrame writes a frame, taking the write lock. It serves every frame
-// write on the connection — data frames ([RawConn.WriteMessage]), the
-// automatic pong and keepalive ping, and the close frame ([RawConn.Close]) —
-// each of which validates its own use. A closed connection yields
+// write on the connection — the automatic pong and keepalive ping, and
+// the application control writes ([RawConn.Ping], [RawConn.Pong]) — each
+// of which validates its own use. A closed connection yields
 // [RawConn.closedWriteErr], never a silent success.
+//
+// A transport-level write failure fails the connection — terminal state
+// with the error recorded, transport closed — exactly as the data writes
+// do: a ping or pong that cannot reach the peer means the pipe is broken,
+// and leaving the connection nominally open would keep background writers
+// running and a blocked reader asleep. Validation failures are not
+// transport failures and leave the connection untouched.
 func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2558,10 +2804,33 @@ func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 		// deadline, not wedge the read loop or hold the write mutex
 		// against Close. Cleared on return so the bound is per-frame.
 		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-		defer func() { _ = c.deadlines.SetWriteDeadline(time.Time{}) }()
+	}
+	writeErr := c.fc.writeFrame(opcode, payload, compressed, true)
+	c.clearWriteDeadline()
+	if writeErr != nil {
+		// A transport-level frame write failure breaks the connection
+		// exactly as a data-write failure does (finding 2), so the failure
+		// is terminal, not merely returned.
+		c.failTransportWrite(writeErr)
 	}
 
-	return c.fc.writeFrame(opcode, payload, compressed, true)
+	return writeErr
+}
+
+// failTransportWrite applies the terminal-failure verdict to a failed
+// transport write, with the write lock already held: a write that reached
+// the transport and failed means the pipe is broken, so the connection is
+// failed with the error recorded and the transport is closed, as
+// [RawConn.Close] does. It is idempotent through the state check, so a
+// racing Close or reader-goroutine failure cannot double-record. The
+// caller still returns the write error itself. Validation failures are
+// not transport failures and must not use this.
+func (c *RawConn) failTransportWrite(writeErr error) {
+	if c.state.Load() == stOpen {
+		c.state.Store(stClosed)
+		c.closeErr = writeErr
+		_ = c.nc.Close()
+	}
 }
 
 // WriteMessage writes a complete text or binary message. It is safe to call
@@ -2613,6 +2882,11 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 
 		return c.closedWriteErr()
 	}
+	if c.fragWriting {
+		c.mu.Unlock()
+
+		return fmt.Errorf("%w: a fragmented message is in progress; finish it before starting a new one", errProtocol)
+	}
 	if c.writeTimeout > 0 {
 		// Bound the write so a blackholed transport cannot hold the write
 		// mutex forever: a stuck write must fail (releasing the mutex) so
@@ -2628,7 +2902,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 	if c.deflateNegotiated {
 		compressErr := c.compress(data)
 		if compressErr != nil {
-			_ = c.deadlines.SetWriteDeadline(time.Time{})
+			c.clearWriteDeadline()
 			c.mu.Unlock()
 
 			return compressErr
@@ -2641,7 +2915,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 		// frame that a peer with the same limit would fail — the connection
 		// stays open, exactly as with the other validation rejections.
 		if int64(len(frame)) > c.fc.maxMsg {
-			_ = c.deadlines.SetWriteDeadline(time.Time{})
+			c.clearWriteDeadline()
 			c.mu.Unlock()
 
 			return fmt.Errorf("%w: compressed message of %d bytes exceeds the %d byte limit",
@@ -2649,24 +2923,22 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 		}
 	}
 	writeErr := c.fc.writeFrame(opcode, frame, compressed, true)
-	_ = c.deadlines.SetWriteDeadline(time.Time{})
+	c.clearWriteDeadline()
 	if writeErr != nil {
-		// The transport write failed, so the pipe is broken: no later
-		// write on this connection can succeed. Fail the connection with
-		// the error recorded — the same verdict the read path gives a
-		// failed pong or keepalive probe — and close the transport, as
-		// [RawConn.Close] does, so a reader blocked in ReadMessage wakes
-		// now instead of on keepalive, and the hijacked conn cannot
-		// leak if the read path is not currently in a read.
-		if c.state.Load() == stOpen {
-			c.state.Store(stClosed)
-			c.closeErr = writeErr
-			_ = c.nc.Close()
-		}
+		c.failTransportWrite(writeErr)
 	}
 	c.mu.Unlock()
 
 	return writeErr
+}
+
+// clearWriteDeadline undoes the bound [RawConn] armed before a write, so the
+// library timeout is per-write, not sticky; an application-managed deadline
+// (the library timeout disabled) is left untouched.
+func (c *RawConn) clearWriteDeadline() {
+	if c.writeTimeout > 0 {
+		_ = c.deadlines.SetWriteDeadline(time.Time{})
+	}
 }
 
 // WriteFrame writes one raw frame — the low-level counterpart of
@@ -2717,6 +2989,14 @@ func (c *RawConn) WriteFrame(opcode Op, payload []byte, more bool) error {
 
 		return fmt.Errorf("%w: continuation frame without a start frame in progress", errProtocol)
 	}
+	if c.fragWriting && (opcode == OpText || opcode == OpBinary) {
+		// RFC 6455 §5.4: a new data message cannot be started while a
+		// fragmented message is in progress; control frames may still be
+		// interleaved and the in-progress message must be finished first.
+		c.mu.Unlock()
+
+		return fmt.Errorf("%w: a fragmented message is in progress; finish it before starting a new one", errProtocol)
+	}
 	if opcode <= OpBinary {
 		// Data frames — continuation, text, and binary, the opcodes 0-2 —
 		// drive the fragmentation state; control frames cannot fragment
@@ -2727,15 +3007,13 @@ func (c *RawConn) WriteFrame(opcode Op, payload []byte, more bool) error {
 		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 	writeErr := c.fc.writeFrame(opcode, payload, false, !more)
-	_ = c.deadlines.SetWriteDeadline(time.Time{})
+	if c.writeTimeout > 0 {
+		// Clear the bound the write armed; an application-managed
+		// deadline (the library timeout disabled) is left untouched.
+		_ = c.deadlines.SetWriteDeadline(time.Time{})
+	}
 	if writeErr != nil {
-		// The transport write failed, so the pipe is broken: fail the
-		// connection, as WriteMessage does.
-		if c.state.Load() == stOpen {
-			c.state.Store(stClosed)
-			c.closeErr = writeErr
-			_ = c.nc.Close()
-		}
+		c.failTransportWrite(writeErr)
 	}
 	c.mu.Unlock()
 
@@ -2791,6 +3069,11 @@ func (c *RawConn) validateRawFrame(opcode Op, payload []byte, more bool) error {
 // A ping is a control frame, so its payload is at most 125 bytes — and, as
 // on the read side, it must also respect the connection's message size
 // limit, since the limit applies to every frame the peer receives.
+//
+// A transport-level write failure fails the connection exactly as a data
+// write does — terminal state, transport closed — because a ping that
+// cannot reach the peer means the pipe is broken; validation failures
+// (oversized payload) leave the connection untouched.
 func (c *RawConn) Ping(payload []byte) error {
 	if len(payload) > maxControlPayload {
 		return fmt.Errorf("%w: ping payload of %d bytes exceeds the %d byte control-frame limit",
@@ -2814,7 +3097,9 @@ func (c *RawConn) Ping(payload []byte) error {
 //
 // A pong is a control frame, so its payload is at most 125 bytes — and, as
 // on the read side, it must also respect the connection's message size
-// limit.
+// limit. A transport-level write failure fails the connection exactly as
+// a data write does, as with [RawConn.Ping]; validation failures leave the
+// connection untouched.
 func (c *RawConn) Pong(payload []byte) error {
 	if len(payload) > maxControlPayload {
 		return fmt.Errorf("%w: pong payload of %d bytes exceeds the %d byte control-frame limit",
@@ -3125,16 +3410,28 @@ func compressTailCheck(stream []byte) ([]byte, error) {
 	return stream[:len(stream)-truncateOctets], nil
 }
 
-// decompress expands a compressed message payload. The received data is a
-// truncated raw DEFLATE stream; appending deflateTailBytes completes the
-// trailing empty block the compressor cut off and adds a BFINAL terminator
-// so Go's strict decoder ends cleanly instead of reporting "unexpected EOF"
-// (see that variable's comment). An empty compressed payload is legal and
-// decompresses to an empty message. The result is at most maxMessageSize —
-// the bound is enforced while decompressing so a high-ratio payload cannot
-// inflate unboundedly before being rejected. The returned slice is fresh: the caller owns it and may
-// retain it, while every decompressor buffer is per-connection scratch reused
-// on the next message — one heap allocation per compressed message.
+// decompress expands a compressed message payload. The wire payload is a
+// DEFLATE block sequence (RFC 7692 §7.2.1) that may carry several complete
+// DEFLATE streams — a peer may end a stream at a byte-aligned final block and
+// continue with further blocks — followed by the §7.2.2 trailing empty block
+// the compressor truncates on the wire. A bare flate reader stops at the
+// first final block and silently discards everything after it; decompress
+// therefore locates every final-block boundary (finalBlockBoundary, using
+// the flate decoder itself as the oracle) and decodes each complete stream in
+// turn, concatenating the output so no content after an early final block is
+// lost. The final, non-final segment is decoded with deflateTailBytes, which
+// completes the truncated trailing empty block and adds a BFINAL terminator
+// so the strict decoder ends cleanly. An empty compressed payload is legal
+// and decompresses to an empty message.
+//
+// The result is at most maxMessageSize, enforced while decompressing so a
+// high-ratio payload cannot inflate unboundedly before rejection; a
+// malformed block — corrupt DEFLATE or a block past the payload — is a
+// protocol failure, never silently discarded bytes.
+//
+// The returned slice is fresh (the caller owns and may retain it); every
+// other buffer is per-connection scratch, so steady-state decompression
+// allocates only the payload: one heap allocation per compressed message.
 func (c *RawConn) decompress(src []byte) ([]byte, error) {
 	if c.inflater == nil {
 		c.inflateSrc = &bytes.Reader{}
@@ -3156,35 +3453,118 @@ func (c *RawConn) decompress(src []byte) ([]byte, error) {
 			c.inflateCopy = make([]byte, inflateCopyScratch)
 		}
 	}
-	// Lay the payload out next to the decompression tail in per-connection
-	// scratch, so the steady-state decompression allocates only the
-	// returned payload.
-	need := len(src) + len(deflateTailBytes)
-	if len(c.inflateWire) < need {
-		c.inflateWire = make([]byte, need)
-	}
-	copy(c.inflateWire, src)
-	copy(c.inflateWire[len(src):], deflateTailBytes[:])
-	c.inflateSrc.Reset(c.inflateWire[:need])
-	resetErr := c.inflaterRst.Reset(c.inflateSrc, nil)
-	if resetErr != nil {
-		return nil, fmt.Errorf("ws: reset decompressor: %w", resetErr)
-	}
 	c.inflateBuf.Reset()
 	c.inflateLimit.limit = int(c.fc.maxMsg)
-	_, err := io.CopyBuffer(&c.inflateLimit, c.inflater, c.inflateCopy)
-	if err != nil {
-		if errors.Is(err, errMessageTooBig) {
-			return nil, fmt.Errorf("%w: decompressed message exceeds the %d byte limit",
-				errMessageTooBig, c.fc.maxMsg)
+	start := 0
+	for start < len(src) {
+		boundary := c.finalBlockBoundary(src, start)
+		if boundary < 0 {
+			// No final block in src[start:]: the last (non-final) stream,
+			// decoded with the completion tail.
+			streamErr := c.decodeStream(src[start:], true)
+			if streamErr != nil {
+				return nil, c.wrapDecompress(streamErr)
+			}
+
+			break
 		}
 
-		return nil, fmt.Errorf("%w: invalid compressed payload: %w", errProtocol, err)
+		// src[start:boundary] is a complete DEFLATE stream ending in a final
+		// block; decode it. The completion tail is harmless here — the
+		// decoder ignores anything after a final block.
+		streamErr := c.decodeStream(src[start:boundary], true)
+		if streamErr != nil {
+			return nil, c.wrapDecompress(streamErr)
+		}
+
+		start = boundary
 	}
 	payload := make([]byte, c.inflateBuf.Len())
 	copy(payload, c.inflateBuf.Bytes())
 
 	return payload, nil
+}
+
+// wrapDecompress maps the decompressor's errors: a size overflow keeps its
+// sentinel; everything else is a protocol violation.
+func (c *RawConn) wrapDecompress(err error) error {
+	if errors.Is(err, errMessageTooBig) {
+		return fmt.Errorf("%w: decompressed message exceeds the %d byte limit", errMessageTooBig, c.fc.maxMsg)
+	}
+
+	return fmt.Errorf("%w: invalid compressed payload: %w", errProtocol, err)
+}
+
+// decodeStream decodes one segment with the re-used decompressor and appends
+// the output to c.inflateBuf. When withTail, the completion octets
+// (deflateTailBytes) are appended to segment: required for the final
+// non-final stream (they complete the truncated trailing empty block) and
+// ignored otherwise (the decoder discards anything after a final block).
+func (c *RawConn) decodeStream(segment []byte, withTail bool) error {
+	need := len(segment)
+	if withTail {
+		need += len(deflateTailBytes)
+	}
+	if len(c.inflateWire) < need {
+		c.inflateWire = make([]byte, need)
+	}
+	copy(c.inflateWire, segment)
+	if withTail {
+		copy(c.inflateWire[len(segment):], deflateTailBytes[:])
+	}
+	c.inflateSrc.Reset(c.inflateWire[:need])
+	resetErr := c.inflaterRst.Reset(c.inflateSrc, nil)
+	if resetErr != nil {
+		return errNoResetter
+	}
+
+	_, copyErr := io.CopyBuffer(&c.inflateLimit, c.inflater, c.inflateCopy)
+	if copyErr != nil {
+		return fmt.Errorf("ws: decompress stream: %w", copyErr)
+	}
+
+	return nil
+}
+
+// finalBlockBoundary returns the smallest byte offset b in (start, len(src)]
+// at which src[start:b] is a complete DEFLATE stream — that is, the flate
+// decoder reaches a BFINAL block — or -1 if no final block occurs in
+// src[start:]. The flate decoder is the oracle: it returns success exactly
+// when a final block is reached (any trailing bytes are ignored) and an error
+// otherwise, so the predicate is monotone in the prefix length and a binary
+// search pins the first boundary.
+func (c *RawConn) finalBlockBoundary(src []byte, start int) int {
+	if !c.probeClean(src[start:]) {
+		return -1
+	}
+
+	low, high := start+1, len(src)
+	for low < high {
+		middle := (low + high) >> 1
+		if c.probeClean(src[start:middle]) {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+
+	return low
+}
+
+// probeClean reports whether the flate decoder, re-armed on segment, reaches
+// a BFINAL block (a complete DEFLATE stream). The decompressed output is
+// discarded; only the terminal state of the decode matters. The copy uses the
+// per-connection inflateCopy scratch so the probe is allocation-free.
+func (c *RawConn) probeClean(segment []byte) bool {
+	c.inflateSrc.Reset(segment)
+	resetErr := c.inflaterRst.Reset(c.inflateSrc, nil)
+	if resetErr != nil {
+		return false
+	}
+
+	_, err := io.CopyBuffer(io.Discard, c.inflater, c.inflateCopy)
+
+	return err == nil
 }
 
 // inflateGuard bounds how many bytes the decompressor may produce, so a
@@ -3255,13 +3635,22 @@ type frameCodec struct {
 	// It grows to the largest masked frame sent and stays there — a
 	// bounded, one-time cost per connection, not per message.
 	maskScratch []byte
+	// pulled counts the bytes readFrame pulled from the stream during the
+	// current attempt; readNextFrame uses it to tell a clean failure
+	// (zero bytes consumed — safe to retry after a keepalive timeout) from
+	// an interrupted frame (bytes already consumed — the connection must
+	// fail, because a retry would re-read the remaining payload as a new
+	// frame). Read-loop only.
+	pulled int
 }
 
 // readFrame reads one frame from the connection. A client must mask its
 // frames and a server must not, so the peer's frames are masked exactly
 // when we are the server.
 func (fc *frameCodec) readFrame() (frame, error) {
-	_, err := io.ReadFull(fc.br, fc.in[:2])
+	fc.pulled = 0
+	n, err := io.ReadFull(fc.br, fc.in[:2])
+	fc.pulled += n
 	if err != nil {
 		return frame{}, fmt.Errorf("ws: read frame header: %w", err)
 	}
@@ -3320,13 +3709,15 @@ func (fc *frameCodec) checkRSV() error {
 // unmasks in place.
 func (fc *frameCodec) readFramePayload(size int64, masked bool) ([]byte, error) {
 	if masked {
-		_, err := io.ReadFull(fc.br, fc.mask[:])
+		n, err := io.ReadFull(fc.br, fc.mask[:])
+		fc.pulled += n
 		if err != nil {
 			return nil, fmt.Errorf("ws: read mask key: %w", err)
 		}
 	}
 	payload := make([]byte, size)
-	_, readErr := io.ReadFull(fc.br, payload)
+	n, readErr := io.ReadFull(fc.br, payload)
+	fc.pulled += n
 	if readErr != nil {
 		return nil, fmt.Errorf("ws: read payload: %w", readErr)
 	}
@@ -3342,14 +3733,22 @@ func (fc *frameCodec) readFramePayload(size int64, masked bool) ([]byte, error) 
 func (fc *frameCodec) readFrameLen(shortLen int) (int64, error) {
 	switch shortLen {
 	case len16:
-		_, err := io.ReadFull(fc.br, fc.in[2:4])
+		n, err := io.ReadFull(fc.br, fc.in[2:4])
+		fc.pulled += n
 		if err != nil {
 			return 0, fmt.Errorf("ws: read 16-bit length: %w", err)
 		}
+		size := int64(binary.BigEndian.Uint16(fc.in[2:4]))
+		// RFC 6455 §5.2: the payload length MUST use the smallest number
+		// of bytes — a 16-bit form below 126 is a malformed frame.
+		if size < len16 {
+			return 0, fmt.Errorf("%w: non-minimal 16-bit frame length %d", errProtocol, size)
+		}
 
-		return int64(binary.BigEndian.Uint16(fc.in[2:4])), nil
+		return size, nil
 	case len64:
-		_, err := io.ReadFull(fc.br, fc.len8[:])
+		n, err := io.ReadFull(fc.br, fc.len8[:])
+		fc.pulled += n
 		if err != nil {
 			return 0, fmt.Errorf("ws: read 64-bit length: %w", err)
 		}
@@ -3358,8 +3757,13 @@ func (fc *frameCodec) readFrameLen(shortLen int) (int64, error) {
 		}
 		// len8[0] == 0 above, so the value is < 2^63: the conversion
 		// below cannot overflow.
+		size := int64(binary.BigEndian.Uint64(fc.len8[:])) //nolint:gosec // bounded above
+		// RFC 6455 §5.2: a 64-bit form below 2^16 is a malformed frame.
+		if size < minLen64 {
+			return 0, fmt.Errorf("%w: non-minimal 64-bit frame length %d", errProtocol, size)
+		}
 
-		return int64(binary.BigEndian.Uint64(fc.len8[:])), nil //nolint:gosec // bounded above
+		return size, nil
 	default:
 
 		return int64(shortLen), nil
@@ -3512,15 +3916,16 @@ const (
 
 // Wire format constants (RFC 6455 §5-§6).
 const (
-	finBit     = 0x80 // frame[0] high bit: final fragment
-	rsvMask    = 0x70 // frame[0] reserved bits
-	rsv1Bit    = 0x40 // reserved bit 1: permessage-deflate "compressed" (RFC 7692)
-	rsv23Mask  = 0x30 // reserved bits 2 and 3, must always be zero
-	opcodeMask = 0x0f // frame[0] low 4 bits: opcode
-	maskBit    = 0x80 // frame[1] high bit: payload is masked
-	lenMask    = 0x7f // frame[1] low 7 bits: payload length
-	len16      = 126  // 16-bit extended length follows the header
-	len64      = 127  // 64-bit extended length follows the header
+	finBit     = 0x80    // frame[0] high bit: final fragment
+	rsvMask    = 0x70    // frame[0] reserved bits
+	rsv1Bit    = 0x40    // reserved bit 1: permessage-deflate "compressed" (RFC 7692)
+	rsv23Mask  = 0x30    // reserved bits 2 and 3, must always be zero
+	opcodeMask = 0x0f    // frame[0] low 4 bits: opcode
+	maskBit    = 0x80    // frame[1] high bit: payload is masked
+	lenMask    = 0x7f    // frame[1] low 7 bits: payload length
+	len16      = 126     // 16-bit extended length follows the header
+	len64      = 127     // 64-bit extended length follows the header
+	minLen64   = 1 << 16 // smallest length that needs the 64-bit form (RFC 6455 §5.2)
 	len16Max   = 0xffff
 	maskKeyLen = 4 // masking key size (RFC 6455 §5.3)
 )
@@ -3683,6 +4088,17 @@ var (
 	errNoResetter = errors.New("ws: internal error: decompressor does not support reset")
 )
 
+// errTransportAbnormalClose is the terminal error recorded when the transport
+// ends without a close frame (RFC 6455 §7.1.5): status 1006, which is never
+// transmitted on the wire, and deliberately not io.EOF — that is the
+// documented clean-close signal, so transport loss stays distinguishable
+// from a normal protocol shutdown. Shared by every connection: the value is
+// never mutated.
+var errTransportAbnormalClose = &CloseError{
+	Code:   StatusAbnormalClosure,
+	Reason: "connection closed without a close frame",
+}
+
 // closeErrFor maps a close code to the terminal error recorded on the
 // connection: a normal closure (1000, or an absent status) yields nil,
 // everything else yields a *CloseError so callers can see the code and
@@ -3690,8 +4106,11 @@ var (
 // terminalErr maps the recorded terminal error to what the connection's
 // surfaces report: a clean end — a normal closure (1000) in either
 // direction, or a close frame without a status — reads as [io.EOF];
-// anything else is the recorded error, so [errors.Is] on [io.EOF] is the
-// one check that distinguishes a clean end from an abnormal one.
+// anything else is the recorded error. An abrupt transport loss is never
+// io.EOF: it is recorded as the 1006 abnormal closure
+// (errTransportAbnormalClose), so [errors.Is] on [io.EOF] distinguishes a
+// clean end from transport loss, and [CloseCode] reports 1006 for the
+// latter.
 func terminalErr(closeErr error) error {
 	if closeErr == nil {
 		return io.EOF

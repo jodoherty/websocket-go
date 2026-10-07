@@ -17,9 +17,7 @@ package h2e2e
 
 import (
 	"bytes"
-	"crypto/sha1"
 	"crypto/tls"
-	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,10 +66,10 @@ func TestExtendedConnectH2RoundTrip(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
-	key := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef"))
 	req, _ := http.NewRequest(http.MethodConnect, ts.URL, pr)
 	req.Header.Set(":protocol", "websocket")
-	req.Header.Set("Sec-WebSocket-Key", key)
+	// No Sec-WebSocket-Key: RFC 8441 §5 supersedes the HTTP/1-only key with
+	// :protocol, so the standards-shaped request omits it.
 	req.Header.Set("Sec-WebSocket-Version", "13")
 	req.Header.Set("Sec-WebSocket-Protocol", "chat")
 
@@ -92,8 +90,9 @@ func TestExtendedConnectH2RoundTrip(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
-	if got := res.Header.Get("Sec-WebSocket-Accept"); got != acceptKey(key) {
-		t.Fatalf("Sec-WebSocket-Accept = %q, want %q", got, acceptKey(key))
+	// RFC 8441 §5: no Sec-WebSocket-Accept is generated over a tunnel.
+	if got := res.Header.Get("Sec-WebSocket-Accept"); got != "" {
+		t.Fatalf("Sec-WebSocket-Accept = %q, want none (the key is HTTP/1-only)", got)
 	}
 	if got := res.Header.Get("Sec-WebSocket-Protocol"); got != "chat" {
 		t.Fatalf("Sec-WebSocket-Protocol = %q, want chat", got)
@@ -106,16 +105,6 @@ func TestExtendedConnectH2RoundTrip(t *testing.T) {
 	if op != 0x1 || !bytes.Equal(payload, []byte("hello")) {
 		t.Fatalf("echo = (op=%#x %q), want text hello", op, payload)
 	}
-}
-
-// acceptKey computes the RFC 6455 §1.3 accept value: base64(sha1(key+GUID)).
-func acceptKey(key string) string {
-	const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	h := sha1.New()
-	_, _ = h.Write([]byte(key))
-	_, _ = h.Write([]byte(guid))
-
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
 // maskedTextFrame builds a masked client-to-server text frame with a fixed

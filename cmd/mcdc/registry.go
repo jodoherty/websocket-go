@@ -13,26 +13,28 @@ package main
 
 // Test names referenced by the traces.
 const (
-	testControlFrame              = "TestMCDCControlFrame"
-	testIsReadTimeout             = "TestMCDCIsReadTimeout"
-	testWriteOpcode               = "TestMCDCWriteMessageOpcode"
-	testCloseCodeRange            = "TestMCDCCloseCodeRange"
-	testDialScheme                = "TestMCDCDialScheme"
-	testMCDCCloseCode             = "TestMCDCCloseCode"
-	testMCDCWebSocketKey          = "TestMCDCWebSocketKey"
-	testMCDCSubprotocol           = "TestMCDCSubprotocol"
-	testMCDCTextUTF8              = "TestMCDCTextUTF8"
-	testMCDCUpgrade101            = "TestMCDCUpgrade101"
-	testMCDCHandleCloseCode       = "TestMCDCHandleCloseCode"
-	testMCDCRawWriteFrame         = "TestMCDCRawWriteFrame"
-	testMCDCTruncateReason        = "TestMCDCTruncateReason"
-	testMCDCStreamDeadlines       = "TestMCDCStreamDeadlines"
-	testMCDCDeflateRSV            = "TestMCDCDeflateRSV"
-	testMCDCDeflateControl        = "TestMCDCDeflateControl"
-	testMCDCDeflateServerWindow   = "TestMCDCDeflateServerWindow"
-	testMCDCDeflateResponseWindow = "TestMCDCDeflateResponseWindow"
-	testMCDCDeflateOffered        = "TestMCDCDeflateOffered"
-	testMCDCDeflateWindowBits     = "TestMCDCDeflateWindowBits"
+	testControlFrame            = "TestMCDCControlFrame"
+	testIsReadTimeout           = "TestMCDCIsReadTimeout"
+	testWriteOpcode             = "TestMCDCWriteMessageOpcode"
+	testCloseCodeRange          = "TestMCDCCloseCodeRange"
+	testDialScheme              = "TestMCDCDialScheme"
+	testMCDCCloseCode           = "TestMCDCCloseCode"
+	testMCDCWebSocketKey        = "TestMCDCWebSocketKey"
+	testMCDCSubprotocol         = "TestMCDCSubprotocol"
+	testMCDCTextUTF8            = "TestMCDCTextUTF8"
+	testMCDCUpgrade101          = "TestMCDCUpgrade101"
+	testMCDCHandleCloseCode     = "TestMCDCHandleCloseCode"
+	testMCDCRawWriteFrame       = "TestMCDCRawWriteFrame"
+	testMCDCTruncateReason      = "TestMCDCTruncateReason"
+	testMCDCStreamDeadlines     = "TestMCDCStreamDeadlines"
+	testMCDCDeflateRSV          = "TestMCDCDeflateRSV"
+	testMCDCDeflateControl      = "TestMCDCDeflateControl"
+	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
+	testMCDCDeflateOffered      = "TestMCDCDeflateOffered"
+	testMCDCDeflateWindowBits   = "TestMCDCDeflateWindowBits"
+	testAuditFragWriteStart     = "TestAuditFragmentedWriteRejectsNewDataStart"
+	testUnquoteExtValue         = "TestUnquoteExtensionValue"
+	testAuditKeepaliveRetry     = "TestAuditKeepaliveRetryAfterPartialFrame"
 )
 
 // Subtest names reused across more than one trace.
@@ -45,7 +47,9 @@ const (
 
 // Condition strings reused across more than one trace.
 const (
-	condOpcodeText = "opcode == OpText"
+	condOpcodeText   = "opcode == OpText"
+	condOpcodeBinary = "opcode == OpBinary"
+	condOpCont       = "opcode == OpContinuation"
 )
 
 // pairTrace is one traced MC/DC independence pair.
@@ -73,6 +77,8 @@ func registry() []decisionTrace {
 	traces = append(traces, textUTF8Traces()...)
 	traces = append(traces, compressionTraces()...)
 	traces = append(traces, rawWriteFrameTraces()...)
+	traces = append(traces, writeFrameGuardTraces()...)
+	traces = append(traces, keepaliveTraces()...)
 
 	return append(traces, serverTraces()...)
 }
@@ -129,7 +135,7 @@ func rawWriteFrameTraces() []decisionTrace {
 		// ws.go (WriteFrame): op == OpText || op == OpBinary || op == OpContinuation
 		{
 			expr:       "opcode == OpText || opcode == OpBinary || opcode == OpContinuation",
-			conditions: []string{condOpcodeText, "opcode == OpBinary", "opcode == OpContinuation"},
+			conditions: []string{condOpcodeText, condOpcodeBinary, condOpCont},
 			pairs: []pairTrace{
 				// A text frame goes out; a close frame is refused (the
 				// text condition flips the case selection).
@@ -146,10 +152,10 @@ func rawWriteFrameTraces() []decisionTrace {
 		// op == OpText || op == OpBinary
 		{
 			expr:       "opcode == OpText || opcode == OpBinary",
-			conditions: []string{condOpcodeText, "opcode == OpBinary"},
+			conditions: []string{condOpcodeText, condOpcodeBinary},
 			pairs: []pairTrace{
-				// A text frame goes out; a close frame is refused (the
-				// text condition flips the sub-decision on).
+				// A text frame goes out; a close frame is refused (the text
+				// condition flips the sub-decision on).
 				{0, []bool{true, false}, []bool{false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
 				// A binary frame goes out; a close frame is refused (the
 				// binary condition flips the sub-decision on).
@@ -169,6 +175,47 @@ func rawWriteFrameTraces() []decisionTrace {
 				// after a start goes out (the fragWriting condition flips
 				// the guard off).
 				{1, []bool{true, true}, []bool{true, false}, testMCDCRawWriteFrame, "continuation-after-text-start"},
+			},
+		},
+	}
+}
+
+// writeFrameGuardTraces covers the finding-3 fragmented-write guards: a new
+// data message cannot start while a fragment is in progress (RFC 6455 §5.4).
+func writeFrameGuardTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (WriteFrame): a new data message cannot
+		// start while a fragment is in progress; control frames may
+		// interleave. Outer decision: c.fragWriting && (OpText || OpBinary).
+		{
+			expr:       "c.fragWriting && (opcode == OpText || opcode == OpBinary)",
+			conditions: []string{"c.fragWriting", condOpcodeText, condOpcodeBinary},
+			pairs: []pairTrace{
+				// A data start mid-fragment is refused; the same frame with
+				// no fragment in flight goes out (the fragWriting condition
+				// flips the guard).
+				{0, []bool{true, true, false}, []bool{false, true, false}, testAuditFragWriteStart, ""},
+				// A text start mid-fragment is refused; the same binary
+				// frame is refused too, so flipping the text condition with
+				// the binary off turns the guard on then off.
+				{1, []bool{true, true, false}, []bool{true, false, false}, testAuditFragWriteStart, ""},
+				// Flipping the binary condition (text off) turns the guard
+				// on then off.
+				{2, []bool{true, false, true}, []bool{true, false, false}, testAuditFragWriteStart, ""},
+			},
+		},
+		// ws.go (WriteFrame writable set, second nested instance):
+		// opcode == OpText || opcode == OpBinary
+		{
+			expr:       "opcode == OpText || opcode == OpBinary",
+			conditions: []string{condOpcodeText, condOpcodeBinary},
+			pairs: []pairTrace{
+				// A text frame goes out; a close frame is refused (the text
+				// condition flips the sub-decision on).
+				{0, []bool{true, false}, []bool{false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
+				// A binary frame goes out; a close frame is refused (the
+				// binary condition flips the sub-decision on).
+				{1, []bool{false, true}, []bool{false, false}, testMCDCRawWriteFrame, subtestCloseNotWritable},
 			},
 		},
 	}
@@ -454,7 +501,7 @@ func serverTraces() []decisionTrace {
 // compressionTraces covers the permessage-deflate (RFC 7692) RSV state
 // machine and the extension negotiation parsing.
 func compressionTraces() []decisionTrace {
-	return append(deflateFrameTraces(), windowBitsTraces()...)
+	return append(append(deflateFrameTraces(), windowBitsTraces()...), unquoteTraces()...)
 }
 
 // deflateFrameTraces covers the RSV state machine and the negotiation
@@ -510,19 +557,6 @@ func deflateFrameTraces() []decisionTrace {
 				// With no offer, a response without the extension is accepted
 				// and one with it fails.
 				{1, []bool{true, false}, []bool{true, true}, testMCDCDeflateOffered, "groups"},
-			},
-		},
-		// ws.go (verifyCompressionResponse): bits != 0 && bits < maxWindowBits
-		{
-			expr:       "bits != 0 && bits < maxWindowBits",
-			conditions: []string{"bits != 0", "bits < maxWindowBits"},
-			pairs: []pairTrace{
-				// A response without a window constraint is accepted; one
-				// capping the window at 10 bits fails the dial.
-				{0, []bool{false, true}, []bool{true, true}, testMCDCDeflateResponseWindow, "bits"},
-				// A 10-bit cap fails the dial; the full 15-bit window is
-				// accepted.
-				{1, []bool{true, true}, []bool{true, false}, testMCDCDeflateResponseWindow, "belowMax"},
 			},
 		},
 	}
@@ -581,6 +615,127 @@ func windowBitsTraces() []decisionTrace {
 				{0, []bool{true, false}, []bool{false, false}, testMCDCDeflateWindowBits, subtestDecode},
 				// "7" is below the floor; "10" is in range.
 				{1, []bool{false, true}, []bool{false, false}, testMCDCDeflateWindowBits, subtestBelow},
+			},
+		},
+	}
+}
+
+// unquoteTraces covers the RFC 6455 §9.1 quoted-string handling in
+// unquoteExtensionValue: the not-quoted short-circuit, the invalid-escape and
+// invalid-character checks.
+func unquoteTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (unquoteExtensionValue): the not-quoted / empty short-circuit.
+		// value == "" || value[0] != '"'
+		{
+			expr:       "value == \"\" || value[0] != '\"'",
+			conditions: []string{"value == \"\"", "value[0] != '\"'"},
+			pairs: []pairTrace{
+				// An empty value short-circuits; a single unquoted char
+				// returns as-is (the empty condition flips the guard).
+				{0, []bool{true, false}, []bool{false, false}, testUnquoteExtValue, "empty-string"},
+				// An unquoted token returns as-is; a quoted value is unescaped
+				// (the quote condition flips the guard off).
+				{1, []bool{false, true}, []bool{false, false}, testUnquoteExtValue, "plain-token"},
+			},
+		},
+		// ws.go (unquoteExtensionValue): invalid-escape check, the outer
+		// AND. next != '"' && next != '\\' && (next < 0x20 || next > 0x7e)
+		{
+			expr:       "next != '\"' && next != '\\\\' && (next < 0x20 || next > 0x7e)",
+			conditions: []string{"next != '\"'", "next != '\\\\'", "next < 0x20", "next > 0x7e"},
+			pairs: []pairTrace{
+				// \\" is a legal escape; a non-quoted, non-backslash escape
+				// with a control char is rejected (the quote condition flips
+				// the check).
+				{0, []bool{true, true, true, false}, []bool{false, true, true, false}, testUnquoteExtValue, "escape-quote"},
+				// \\\\ is a legal escape; the same escape with a control char
+				// is rejected (the backslash condition flips the check).
+				{1, []bool{true, true, true, false}, []bool{true, false, true, false}, testUnquoteExtValue, "escape-backslash"},
+				// a control char after a backslash is rejected; a printable
+				// char after a backslash is legal (the low condition flips).
+				{2, []bool{true, true, true, false}, []bool{true, true, false, false}, testUnquoteExtValue, "escape-control"},
+				// a high char after a backslash is rejected; a printable char
+				// after a backslash is legal (the high condition flips).
+				{3, []bool{true, true, false, true}, []bool{true, true, false, false}, testUnquoteExtValue, "escape-high"},
+			},
+		},
+		// ws.go (unquoteExtensionValue, nested sub-decision): next != '"' && next != '\\'
+		{
+			expr:       "next != '\"' && next != '\\\\'",
+			conditions: []string{"next != '\"'", "next != '\\\\'"},
+			pairs: []pairTrace{
+				// \\" is legal; a control-char escape is rejected (the quote
+				// condition flips the sub-decision off).
+				{0, []bool{true, true}, []bool{false, true}, testUnquoteExtValue, "escape-quote"},
+				// \\\\ is legal; a control-char escape is rejected (the
+				// backslash condition flips the sub-decision off).
+				{1, []bool{true, true}, []bool{true, false}, testUnquoteExtValue, "escape-backslash"},
+			},
+		},
+		// ws.go (unquoteExtensionValue, nested sub-decision): next < 0x20 || next > 0x7e
+		{
+			expr:       "next < 0x20 || next > 0x7e",
+			conditions: []string{"next < 0x20", "next > 0x7e"},
+			pairs: []pairTrace{
+				// a control char after a backslash is rejected; a printable
+				// char is legal (the low condition flips the sub-decision on).
+				{0, []bool{true, false}, []bool{false, false}, testUnquoteExtValue, "escape-control"},
+				// a high char after a backslash is rejected; a printable char
+				// is legal (the high condition flips the sub-decision on).
+				{1, []bool{false, true}, []bool{false, false}, testUnquoteExtValue, "escape-high"},
+			},
+		},
+		// ws.go (unquoteExtensionValue): invalid-character check, the outer
+		// AND. ch != 0x09 && (ch < 0x20 || ch > 0x7e)
+		{
+			expr:       "ch != 0x09 && (ch < 0x20 || ch > 0x7e)",
+			conditions: []string{"ch != 0x09", "ch < 0x20", "ch > 0x7e"},
+			pairs: []pairTrace{
+				// tab is the one permitted control char; a NUL is rejected
+				// (the tab condition flips the check).
+				{0, []bool{true, true, false}, []bool{false, true, false}, testUnquoteExtValue, "tab-char"},
+				// a NUL is rejected; tab is legal (the low condition flips).
+				{1, []bool{true, true, false}, []bool{true, false, false}, testUnquoteExtValue, "control-char"},
+				// a high char is rejected; a printable char is legal (the high
+				// condition flips).
+				{2, []bool{true, false, true}, []bool{true, false, false}, testUnquoteExtValue, "high-char"},
+			},
+		},
+		// ws.go (unquoteExtensionValue, nested sub-decision): ch < 0x20 || ch > 0x7e
+		{
+			expr:       "ch < 0x20 || ch > 0x7e",
+			conditions: []string{"ch < 0x20", "ch > 0x7e"},
+			pairs: []pairTrace{
+				// a NUL is rejected; a printable char is legal (the low
+				// condition flips the sub-decision on).
+				{0, []bool{true, false}, []bool{false, false}, testUnquoteExtValue, "control-char"},
+				// a high char is rejected; a printable char is legal (the high
+				// condition flips the sub-decision on).
+				{1, []bool{false, true}, []bool{false, false}, testUnquoteExtValue, "high-char"},
+			},
+		},
+	}
+}
+
+// keepaliveTraces covers the keepalive probe/timeout read-loop decisions.
+func keepaliveTraces() []decisionTrace {
+	return []decisionTrace{
+		// ws.go (readNextFrame): retry && c.fc.pulled > 0 — a keepalive
+		// timeout that interrupted a frame whose bytes were already pulled
+		// is unrecoverable; a clean timeout (nothing pulled) retries.
+		{
+			expr:       "retry && c.fc.pulled > 0",
+			conditions: []string{"retry", "c.fc.pulled > 0"},
+			pairs: []pairTrace{
+				// A timeout after a partial frame fails the connection; the
+				// same bytes with no timeout take the normal error path (the
+				// retry condition flips the guard).
+				{0, []bool{true, true}, []bool{false, true}, testAuditKeepaliveRetry, "partial-frame"},
+				// A timeout after a partial frame fails the connection; a
+				// timeout with nothing pulled retries and delivers the frame
+				// (the pulled condition flips the guard).
+				{1, []bool{true, true}, []bool{true, false}, testAuditKeepaliveRetry, "clean-retry"},
 			},
 		},
 	}
