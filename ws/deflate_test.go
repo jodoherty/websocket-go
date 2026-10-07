@@ -1005,3 +1005,84 @@ func TestUnquoteExtensionValue(t *testing.T) {
 		check("\"aZ\"", "aZ")
 	})
 }
+
+// TestVerifyServerWindowBitsInResponse: server_max_window_bits in a 101
+// response bounds the SERVER's compressor, which this client's full-window
+// decompressor decodes unconditionally. A smaller server window must be
+// accepted, not used to wrongly cap the client's own compressor.
+func TestVerifyServerWindowBitsInResponse(t *testing.T) {
+	t.Parallel()
+	ok, err := verifyCompressionResponse(true,
+		[]string{"permessage-deflate; server_no_context_takeover; server_max_window_bits=10"})
+	if err != nil {
+		t.Fatalf("valid response rejected: %v", err)
+	}
+	if !ok {
+		t.Fatal("valid response reported as not negotiated")
+	}
+}
+
+// TestNegotiateCompressionAlternativeOffers: RFC 7692 §7 permits multiple
+// permessage-deflate offers as alternative configurations, ordered by
+// preference. The first alternative demands a window this implementation
+// cannot supply; the second can be supported and must be selected.
+func TestNegotiateCompressionAlternativeOffers(t *testing.T) {
+	t.Parallel()
+	resp, err := negotiateCompression([]string{
+		"permessage-deflate; server_max_window_bits=10",
+		"permessage-deflate",
+	})
+	if err != nil {
+		t.Fatalf("alternative offers rejected: %v", err)
+	}
+	if resp != deflateResponseHeader {
+		t.Fatalf("response = %q, want %q", resp, deflateResponseHeader)
+	}
+}
+
+// TestDecompressMultipleFinalBlocks: RFC 7692 §7.2.1 permits byte-aligned
+// final DEFLATE blocks followed by more blocks. A peer sending two final
+// stored blocks (payload "AB") plus the §7.2.3.4 trailing empty block must
+// deliver the full message, not just the first block.
+func TestDecompressMultipleFinalBlocks(t *testing.T) {
+	t.Parallel()
+	// Two final stored blocks: "A" then "B", then the truncated §7.2.2
+	// trailing empty block — a single 0x00 header byte, the length and its
+	// complement having been dropped by the compressor (see
+	// deflateTailBytes, which restores them on receipt).
+	payload := []byte{
+		0x01, 0x01, 0x00, 0xfe, 0xff, 0x41, // final stored block: "A"
+		0x01, 0x01, 0x00, 0xfe, 0xff, 0x42, // final stored block: "B"
+		0x00, // truncated trailing empty block header
+	}
+	wire := append([]byte{0xc2, byte(len(payload))}, payload...) //nolint:gosec // test frame: handful of bytes
+	raw := newTestRawConn(wire, true)
+	raw.applyCompression()
+	ev, err := raw.ReadEvent()
+	if err != nil {
+		t.Fatalf("multi-block compressed message failed: %v", err)
+	}
+	if string(ev.Payload) != "AB" {
+		t.Fatalf("payload = %q, want %q: the decoder stopped at the first BFINAL block and discarded the rest",
+			ev.Payload, "AB")
+	}
+}
+
+// TestQuotedWindowBitsValue: RFC 6455 §9.1 permits quoted-string parameter
+// values; server_max_window_bits="15" is the value 15. A quoted value that
+// is not a valid token must still be rejected.
+func TestQuotedWindowBitsValue(t *testing.T) {
+	t.Parallel()
+	params, err := parseCompressionParams(`permessage-deflate; server_max_window_bits="15"`)
+	if err != nil {
+		t.Fatalf("valid quoted value rejected: %v", err)
+	}
+	if params.serverWindowBits != 15 {
+		t.Fatalf("window bits = %d, want 15", params.serverWindowBits)
+	}
+	// A quoted value that is not a token must still be rejected.
+	_, quotedErr := parseCompressionParams(`permessage-deflate; server_max_window_bits="15x"`)
+	if quotedErr == nil {
+		t.Error("quoted non-numeric window bits accepted; want rejection")
+	}
+}

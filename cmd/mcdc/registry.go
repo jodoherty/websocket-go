@@ -32,9 +32,9 @@ const (
 	testMCDCDeflateServerWindow = "TestMCDCDeflateServerWindow"
 	testMCDCDeflateOffered      = "TestMCDCDeflateOffered"
 	testMCDCDeflateWindowBits   = "TestMCDCDeflateWindowBits"
-	testAuditFragWriteStart     = "TestAuditFragmentedWriteRejectsNewDataStart"
+	testFragWriteStart          = "TestWriteRejectsDataStartDuringFragment"
 	testUnquoteExtValue         = "TestUnquoteExtensionValue"
-	testAuditKeepaliveRetry     = "TestAuditKeepaliveRetryAfterPartialFrame"
+	testKeepaliveRetry          = "TestKeepaliveRetryAfterPartialFrame"
 )
 
 // Subtest names reused across more than one trace.
@@ -194,14 +194,14 @@ func writeFrameGuardTraces() []decisionTrace {
 				// A data start mid-fragment is refused; the same frame with
 				// no fragment in flight goes out (the fragWriting condition
 				// flips the guard).
-				{0, []bool{true, true, false}, []bool{false, true, false}, testAuditFragWriteStart, ""},
+				{0, []bool{true, true, false}, []bool{false, true, false}, testFragWriteStart, ""},
 				// A text start mid-fragment is refused; the same binary
 				// frame is refused too, so flipping the text condition with
 				// the binary off turns the guard on then off.
-				{1, []bool{true, true, false}, []bool{true, false, false}, testAuditFragWriteStart, ""},
+				{1, []bool{true, true, false}, []bool{true, false, false}, testFragWriteStart, ""},
 				// Flipping the binary condition (text off) turns the guard
 				// on then off.
-				{2, []bool{true, false, true}, []bool{true, false, false}, testAuditFragWriteStart, ""},
+				{2, []bool{true, false, true}, []bool{true, false, false}, testFragWriteStart, ""},
 			},
 		},
 		// ws.go (WriteFrame writable set, second nested instance):
@@ -731,11 +731,11 @@ func keepaliveTraces() []decisionTrace {
 				// A timeout after a partial frame fails the connection; the
 				// same bytes with no timeout take the normal error path (the
 				// retry condition flips the guard).
-				{0, []bool{true, true}, []bool{false, true}, testAuditKeepaliveRetry, "partial-frame"},
+				{0, []bool{true, true}, []bool{false, true}, testKeepaliveRetry, "partial-frame"},
 				// A timeout after a partial frame fails the connection; a
 				// timeout with nothing pulled retries and delivers the frame
 				// (the pulled condition flips the guard).
-				{1, []bool{true, true}, []bool{true, false}, testAuditKeepaliveRetry, "clean-retry"},
+				{1, []bool{true, true}, []bool{true, false}, testKeepaliveRetry, "clean-retry"},
 			},
 		},
 	}

@@ -441,3 +441,130 @@ func TestDefaultWriteTimeoutApplies(t *testing.T) {
 		t.Fatalf("client default write bound = %v, want the positive default", got)
 	}
 }
+
+// failedWriteConn is a transport whose writes always fail; Close records
+// that it was called.
+type failedWriteConn struct {
+	closed bool
+}
+
+func (f *failedWriteConn) Read(_ []byte) (int, error)  { return 0, io.EOF }
+func (f *failedWriteConn) Write(_ []byte) (int, error) { return 0, io.ErrClosedPipe }
+func (f *failedWriteConn) Close() error                { f.closed = true; return nil }
+func (f *failedWriteConn) RemoteAddr() net.Addr        { return fakeAddr{} }
+func (f *failedWriteConn) LocalAddr() net.Addr         { return fakeAddr{} }
+func (f *failedWriteConn) SetDeadline(time.Time) error { return nil }
+func (f *failedWriteConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (f *failedWriteConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestControlWriteFailureFailsConnection: a transport-level ping or pong
+// write failure must fail the connection exactly as a data-write failure
+// does (terminal state, transport closed), not just return an error — a
+// blocked reader has to be woken.
+func TestControlWriteFailureFailsConnection(t *testing.T) {
+	t.Parallel()
+	for name, call := range map[string]func(*RawConn) error{
+		"Ping": func(c *RawConn) error { return c.Ping([]byte("x")) },
+		"Pong": func(c *RawConn) error { return c.Pong([]byte("x")) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			f := &failedWriteConn{}
+			raw := newRawConn(f, f, true, 1<<20, 0, 0)
+			callErr := call(raw)
+			if callErr == nil {
+				t.Fatal("control write unexpectedly succeeded")
+			}
+			if !raw.Closed() {
+				t.Error("Closed() = false after a failed control write: the connection was not made terminal")
+			}
+			if !f.closed {
+				t.Error("transport not closed after a failed control write: a blocked reader would not be woken")
+			}
+		})
+	}
+}
+
+// TestAbruptEOFIsAbnormalClosure: a bare transport EOF is the
+// abnormal-closure error, not io.EOF (the documented clean-close signal).
+// RFC 6455 §7.1.5 assigns 1006 to transport loss, so the two must stay
+// distinguishable.
+func TestAbruptEOFIsAbnormalClosure(t *testing.T) {
+	t.Parallel()
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	raw := newRawConn(clientConn, clientConn, true, 1<<20, 0, 0)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = serverConn.Close()
+	}()
+	_, err := raw.ReadEvent()
+	if err == nil {
+		t.Fatal("ReadEvent returned no error on transport loss")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("abrupt transport EOF matches io.EOF (%v): the documented clean-close "+
+			"check cannot distinguish transport loss from a normal close", err)
+	}
+	// Contrast: a normal close frame IS the clean close.
+	sess := newTestConn([]byte{0x88, 0x02, 0x03, 0xe8}, true) // close 1000
+	_, _, cleanErr := sess.ReadMessage()
+	if !errors.Is(cleanErr, io.EOF) {
+		t.Fatalf("normal close frame should read as io.EOF, got %v", cleanErr)
+	}
+}
+
+// writeDeadlineProbe records the most recent write deadline the transport
+// was asked to set, so a test can observe whether a write cleared it.
+type writeDeadlineProbe struct {
+	net.Conn
+
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (w *writeDeadlineProbe) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	w.last = t
+	w.mu.Unlock()
+
+	return w.Conn.SetWriteDeadline(t)
+}
+
+func (w *writeDeadlineProbe) lastWriteDeadline() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.last
+}
+
+// TestWritePreservesApplicationDeadline: with the library write timeout
+// disabled (0), an application-set write deadline must survive a successful
+// message write, not be cleared to the zero time.
+func TestWritePreservesApplicationDeadline(t *testing.T) {
+	t.Parallel()
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	probe := &writeDeadlineProbe{Conn: clientConn}
+	raw := newRawConn(probe, clientConn, true, 1<<20, 0, 0)
+	appDeadline := time.Now().Add(10 * time.Second)
+	deadlineErr := raw.SetWriteDeadline(appDeadline)
+	if deadlineErr != nil {
+		t.Fatalf("SetWriteDeadline: %v", deadlineErr)
+	}
+	go func() {
+		buf := make([]byte, 32)
+		_, _ = io.ReadFull(serverConn, buf)
+	}()
+	writeErr := raw.WriteMessage(OpBinary, []byte("hello"))
+	if writeErr != nil {
+		t.Fatalf("write: %v", writeErr)
+	}
+	if last := probe.lastWriteDeadline(); !last.Equal(appDeadline) {
+		t.Fatalf("write deadline after a successful write = %v, want the preserved %v: "+
+			"the write cleared an application-managed deadline", last, appDeadline)
+	}
+}

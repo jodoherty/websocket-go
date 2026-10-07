@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestAuditLoopExitNotProvenByBodyCount: the audit fixture
+// TestLoopExitNotProvenByBodyCount: this fixture
 //
 //	func Loop(v bool) {
 //		for v {
@@ -18,10 +18,10 @@ import (
 //
 // is called only with Loop(true): the loop condition never evaluates false
 // and the body exits via return. Body execution therefore does not prove
-// the for-exit outcome, yet the tool currently reports it covered (2/2 =
+// the for-exit outcome, yet a naive counter reports it covered (2/2 =
 // 100%). This test reproduces that false positive against a REAL count
 // profile and asserts the tool does not claim every outcome proven.
-func TestAuditLoopExitNotProvenByBodyCount(t *testing.T) {
+func TestLoopExitNotProvenByBodyCount(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) {
 		err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)

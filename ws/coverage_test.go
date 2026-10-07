@@ -17,6 +17,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -650,4 +652,89 @@ func TestNonPositiveMessageSizeFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read with WithMaxMessageSize(0): %v, want the default limit in effect", err)
 	}
+}
+
+// trackedListener wraps a listener so a test can track every accepted
+// connection and whether it was closed.
+type trackedListener struct {
+	net.Listener
+
+	mu    sync.Mutex
+	conns []*closingConn
+}
+
+func (l *trackedListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	tc := &closingConn{Conn: conn}
+	l.mu.Lock()
+	l.conns = append(l.conns, tc)
+	l.mu.Unlock()
+
+	return tc, nil
+}
+
+func (l *trackedListener) allClosed(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		l.mu.Lock()
+		n, closed := len(l.conns), true
+		for _, c := range l.conns {
+			if !c.closed.Load() {
+				closed = false
+			}
+		}
+		l.mu.Unlock()
+		if n > 0 && closed {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return false
+}
+
+type closingConn struct {
+	net.Conn
+
+	closed atomic.Bool
+}
+
+func (c *closingConn) Close() error {
+	c.closed.Store(true)
+
+	return c.Conn.Close()
+}
+
+// TestHandlerPanicClosesConnection: a panic in the application callback must
+// still tear the upgraded connection down; net/http's recovery path
+// deliberately skips hijacked connections, so without deferred teardown the
+// transport leaks.
+func TestHandlerPanicClosesConnection(t *testing.T) {
+	run := func(t *testing.T, h http.Handler, name string) {
+		t.Helper()
+		ts := httptest.NewUnstartedServer(h)
+		tracked := &trackedListener{Listener: ts.Listener}
+		ts.Listener = tracked
+		ts.Start()
+		defer ts.Close()
+
+		s, err := ws.Dial(context.Background(), "ws://"+strings.TrimPrefix(ts.URL, "http://"))
+		if err != nil {
+			t.Fatalf("%s: Dial: %v", name, err)
+		}
+		defer s.Close(ws.StatusNormalClosure, "")
+		t.Logf("%s: handler panicked (recovered by net/http; the log dump is expected)", name)
+		if !tracked.allClosed(2 * time.Second) {
+			t.Fatalf("%s: the hijacked transport was never closed after the handler panicked: connection leaked", name)
+		}
+	}
+	t.Run("Handle", func(t *testing.T) {
+		run(t, ws.NewUpgrader().Handle(func(*http.Request, *ws.Session) error { panic("boom") }), "Handle")
+	})
+	t.Run("HandleRaw", func(t *testing.T) {
+		run(t, ws.NewUpgrader().HandleRaw(func(*http.Request, *ws.RawConn) error { panic("boom") }), "HandleRaw")
+	})
 }

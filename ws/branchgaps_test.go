@@ -378,3 +378,73 @@ func TestSanitizeLimits(t *testing.T) {
 			up.maxMessageSize, up.idleTimeout, up.writeTimeout)
 	}
 }
+
+// TestWriteRejectsDataStartDuringFragment: while a fragmented message is in
+// progress, a new data message must not be started (RFC 6455 §5.4) — not via
+// WriteFrame and not via WriteMessage. Continuations and control frames
+// remain legal mid-fragment.
+func TestWriteRejectsDataStartDuringFragment(t *testing.T) {
+	t.Parallel()
+	raw := newTestRawConn(nil, true)
+	startErr := raw.WriteFrame(OpBinary, []byte("start"), true)
+	if startErr != nil {
+		t.Fatalf("fragment start: %v", startErr)
+	}
+	newFrameErr := raw.WriteFrame(OpBinary, []byte("new"), false)
+	if newFrameErr == nil {
+		t.Error("WriteFrame started a new data message while another was mid-fragment")
+	}
+	newMsgErr := raw.WriteMessage(OpBinary, []byte("new"))
+	if newMsgErr == nil {
+		t.Error("WriteMessage started a new data message while another was mid-fragment")
+	}
+	// Control traffic stays legal mid-fragment (RFC 6455 §5.5).
+	pingErr := raw.Ping(nil)
+	if pingErr != nil {
+		t.Errorf("ping mid-fragment must stay legal: %v", pingErr)
+	}
+	// Finishing the fragment re-opens normal writes.
+	fresh := newTestRawConn(nil, true)
+	freshStartErr := fresh.WriteFrame(OpBinary, []byte("start"), true)
+	if freshStartErr != nil {
+		t.Fatalf("fragment start (fresh): %v", freshStartErr)
+	}
+	contErr := fresh.WriteFrame(OpContinuation, []byte("end"), false)
+	if contErr != nil {
+		t.Fatalf("continuation: %v", contErr)
+	}
+	nextErr := fresh.WriteMessage(OpBinary, []byte("next"))
+	if nextErr != nil {
+		t.Errorf("write after the fragment completed: %v", nextErr)
+	}
+}
+
+// TestReadFrameRejectsNonminimalLength: RFC 6455 §5.2 requires the smallest
+// length encoding. The 16-bit form below 126 and the 64-bit form below 65536
+// must be rejected; the canonical boundary forms stay accepted.
+func TestReadFrameRejectsNonminimalLength(t *testing.T) {
+	t.Parallel()
+	// One-byte payload in the 16-bit form: must be rejected.
+	c := newTestCodec([]byte{0x82, 0x7e, 0x00, 0x01, 0x58}, true)
+	_, frame16Err := c.readFrame()
+	if frame16Err == nil {
+		t.Error("16-bit length form for a 1-byte payload accepted; want protocol rejection")
+	}
+	// One-byte payload in the 64-bit form: must be rejected.
+	c = newTestCodec([]byte{0x82, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x58}, true)
+	_, frame64Err := c.readFrame()
+	if frame64Err == nil {
+		t.Error("64-bit length form for a 1-byte payload accepted; want protocol rejection")
+	}
+	// Boundary: exactly 126 bytes must use the 16-bit form and is legal.
+	payload := make([]byte, 126)
+	for i := range payload {
+		payload[i] = 0xa5
+	}
+	wire := append([]byte{0x82, 0x7e, 0x00, 0x7e}, payload...)
+	c = newTestCodec(wire, true)
+	f, err := c.readFrame()
+	if err != nil || len(f.payload) != 126 {
+		t.Fatalf("canonical 16-bit form for 126 bytes: (%+v, %v), want the 126-byte payload", f, err)
+	}
+}

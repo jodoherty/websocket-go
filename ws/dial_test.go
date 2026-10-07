@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 )
 
 // TestWithDialerOption pins the option's plumbing: the dial function lands
@@ -161,5 +162,50 @@ func TestDialDefaultWSS(t *testing.T) {
 	var uae x509.UnknownAuthorityError
 	if !errors.As(err, &uae) {
 		t.Fatalf("default wss dial error = %v; want *x509.UnknownAuthorityError (reached cert verification)", err)
+	}
+}
+
+// containsCRLFCRLF reports whether buf contains the end of an HTTP head.
+func containsCRLFCRLF(buf []byte) bool {
+	for i := 0; i+3 < len(buf); i++ {
+		if buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n' {
+			return true
+		}
+	}
+
+	return false
+}
+
+// TestDialCancellationInterruptsHandshake: cancelling the establishment
+// context while the 101 response is pending must unblock Dial; it may not
+// wait for the (deadline-free) transport to die on its own.
+func TestDialCancellationInterruptsHandshake(t *testing.T) {
+	t.Parallel()
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := Dial(ctx, "ws://cancel.example.local/ws", WithDialer(
+			func(context.Context, *url.URL) (net.Conn, error) { return clientConn, nil }))
+		done <- err
+	}()
+	// Wait for the request to arrive at the peer.
+	buf := make([]byte, 4096)
+	for !containsCRLFCRLF(buf) {
+		n, err := serverConn.Read(buf)
+		if err != nil {
+			t.Fatalf("peer read of the handshake request: %v", err)
+		}
+		if n == 0 {
+			t.Fatal("peer read returned zero")
+		}
+		buf = buf[:n]
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dial did not return within 2s of context cancellation while the response was pending")
 	}
 }
