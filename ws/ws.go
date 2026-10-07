@@ -2437,8 +2437,18 @@ func (c *RawConn) ReadEvent() (Event, error) {
 
 			return Event{Op: OpClose, Code: code, Reason: reason}, nil
 		case OpText, OpBinary, OpContinuation:
-			msgOp, payload, complete, dataErr := c.readData(frm)
+			msgOp, payload, complete, closeCode, dataErr := c.readData(frm)
 			if dataErr != nil {
+				// A protocol violation the peer can still receive a Close frame
+				// for (the 7.1.7 SHOULD): answer with the code readData
+				// reports. A decompression failure (code 0) owes no Close frame
+				// here and is reported directly.
+				if closeCode != 0 {
+					what := strings.TrimPrefix(dataErr.Error(), errProtocol.Error()+": ")
+
+					return Event{}, c.failWith(closeCode, what)
+				}
+
 				return Event{}, c.finish(dataErr)
 			}
 			if !complete {
@@ -2502,22 +2512,33 @@ func (c *RawConn) readNextFrame() (frame, error) {
 
 // readData assembles one data message from a frame and, when the message is
 // compressed, expands it. It returns the message opcode and payload; complete
-// reports whether a possibly fragmented message has ended. A decompression
-// failure (a corrupt or oversized payload) is returned as the error.
-func (c *RawConn) readData(frm frame) (Op, []byte, bool, error) {
+// reports whether a possibly fragmented message has ended. On a protocol
+// failure it also returns the close code the peer should be told (the 7.1.7
+// SHOULD): 1002 for a message-level violation, 1007 for a non-UTF-8 text
+// message, and 0 when no Close frame is owed (a decompression failure, which
+// the caller reports directly).
+func (c *RawConn) readData(frm frame) (Op, []byte, bool, int, error) {
 	msgOp, payload, complete, compressed, msgErr := c.handleData(frm)
 	if msgErr != nil {
-		return 0, nil, false, msgErr
+		// A message-level protocol violation (a continuation without a start,
+		// a data frame mid-fragment, a cross-frame overflow): the peer is
+		// still the sender and can receive a Close frame, so the 7.1.7
+		// SHOULD applies — answer with 1002, uniform with the frame-level
+		// violations the read loop already answers.
+		return 0, nil, false, StatusProtocolError, msgErr
 	}
 	if !complete {
-		return 0, nil, false, nil
+		return 0, nil, false, 0, nil
 	}
 	out := payload
 	if compressed {
 		c.fragCompressed = false
 		expanded, err := c.decompress(payload)
 		if err != nil {
-			return 0, nil, false, err
+			// A decompression failure fails the connection but owes the peer
+			// no Close frame here (out of scope for the 7.1.7 reassembly
+			// contract): the caller reports the error directly (code 0).
+			return 0, nil, false, 0, err
 		}
 
 		out = expanded
@@ -2525,14 +2546,11 @@ func (c *RawConn) readData(frm frame) (Op, []byte, bool, error) {
 	if msgOp == OpText && !utf8.Valid(out) {
 		// RFC 6455 §5.6: a peer MUST close on a non-UTF-8 text frame; 1007
 		// is the close the browser implementations assign to exactly this.
-		// Close records the error, so the finish in the read loop reports
-		// it.
-		_ = c.Close(StatusInvalidDataType, "text message is not valid UTF-8")
-
-		return 0, nil, false, fmt.Errorf("%w: text message is not valid UTF-8", errProtocol)
+		return 0, nil, false, StatusInvalidDataType,
+			fmt.Errorf("%w: text message is not valid UTF-8", errProtocol)
 	}
 
-	return msgOp, out, true, nil
+	return msgOp, out, true, 0, nil
 }
 
 // handleData processes one data or continuation frame. It returns complete
@@ -2549,9 +2567,11 @@ func (c *RawConn) handleData(frm frame) (Op, []byte, bool, bool, error) {
 			return 0, nil, false, false, fmt.Errorf("%w: continuation frame without start", errProtocol)
 		}
 		if int64(len(c.fragBuf)+len(frm.payload)) > c.fc.maxMsg {
+			total := len(c.fragBuf) + len(frm.payload)
 			c.inFrag, c.fragBuf, c.fragCompressed = false, nil, false
 
-			return 0, nil, false, false, fmt.Errorf("%w: %w", errProtocol, errMessageTooBig)
+			return 0, nil, false, false, fmt.Errorf(
+				"%w: message of %d bytes exceeds the %d byte limit", errProtocol, total, c.fc.maxMsg)
 		}
 		c.fragBuf = append(c.fragBuf, frm.payload...)
 		if !frm.fin {
@@ -2742,12 +2762,21 @@ func truncateReason(reason string) string {
 
 // failProtocol tears the connection down with 1002 (protocol error) and
 // returns the violation for ReadMessage to report.
-func (c *RawConn) failProtocol(what string) error {
+// failWith answers a protocol error with a Close frame carrying the given
+// status code and fails the connection; it returns the terminal error
+// recorded on the connection. This is the RFC 6455 7.1.7 SHOULD: an endpoint
+// failing the connection SHOULD send a Close frame with an appropriate status
+// code before proceeding to Close the connection. failProtocol is failWith
+// with 1002, the code the SHOULD carries for a protocol violation that is not
+// the invalid-data-type 1007.
+func (c *RawConn) failWith(code int, what string) error {
 	err := fmt.Errorf("%w: %s", errProtocol, what)
-	_ = c.Close(StatusProtocolError, what)
+	_ = c.Close(code, what)
 
 	return c.finish(err)
 }
+
+func (c *RawConn) failProtocol(what string) error { return c.failWith(StatusProtocolError, what) }
 
 // opcodeName is the human-readable name of an opcode for error messages.
 func opcodeName(opcode Op) string {

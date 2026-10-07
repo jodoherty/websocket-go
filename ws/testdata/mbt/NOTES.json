@@ -1,8 +1,1 @@
-[
-  {
-    "id": "MAY:close-frame-omitted",
-    "rfc": "RFC 6455 7.1.7",
-    "accepted": true,
-    "reason": "Message-level protocol violations (continuation without start, a data frame while a fragment is in progress, a cross-frame size overflow) corrupt the receiver's message state, so the peer is unlikely to receive and process a Close frame; the RFC MAY omits it. To eliminate this divergence, ws.go would send the SHOULD 1002 close frame on these violations, uniform with header-level violations (which already send it)."
-  }
-]
+[]

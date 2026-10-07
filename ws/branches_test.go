@@ -235,8 +235,13 @@ func TestReadMessageControlAndFragmentBranches(t *testing.T) {
 		fc := &fakeConn{data: []byte{0x01, 0x02, 'a', 'b', 0x80, 0x02, 'c', 'd'}}
 		c := newSession(newRawConn(fc, fc, true, 3, 0, 0), nil) // maxMsg 3 < 2+2 total
 		_, _, err := c.ReadMessage()
-		if err == nil || !errors.Is(err, errMessageTooBig) {
-			t.Fatalf("err = %v, want errMessageTooBig", err)
+		var ce *CloseError
+		if err == nil || !errors.As(err, &ce) || ce.Code != StatusProtocolError {
+			t.Fatalf("err = %v, want CloseError 1002", err)
+		}
+		// The peer must see a 1002 close frame, not a bare TCP close (7.1.7).
+		if len(fc.written) < 2 || fc.written[0] != 0x88 || fc.written[1]&0x80 == 0 {
+			t.Fatalf("no masked 1002 close frame on the wire: % x", fc.written)
 		}
 	})
 }

@@ -116,10 +116,12 @@ is always asserted hard. Only the SHOULD/MAY layer produces warnings.
 Warnings are aggregated by a **stable ID** (one ID per root cause, so a
 single code change clears every trace that shares it), checked against
 `ws/testdata/mbt/NOTES.json` (the allowlist of *accepted* divergences, each
-with its RFC basis and reason), and reported as one countable line:
+with its RFC basis and reason), and reported as one countable line
+(`make mbt-report`). The suite is currently fully conformant to the SHOULD
+layer:
 
 ```
-MBT-WARNINGS: 28 total, 1 distinct: MAY:close-frame-omitted x28
+MBT-WARNINGS: 0 (fully conformant to the SHOULD layer)
 ```
 
 The gate is self-enforcing in both directions:
@@ -133,7 +135,9 @@ To **eliminate** a warning: fix the implementation so it takes the SHOULD
 outcome (the count drops), then remove the now-stale `NOTES.json` entry (the
 build fails until you do, which is the pressure to keep the ledger minimal).
 The goal is a ledger that shrinks to empty as the implementation converges
-on the SHOULDs.
+on the SHOULDs — and it is there: the one divergence this layer found
+(message-level violations omitting the §7.1.7 SHOULD close frame) is gone,
+because `ws.go` now sends the 1002 frame on those violations too.
 
 ## Properties
 
@@ -172,23 +176,20 @@ correct.
 
 ## Behaviors the model pins (and why they matter)
 
-These are behaviors that differ from a naive "every violation → 1002 close
-frame" assumption, and that the traces now pin explicitly:
+These are behaviors the traces pin explicitly — the close-frame policy for
+each violation class, the size limit that applies to close frames too, and
+the per-fragment UTF-8 rule:
 
-1. **Message-level violations omit the SHOULD close frame (a tracked MAY).**
-   Continuation-without-start, data-frame-while-in-fragment, and
-   cross-frame-size-overflow corrupt the receiver's message state, so the
-   implementation answers them by tearing the connection down with **no**
-   close frame (a bare protocol error, not a `*CloseError`). Header
+1. **Every protocol violation sends the SHOULD close frame.** Header
    violations (masking, RSV, non-minimal length, control size, single-frame
-   size), close-code violations, and UTF-8 violations *do* write the close
-   frame (1002 / 1007), meeting the §7.1.7 SHOULD. Per the conformance
-   layer above, the message-level omissions are the MAY that §7.1.7
-   permits, so they are **counted as the `MAY:close-frame-omitted` warning
-   and accepted in `NOTES.json`** rather than hard-failing. The goal is to
-   eliminate it — send the SHOULD 1002 frame on these too (uniform with
-   header-level) — which drops the count to zero and lets the `NOTES.json`
-   entry be removed.
+   size) and close-code violations answer with 1002; UTF-8 violations answer
+   with 1007; and message-level violations (continuation-without-start,
+   data-frame-while-in-fragment, cross-frame-size-overflow) also answer with
+   1002, uniform with the rest — meeting the §7.1.7 SHOULD in every case.
+   The model still records the §7.1.7 MAY (omit the frame on a
+   state-corrupting error) as a permitted alternative, so the suite would
+   warn if the implementation ever regressed to a bare teardown; today it
+   takes the SHOULD everywhere, so the warning ledger is empty.
 2. **`maxMessageSize` bounds every frame, including close frames.** The
    frame codec rejects any frame whose payload exceeds the limit, so a
    close frame with a reason larger than the limit is rejected with 1002.

@@ -28,7 +28,7 @@
       {
         "id": "MAY:close-frame-omitted",
         "mod": "may",
-        "note": "RFC 6455 7.1.7 MAY: omit the Close frame; expected when the error corrupts message state, so the peer is unlikely to receive and process it. To eliminate: send the SHOULD 1002 close frame on message-level violations, uniform with header-level ones.",
+        "note": "RFC 6455 7.1.7 MAY: omit the Close frame when the error corrupts message state (the peer is unlikely to receive and process it). The implementation sends the SHOULD 1002 frame on these violations instead, uniform with header-level; a regression to a bare teardown would warn under this ID.",
         "term": "proto",
         "wire": {
           "kind": "none"

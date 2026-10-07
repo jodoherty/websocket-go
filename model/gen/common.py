@@ -397,15 +397,18 @@ def term_code(code):
 
 # --- Conformance assertions (the MUST / SHOULD / MAY layer) -----------------
 
-# The single assessable warning the pilot emits: the RFC 6455 7.1.7 SHOULD
-# close frame was not sent. One ID groups every trace that invokes the MAY,
-# so eliminating it (sending the frame in ws.go) clears them all at once.
+# The assessable warning the pilot tracks: a protocol violation where the RFC
+# 6455 7.1.7 SHOULD Close frame was not sent (the impl invoked the MAY and
+# tore the connection down bare). One ID groups every trace that would fire
+# it, so a regression back to a bare teardown is a single countable, assessable
+# signal. ws.go now sends the 1002 frame on every protocol violation, so it
+# does not fire today.
 MAY_OMIT_ID = "MAY:close-frame-omitted"
-MAY_OMIT_NOTE = ("RFC 6455 7.1.7 MAY: omit the Close frame; expected when the "
-                 "error corrupts message state, so the peer is unlikely to "
-                 "receive and process it. To eliminate: send the SHOULD 1002 "
-                 "close frame on message-level violations, uniform with "
-                 "header-level ones.")
+MAY_OMIT_NOTE = ("RFC 6455 7.1.7 MAY: omit the Close frame when the error "
+                 "corrupts message state (the peer is unlikely to receive and "
+                 "process it). The implementation sends the SHOULD 1002 frame "
+                 "on these violations instead, uniform with header-level; a "
+                 "regression to a bare teardown would warn under this ID.")
 SHOULD_NOTE = ("RFC 6455 7.1.7 SHOULD: send a Close frame with an "
                "appropriate status code before closing the connection")
 
