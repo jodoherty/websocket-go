@@ -7,12 +7,16 @@ See [ws/ws.go](ws/ws.go) for the full implementation.
 
 I wanted something that has no dependencies outside the standard library and
 that was thoroughly tested. As such, most of this repository is actually test
-code and supporting documentation. It implements custom branch coverage and
-MCDC coverage tooling, and it tests end to end compatibility with Node.js,
-Chromium, and Firefox.
+code and supporting documentation.
+
+The test coverage includes custom branch and MCDC coverage tooling. End to end
+compatibility testing is done with Node.js, Chromium, and Firefox websocket
+implementations. Finally, model based testing is done based on an RFC-derived
+formal model of the WebSocket protocol states.
 
 I've set the project up with fairly strict linting and staticcheck rules to
-make it easier to add to any existing project.
+make it easier to add to any existing project by dropping in the implementation
+file.
 
 Because this is agentically generated, I've provided it as free and
 unencumbered software released into the public domain under the UNLICENSE
