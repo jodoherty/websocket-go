@@ -11,8 +11,9 @@ code and supporting documentation.
 
 The test coverage includes custom branch and MCDC coverage tooling. End to end
 compatibility testing is done with Node.js, Chromium, and Firefox websocket
-implementations. Finally, model based testing is done based on an RFC-derived
-formal model of the WebSocket protocol states.
+implementations. Mutation tests and fuzzing stochastically discover more
+robustness edge cases. Finally, model based testing is done based on an
+RFC-derived formal model of the WebSocket protocol states.
 
 I've set the project up with fairly strict linting and staticcheck rules to
 make it easier to add to any existing project by dropping in the implementation
