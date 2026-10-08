@@ -1,7 +1,7 @@
 GOLANGCI ?= golangci-lint
 MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc model model-image mbt-gen mbt-report close-model close-mbt-gen close-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -76,12 +76,25 @@ mcdc:
 # frame-reassembly machine is transformed into a formal model (model/gen/
 # common.py), encoded independently in nuXmv (gen_model.py), and its
 # transitions drive a set of committed traces (ws/testdata/mbt/) replayed by
-# ws/mbt_test.go. `model` is pure Python (no container): it checks the
-# model's self-consistency (P1 wire close-code legitimacy, P2 terminal
-# absorbing, table completeness, encoding round-trip) and that every
-# committed trace is a faithful artifact of the model. The Go test runs in
-# the normal suite (`make test`); only regeneration needs the container.
-model:
+# ws/mbt_test.go.
+#
+# The shared UTF-8 boundary machine (model/gen/utf8bound.py, RFC 3629 per
+# doc/rfc3629.txt): the exact Section 3/4 state machine over fragment
+# boundaries that both the frame-reassembly machine and the RSV1 /
+# compressed-message machine track their accumulations through. Pure Python;
+# B1-B7 self-consistency (totality, BROKEN absorption, agreement with the
+# documented acceptance sets, the hazard corpus, composition, edge coverage,
+# decoder cross-check).
+utf8-model:
+	python3 model/gen/check_utf8props.py
+
+# The reassembly model's self-consistency (P1 wire close-code legitimacy,
+# P2 terminal absorbing, table completeness, encoding round-trip) and that
+# every committed trace is a faithful artifact of the model. Pure Python (no
+# container); runs the shared boundary machine first (model depends on
+# utf8-model). The Go trace replay runs in the normal suite (`make test`);
+# only regeneration needs the container.
+model: utf8-model
 	python3 model/gen/check_props.py
 	python3 model/gen/check_traces.py
 
