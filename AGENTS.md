@@ -165,7 +165,7 @@ ws/ws.go            the entire library in one file — copy it into an
                     existing project (package ws, stdlib only). Organized
                     in numbered sections, reading-ordered (high-level API
                     first, internals after), with a file map in the
-                    file map in the package doc.
+                    package doc.
 ws/ws_test.go       unit tests: echo, close codes, keepalive, masking,
                     origin policy, bearer auth, upgrade validation
 ws/vectors_test.go  RFC 6455 test vectors (§1.3 accept key, §5.7 frames)
@@ -230,6 +230,23 @@ ws/utf8_test.go      RFC 6455 §5.6 UTF-8 enforcement on text frames: read
                     and write paths, fragmented messages, the MC/DC pair
 ws/writehelpers_test.go WriteText/WriteBinary/WriteJSON wire format and
                     WriteJSON marshal failure
+ws/extendedconnect_test.go the extended-CONNECT branch of Upgrade at the
+                    unit level: :protocol routing, version-only validation
+                    (the handshake key is optional and ignored),
+                    subprotocol/extension negotiation, origin policy, the
+                    full-duplex requirement, the 501 deadline gate and its
+                    waiver, and the SessionOnStream surface (net.Pipe, the
+                    DeadlineStream adaptation, the deadline refusal)
+ws/handshake_header_limit_test.go the bounded client handshake-response head
+                    read (the header-flood defense): a normal response
+                    returned whole with the reader left at the first frame,
+                    an over-limit header set rejected, an over-long single
+                    line rejected, a truncated set rejected
+ws/allocbudget_{race,norace}_test.go build-tag split reporting whether the
+                    race detector is on: the flate decompression allocation
+                    budget (deflate_test.go) is pinned only on the non-race
+                    run, because the race instrumentation inflates the
+                    flate reader's per-message allocation count
 ws/examples_test.go executable documentation: Example functions, compiled
                     and run on every go test with pinned output; also
                     integration tests of Handle, Upgrade, Dial, CloseCode
@@ -275,6 +292,9 @@ doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions
 doc/rfc6455.txt   the RFC 6455 reference
 doc/rfc7692.txt   the RFC 7692 reference (permessage-deflate)
+doc/rfc8307.txt   the RFC 8307 reference (QUIC)
+doc/rfc8441.txt   the RFC 8441 reference (HTTP/2 extended CONNECT)
+doc/rfc9220.txt   the RFC 9220 reference (HTTP/3 extended CONNECT)
 doc/COMPRESSION.md permessage-deflate design + interop evidence
 doc/STATES.md     the frame-reassembly state machine: the RFC 6455
                     transformation, the properties (P1/P2/completeness), trace
@@ -319,8 +339,14 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                 gen/check_closeprops.py close-model self-consistency (P1-P6)
                 gen/check_closetraces.py close-trace <-> model consistency
 e2e/            e2e suites:
-                ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
-                                 binary, bearer accept/reject, mTLS rejection, close codes
+                tests/ws.spec.ts   Playwright, Firefox + Chromium: echo, subprotocols,
+                                 binary, bearer accept/reject, mTLS rejection,
+                                 compression negotiation, close codes
+                global-setup.ts    builds the demo, binds it on ephemeral ports,
+                                 and records the base URL the browser suite dials
+                playwright.config.ts the browser-suite config (chromium + firefox
+                                 projects, self-signed-cert tolerance, and the
+                                 globalSetup above)
                 e2e_test.go      Go: mTLS positive path, and cross-implementation
                                  interop both directions (Node ws client -> Go server,
                                  Go client -> Node ws server)

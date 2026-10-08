@@ -9,7 +9,7 @@ held to the strictest standard lint, and held *repeatably*:
 ```sh
 make lint        # golangci-lint with every linter enabled
 make staticcheck # staticcheck -checks=all (a second, independent engine)
-make all         # lint + staticcheck + tests, the full gate
+make gate        # the full validation gate: every target, including e2e
 ```
 
 `lint` runs `golangci-lint` with `default: all` — every linter in the
