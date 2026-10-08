@@ -259,9 +259,11 @@ for {
 }
 _ = c.Close()
 
-// The writer: say goodbye, then take the transport down.
+// The writer: say goodbye, run the read side to its terminal, then take
+// the transport down.
 _ = c.WriteMessage(ws.OpText, []byte("last word"))
 _ = c.Shutdown(ws.StatusGoingAway, "leaving")
+_ = c.Drain()                 // consumes the traffic, reports the close code
 _ = c.Close()
 ```
 
@@ -279,10 +281,21 @@ no close frame goes out, and the peer resolves the connection to 1006 — which 
 what a bare `defer c.Close()` cleanup does when the application never said
 goodbye.
 
-There is deliberately no method that *waits* for the closing handshake. Only
-reading can finish it, and reading belongs to the pumping goroutine; a blocking
-`Close` would deadlock the moment a handler closed from its own goroutine, which
-is the common case.
+`Drain` is §7.1.1's middle step — the *recv() until 0* — as one call: it runs
+the read side to its terminal, discards the traffic on the way, and returns the
+terminal (`io.EOF` for a clean end, `*CloseError` carrying the peer's code
+otherwise). It is the writer's half's tool: after `Shutdown` it is the only way
+to learn the connection's close code without running the message loop. Like
+any read it belongs to the pumping goroutine — never run it concurrently with
+the read loop — and its wait is the read wait: bounded by the keepalive window
+when one is set, by the transport otherwise (bound it with `SetReadDeadline`
+before calling). On a session, pings are answered automatically while it runs,
+exactly as `ReadMessage` answers them.
+
+There is deliberately no method that *waits* for the closing handshake
+without reading — only reading can finish it, and a blocking `Close` would
+deadlock the moment a handler closed from its own goroutine, which is the
+common case.
 
 ### Teardown is bounded, not instant
 
@@ -389,6 +402,8 @@ Session.WriteJSON(v any) error                    // marshal (off-lock) then OpT
 Session.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
 Session.Shutdown(code int, reason string) error   // start the closing handshake: send the close frame, stop
                                                   // sending, keep reading; returns the write status
+Session.Drain() error                             // the read side to its terminal as one call: discards the
+                                                  // traffic, returns the terminal (io.EOF or *CloseError)
 Session.Close() error                             // close the transport; never blocks, never writes
 Session.ID() / Subprotocol() / RemoteAddr() / LocalAddr()
 Session.Compressed() bool     // whether permessage-deflate was negotiated on this connection
@@ -412,13 +427,15 @@ RawConn.Pong(payload []byte) error   // the answer to a received ping (≤125 B)
 RawConn.WriteMessage / WriteText / WriteBinary / WriteJSON / Ping / Closed
 RawConn.Shutdown(code int, reason string) error   // start the closing handshake (§7.1.2); returns the
                                                   // close-frame write status; transport stays up
+RawConn.Drain() error                             // the read side to its terminal as one call: discards
+                                                  // the events, returns the terminal (io.EOF or *CloseError)
 RawConn.Close() error                             // close the transport (§7.1.1); abrupt if no Shutdown
 RawConn.ID() / Subprotocol() / RemoteAddr() / LocalAddr() / Compressed()
 
 // Sentinels
 type Op int  // OpContinuation, OpText, OpBinary, OpClose, OpPing, OpPong
 var ErrClosed  // returned by WriteMessage after a normal closure (1000)
-io.EOF       // returned by ReadMessage and Close for a clean end
+io.EOF       // returned by ReadMessage, ReadEvent, and Drain for a clean end
 
 // Client
 func Dial(ctx context.Context, url string, opts ...Option) (*Session, error)   // the session view

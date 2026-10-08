@@ -74,17 +74,12 @@ func stressIters(t *testing.T) int {
 }
 
 // sayGoodbyeRead runs the full RFC 6455 §7.1.1 close on a session: shut the
-// write side, drain the reads until the peer's answer resolves the handshake
-// (that read is what records the close code, §7.1.5), then take the transport
-// down. Use it when a test needs the recorded close code to be the peer's.
+// write side, run the read side to its terminal with Drain (that read is
+// what records the close code, §7.1.5), then take the transport down. Use
+// it when a test needs the recorded close code to be the peer's.
 func sayGoodbyeRead(c *Session, code int, reason string) {
 	_ = c.Shutdown(code, reason)
-	for {
-		_, _, err := c.ReadMessage()
-		if err != nil {
-			break
-		}
-	}
+	_ = c.Drain()
 	_ = c.Close()
 }
 
@@ -526,6 +521,33 @@ func TestRawConcurrentReadWriteClose(t *testing.T) {
 		case <-peerDone:
 		case <-time.After(5 * time.Second):
 			t.Fatalf("iteration %d: peer's read loop did not terminate", i)
+		}
+	}
+}
+
+// TestDrainRacesClose: Drain and Close racing on one connection must end in
+// a terminal, not a panic, a hang, or a torn state — the read side and the
+// transport teardown may observe each other in either order.
+func TestDrainRacesClose(t *testing.T) {
+	for i := range stressIters(t) {
+		s, c := pipeConnPair()
+		// All three race: the drain, the teardown, and the close-frame
+		// send (whose write blocks on the synchronous pipe until the
+		// drain reads it).
+		errs := make([]error, 3)
+		var wg sync.WaitGroup
+		wg.Go(func() { errs[0] = s.Drain() })
+		wg.Go(func() { errs[1] = c.Close() })
+		wg.Go(func() { errs[2] = c.Shutdown(StatusGoingAway, "bye") })
+		wg.Wait()
+		// The drain always ends in a terminal: the clean end, the
+		// recorded close, or the transport error when Close cut the pipe
+		// first.
+		if errs[0] == nil {
+			t.Fatalf("iteration %d: Drain = nil, want a terminal error", i)
+		}
+		if errs[1] != nil {
+			t.Fatalf("iteration %d: Close = %v, want nil", i, errs[1])
 		}
 	}
 }

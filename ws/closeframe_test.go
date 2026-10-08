@@ -295,3 +295,184 @@ func TestShutdownWireRaw(t *testing.T) {
 	sayGoodbye(client, StatusNormalClosure, "")
 	<-clientDone
 }
+
+// TestDrain pins [RawConn.Drain]: the read side run to its terminal as one
+// call — the middle step of RFC 6455 §7.1.1 (Shutdown, drain, Close) —
+// discarding the traffic on the way and reporting only the terminal, so the
+// writer's half of the connection learns the close code (§7.1.5) without
+// running the message loop.
+func TestDrain(t *testing.T) {
+	t.Parallel()
+
+	// pipe is a raw pair over net.Pipe — synchronous, so every write
+	// blocks until the other end reads and the draining side is always
+	// started before the initiator writes.
+	pipe := func() (peer, conn *RawConn) {
+		sr, cr := net.Pipe()
+
+		return newRawConn(sr, sr, false, 1<<20, 0, 0), newRawConn(cr, cr, true, 1<<20, 0, 0)
+	}
+
+	// drainPeer reads a raw peer to its terminal so the drained side's
+	// writes (the close echo) complete.
+	drainPeer := func(t *testing.T, peer *RawConn) <-chan struct{} {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				_, err := peer.ReadEvent()
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		return done
+	}
+
+	// startDrain runs conn.Drain and reports its terminal.
+	startDrain := func(conn *RawConn) <-chan error {
+		done := make(chan error, 1)
+		go func() { done <- conn.Drain() }()
+
+		return done
+	}
+
+	t.Run("learnsPeerCloseCode", func(t *testing.T) {
+		t.Parallel()
+		// The peer initiates with an application code; the writer's half
+		// drains instead of running the loop.
+		peer, conn := pipe()
+		drainDone := startDrain(conn)
+		_ = peer.Shutdown(4001, "app reason")
+		done := drainPeer(t, peer)
+		drainErr := <-drainDone
+		var ce *CloseError
+		if !errors.As(drainErr, &ce) {
+			t.Fatalf("Drain = %v, want a *CloseError", drainErr)
+		}
+		if ce.Code != 4001 || ce.Reason != "app reason" {
+			t.Fatalf("Drain close = %d %q, want 4001 %q", ce.Code, ce.Reason, "app reason")
+		}
+		<-done
+		_ = conn.Close()
+	})
+
+	t.Run("cleanEndIsEOF", func(t *testing.T) {
+		t.Parallel()
+		peer, conn := pipe()
+		drainDone := startDrain(conn)
+		_ = peer.Shutdown(StatusNormalClosure, "")
+		done := drainPeer(t, peer)
+		drainErr := <-drainDone
+		if !errors.Is(drainErr, io.EOF) {
+			t.Fatalf("Drain = %v, want io.EOF (clean end)", drainErr)
+		}
+		<-done
+		_ = conn.Close()
+	})
+
+	t.Run("discardsPingAndData", func(t *testing.T) {
+		t.Parallel()
+		// The peer pings, sends data, then closes. The drain consumes all
+		// of it: RawConn never pongs on the application's behalf, so the
+		// first thing the peer reads back must be the close echo, not a
+		// pong.
+		peer, conn := pipe()
+		first := make(chan Event, 1)
+		go func() {
+			_ = peer.Ping([]byte("hb"))
+			_ = peer.WriteMessage(OpText, []byte("late data"))
+			_ = peer.Shutdown(4002, "done")
+			for {
+				ev, err := peer.ReadEvent()
+				if err != nil {
+					return
+				}
+				select {
+				case first <- ev:
+				default:
+				}
+			}
+		}()
+		drainErr := conn.Drain()
+		var ce *CloseError
+		if !errors.As(drainErr, &ce) || ce.Code != 4002 {
+			t.Fatalf("Drain = %v, want close 4002", drainErr)
+		}
+		select {
+		case ev := <-first:
+			if ev.Op != OpClose || ev.Code != 4002 {
+				t.Fatalf("peer's first event back = %+v, want the close echo (no pong before it)", ev)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("peer never read the close echo back")
+		}
+		_ = conn.Close()
+	})
+
+	t.Run("alreadyTerminalFastFails", func(t *testing.T) {
+		t.Parallel()
+		// Read to the terminal first; a second Drain returns the recorded
+		// terminal at once, without touching the transport.
+		peer, conn := pipe()
+		firstDone := startDrain(conn)
+		_ = peer.Shutdown(StatusGoingAway, "gone")
+		done := drainPeer(t, peer)
+		first := <-firstDone
+		var ce *CloseError
+		if !errors.As(first, &ce) || ce.Code != StatusGoingAway {
+			t.Fatalf("first Drain = %v, want close 1001", first)
+		}
+		second := conn.Drain()
+		var again *CloseError
+		if !errors.As(second, &again) || again.Code != StatusGoingAway {
+			t.Fatalf("second Drain = %v, want the same recorded terminal", second)
+		}
+		<-done
+	})
+
+	t.Run("abruptCloseReportsCleanEnd", func(t *testing.T) {
+		t.Parallel()
+		// A Close without a Shutdown tears the transport down without a
+		// terminal error of its own: Drain reports a clean end, at once.
+		peer, conn := pipe()
+		closeErr := conn.Close()
+		if closeErr != nil {
+			t.Fatalf("Close = %v, want nil", closeErr)
+		}
+		drainErr := conn.Drain()
+		if !errors.Is(drainErr, io.EOF) {
+			t.Fatalf("Drain after abrupt Close = %v, want io.EOF", drainErr)
+		}
+		_ = peer.Close()
+	})
+}
+
+// TestSessionDrain is TestDrain on the session face: the same terminal
+// contract — the writer's half learns the peer's close code without running
+// the message loop.
+func TestSessionDrain(t *testing.T) {
+	t.Parallel()
+	server, client := pipeConnPair()
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- client.Drain() }()
+	_ = server.Shutdown(4003, "server says")
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			_, _, err := server.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	drainErr := <-drainDone
+	var ce *CloseError
+	if !errors.As(drainErr, &ce) || ce.Code != 4003 || ce.Reason != "server says" {
+		t.Fatalf("Drain = %v, want close 4003 %q", drainErr, "server says")
+	}
+	<-serverDone
+}

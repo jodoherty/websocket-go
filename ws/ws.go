@@ -123,10 +123,11 @@
 //     [Session.Close] — are safe to call from any goroutine; the same holds
 //     for the raw equivalents on [RawConn] (including [RawConn.WriteFrame]
 //     and [RawConn.Pong]).
-//  2. The read loop is not: [Session.ReadMessage] and [RawConn.ReadEvent]
-//     are owned by the single goroutine that pumps the connection, and the
-//     two are never mixed on one connection — read state is owned by that
-//     goroutine. Never call either from two goroutines.
+//  2. The read loop is not: [Session.ReadMessage], [RawConn.ReadEvent], and
+//     their drain forms ([Session.Drain], [RawConn.Drain]) are owned by the
+//     single goroutine that pumps the connection, and the two faces are
+//     never mixed on one connection — read state is owned by that
+//     goroutine. Never call two of them on one connection at once.
 //  3. Between sequential read calls in the same goroutine there are no
 //     visibility concerns: handler-local state modified in one iteration is
 //     plainly visible in the next.
@@ -272,7 +273,8 @@ import (
 // connection's idle timeout.
 //
 // A Session is tied to exactly one pumping goroutine: the goroutine that
-// calls [Session.ReadMessage]. Every other method is safe from any
+// calls [Session.ReadMessage] — or [Session.Drain], which runs that same
+// read side to its terminal. Every other method is safe from any
 // goroutine.
 //
 // The raw protocol view — every ping, every pong, every close event, and
@@ -381,8 +383,9 @@ func (s *Session) Ping(payload []byte) error { return s.raw.Ping(payload) }
 // blocks and never writes, so a connection that has been read to its terminal
 // is already down here and this is an idempotent no-op. To close politely,
 // send a close frame first with [Session.Shutdown] and let the read loop run
-// to its terminal; a bare Close is an abrupt close that the peer resolves to
-// 1006. It is safe to call from any goroutine.
+// to its terminal ([Session.Drain] runs that loop as one call); a bare Close
+// is an abrupt close that the peer resolves to 1006. It is safe to call from
+// any goroutine.
 func (s *Session) Close() error { return s.raw.Close() }
 
 // Shutdown starts the closing handshake the way RFC 6455 §7.1.2 defines it:
@@ -399,6 +402,34 @@ func (s *Session) Close() error { return s.raw.Close() }
 // idempotent, safe from any goroutine, and returns the status of the close-
 // frame write rather than how the connection ended.
 func (s *Session) Shutdown(code int, reason string) error { return s.raw.Shutdown(code, reason) }
+
+// Drain runs the session's read side to its terminal, consuming and
+// discarding every message and control frame, and returns the terminal
+// error: [io.EOF] for a clean end, a [*CloseError] otherwise — exactly what
+// [Session.ReadMessage] would have returned last. It is [RawConn.Drain] on
+// the session face: the read-side half of the closing sequence
+// ([Session.Shutdown], Drain, [Session.Close]) as one call, for the
+// writer's half of the connection, which wants the close to complete and its
+// code learned without running the message loop.
+//
+// Events are discarded on the way: pings are answered automatically, exactly
+// as [Session.ReadMessage] answers them, and data messages are not
+// delivered. The terminal is the only information retained, and it carries
+// the connection's close code (RFC 6455 §7.1.5).
+//
+// Like [Session.ReadMessage] it must only be called from the pumping
+// goroutine, and never concurrently with [Session.ReadMessage]. On a
+// connection that is already terminal it returns the recorded terminal at
+// once. The wait it performs is bounded the way [RawConn.Drain] documents
+// it: by the idle window when one is set, otherwise by the transport alone.
+func (s *Session) Drain() error {
+	for {
+		_, _, readErr := s.ReadMessage()
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
 
 // Closed reports whether the connection has been closed, exactly as
 // [RawConn.Closed].
@@ -2262,10 +2293,12 @@ var connSeq atomic.Uint64
 //
 // The close API is the RFC's own three-step example (§7.1.1) with one method
 // per step: [RawConn.Shutdown] sends this endpoint's Close frame and half-
-// closes the write side, [RawConn.ReadEvent] drained to its terminal is the
-// read side finishing, and [RawConn.Close] closes the transport. There is no
-// method that waits for the closing handshake, because the only thing that
-// can finish it is reading — and reading belongs to the pumping goroutine.
+// closes the write side, the read side finishing is [RawConn.ReadEvent] run
+// to its terminal — or [RawConn.Drain], which runs that loop and reports
+// the terminal — and [RawConn.Close] closes the transport. Nothing can wait
+// for the closing handshake without reading, because reading is what
+// finishes it and what learns the close code; the drain, like the loop,
+// belongs to the pumping goroutine.
 type RawConn struct {
 	nc transport
 	// deadlines is the channel's deadline enforcement, resolved once at
@@ -3295,8 +3328,9 @@ func (c *RawConn) sendCloseFrame(code int, reason string) error {
 // learned without reading, and §5.5.1 lets the peer keep sending data until it
 // has sent its own Close.
 //
-// So the idiomatic reader is: loop on [RawConn.ReadEvent] until it returns the
-// terminal error, then call [RawConn.Close]. The read loop ends by itself —
+// So the idiomatic reader is: run the read side to its terminal —
+// [RawConn.ReadEvent] in a loop, or [RawConn.Drain] as one call — then call
+// [RawConn.Close]. The read loop ends by itself —
 // when the peer's Close arrives the handshake is complete, §5.5.1 requires the
 // transport down, and the next read reports the terminal — so no explicit wait
 // on the closing handshake is needed anywhere.
@@ -3371,6 +3405,42 @@ func (c *RawConn) Close() error {
 	}
 
 	return nil
+}
+
+// Drain runs the read side to its terminal, consuming and discarding every
+// event, and returns the terminal error: [io.EOF] for a clean end, a
+// [*CloseError] otherwise. It is the read-side half of the RFC 6455 §7.1.1
+// closing sequence — [RawConn.Shutdown], Drain, [RawConn.Close] — as one
+// call, for the application that wants the connection ended and its close
+// code learned (the first Close frame received, §7.1.5) without running the
+// message loop: the writer's half of the connection.
+//
+// Events are discarded on the way: pings are consumed without a pong answer
+// (the connection is ending, and RawConn never pongs on the application's
+// behalf), and data messages are not delivered (RFC 6455 §5.5.1 does not
+// require a closing endpoint to keep processing data). The terminal is the
+// only information retained.
+//
+// Drain must only be called from the goroutine that pumps the connection —
+// it runs [RawConn.ReadEvent] — and never concurrently with
+// [RawConn.ReadEvent]. On a connection that is already terminal — read to
+// its terminal, or [RawConn.Close]d — it returns the recorded terminal at
+// once.
+//
+// The wait it performs is the read wait, so it is bounded the way reads are:
+// with the idle timeout set, a silent peer is probed with a ping and the
+// drain fails with a timeout after a second window; with keepalive disabled
+// it is bounded only by the transport — bound it with
+// [RawConn.SetReadDeadline] before calling. After a [RawConn.Shutdown] it
+// reads the peer's reply; called without one it waits for the peer to
+// initiate the closing handshake.
+func (c *RawConn) Drain() error {
+	for {
+		_, readErr := c.ReadEvent()
+		if readErr != nil {
+			return readErr
+		}
+	}
 }
 
 // Closed reports whether the connection is closed or closing, from any

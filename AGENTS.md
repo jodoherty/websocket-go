@@ -72,8 +72,10 @@ Unlicense (see `LICENSE`).
   frame reassembly. `Session` adds policy only: auto-pong, the pong
   handler, the close-to-terminal-error mapping, and keepalive probing.
 - The read side is owned by one pumping goroutine in either face:
-  `Session.ReadMessage` for a session, `RawConn.ReadEvent` for raw mode —
-  and a connection has exactly one of them, never both. `WriteMessage`,
+  `Session.ReadMessage` (or `Session.Drain`, that read side run to its
+  terminal) for a session, `RawConn.ReadEvent` (or `RawConn.Drain`) for raw
+  mode — and a connection has exactly one of those pumping at once, never
+  both, and a loop and its drain are never concurrent. `WriteMessage`,
   `WriteFrame`, `Pong`, and `Shutdown` are safe from any goroutine.
   `Close` is too, and deliberately takes **no** write lock: it only swaps the
   state and closes the transport, so a stalled writer holding `c.mu` can never
@@ -182,11 +184,15 @@ ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
                     plus the stalled-write bounded-write regression
-ws/closeframe_test.go Shutdown/Close: the close-frame write status (nil on a
-                    live transport, the write failure on a stalled one, the
-                    already-closing refusal, the code rejection), Close as pure
-                    non-blocking teardown (abrupt, no frame, never wedged by a
-                    stalled writer), and that Shutdown leaves the read side live
+ws/closeframe_test.go Shutdown/Close/Drain: the close-frame write status
+                    (nil on a live transport, the write failure on a stalled
+                    one, the already-closing refusal, the code rejection),
+                    Close as pure non-blocking teardown (abrupt, no frame,
+                    never wedged by a stalled writer), that Shutdown leaves
+                    the read side live, and Drain: the read side run to its
+                    terminal as one call (peer-code delivery, clean-end EOF,
+                    ping and data discard, the terminal fast-fail, the
+                    abrupt-close clean end)
 ws/raw_test.go      the raw API: the ReadEvent contract (control frames are
                     events, no auto-pong, close resolution), the WriteFrame
                     MC/DC matrix (state, control shape, UTF-8, writable set),
@@ -197,9 +203,9 @@ ws/longrunning_test.go write-deadline wedge regression + Closed() signal,
                     transport-write failure failing the connection, Close's
                     write-deadline bound
 ws/concurrency_test.go concurrent-stress suite (-race): the close state
-                    machine, writer-vs-close, read-vs-close, and the
-                    reader-goroutine write paths (session auto-pong and
-                    raw application pong interleaved with app writes)
+                    machine, writer-vs-close, read-vs-close, drain-vs-close,
+                    and the reader-goroutine write paths (session auto-pong
+                    and raw application pong interleaved with app writes)
 ws/bench_test.go    codec + round-trip benchmarks
 ws/memory_test.go   per-frame allocation budget (testing.AllocsPerRun)
 ws/branches_test.go error-branch coverage: malformed frames, control/fragment

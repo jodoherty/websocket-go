@@ -51,15 +51,18 @@ One method per step:
 | RFC step | method | state effect |
 |---|---|---|
 | `shutdown(SHUT_WR)` — §7.1.2 *Start the Closing Handshake* | `Shutdown(code, reason)` | `OPEN → CLOSING`; write half closed, read half live |
-| `recv()` until 0 | `ReadEvent` / `ReadMessage` to its terminal | `CLOSING → CLOSED` when the peer's Close lands |
+| `recv()` until 0 | `ReadEvent` / `ReadMessage` to its terminal — or `Drain`, which runs that loop and reports the terminal | `CLOSING → CLOSED` when the peer's Close lands |
 | `close()` — §7.1.1 *Close the WebSocket Connection* | `Close()` | transport down; no-op if already down |
 
-There is deliberately **no method that waits for the closing handshake**. Only
-reading can complete it (§7.1.5 makes the close code the first Close *received*),
-and reading belongs to the pumping goroutine. A blocking `Close` deadlocks the
-moment a handler closes from its own goroutine — which is the common case — so
-the design makes that deadlock unrepresentable rather than bounding it with a
-timeout.
+There is deliberately **no method that waits for the closing handshake**
+without reading. Only reading can complete it (§7.1.5 makes the close code the
+first Close *received*), and reading belongs to the pumping goroutine — `Drain`
+is reading, and it belongs to the same goroutine. A blocking `Close` deadlocks
+the moment a handler closes from its own goroutine — which is the common case
+— so the design makes that deadlock unrepresentable rather than bounding it
+with a timeout. `Drain` is the writer's half's name for that step: after a
+`Shutdown`, it is the only way to learn the connection's close code without
+running the message loop.
 
 `Close()` without a preceding `Shutdown()` is an abrupt close: no Close frame
 goes out and the peer resolves to 1006 (§7.1.5). §7.1.1 permits this ("close the
