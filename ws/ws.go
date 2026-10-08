@@ -4212,9 +4212,9 @@ func (e *CloseError) Error() string {
 }
 
 // CloseCode extracts the close code and reason from an error returned by
-// [Session.ReadMessage], by a write that failed with the connection's
-// recorded close error, or from [Session.Close] itself. ok is false if the
-// error does not carry a close code.
+// [Session.ReadMessage] or by a write that failed with the connection's
+// recorded close error. ok is false if the error does not carry a close
+// code.
 func CloseCode(err error) (int, string, bool) {
 	var closeErr *CloseError
 	if !errors.As(err, &closeErr) {
@@ -4285,10 +4285,6 @@ var errTransportAbnormalClose = &CloseError{
 	Reason: "connection closed without a close frame",
 }
 
-// closeErrFor maps a close code to the terminal error recorded on the
-// connection: a normal closure (1000, or an absent status) yields nil,
-// everything else yields a *CloseError so callers can see the code and
-// reason (e.g. 1001 "going away").
 // terminalErr maps the recorded terminal error to what the connection's
 // surfaces report: a clean end — a normal closure (1000) in either
 // direction, or a close frame without a status — reads as [io.EOF];
@@ -4305,6 +4301,10 @@ func terminalErr(closeErr error) error {
 	return closeErr
 }
 
+// closeErrFor maps a close code to the terminal error recorded on the
+// connection: a normal closure (1000, or an absent status) yields nil,
+// everything else yields a *CloseError so callers can see the code and
+// reason (e.g. 1001 "going away").
 func closeErrFor(code int, reason string) error {
 	switch code {
 	case StatusNormalClosure, StatusNoStatusReceived:
