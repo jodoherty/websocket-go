@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGT0, cont1); frames: text0e, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "018001020304",
+    "80810102030440"
+  ],
+  "fromState": "FGT0",
+  "id": "T_FGT0_cont1_server",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.4"
+  ],
+  "side": "server",
+  "terminal": null
+}

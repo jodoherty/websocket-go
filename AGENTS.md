@@ -298,12 +298,14 @@ doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions
 doc/rfc6455.txt   the RFC 6455 reference
 doc/rfc7692.txt   the RFC 7692 reference (permessage-deflate)
+doc/rfc3629.txt   the RFC 3629 reference (UTF-8; the shared boundary machine's spec)
 doc/rfc8307.txt   the RFC 8307 reference (QUIC)
 doc/rfc8441.txt   the RFC 8441 reference (HTTP/2 extended CONNECT)
 doc/rfc9220.txt   the RFC 9220 reference (HTTP/3 extended CONNECT)
 doc/COMPRESSION.md permessage-deflate design + interop evidence
 doc/STATES.md     the frame-reassembly state machine: the RFC 6455
-                    transformation, the properties (P1/P2/completeness), trace
+                    transformation, the shared RFC 3629 boundary machine
+                    (P6 projection), trace
                     generation, and the behaviors the model pins
 doc/CLOSE-HANDSHAKE.md the close-handshake state machine: the RFC's OPEN/
                     CLOSING/CLOSED states, the Shutdown/read/Close mapping to
@@ -318,18 +320,29 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                 container. Not a Go module (Python + SMV only), so the root
                 go.mod stays dependency-free.
                 Containerfile    nuXmv 2.2 (FBK tarball, SHA-256 verified)
-                gen/common.py    the transition function trans(state, frame) +
-                                 wire_close(state, frame): the single source
-                                 of truth (states, 32 frame classes, the check
-                                 order, and the RFC citations)
+                gen/utf8bound.py the exact RFC 3629 §3/§4 boundary machine over
+                                 fragment boundaries (10 states, the five
+                                 narrow acceptance sets), shared by the
+                                 reassembly machine and the RSV1 machine;
+                                 B1-B7 self-check
+                gen/check_utf8props.py the boundary machine's properties
+                                 (make utf8-model), pure Python
+                gen/common.py    the transition function trans(state, frame):
+                                 the single source of truth (46 states incl.
+                                 count-0 and the 10 suffixes per text count,
+                                 36 frame classes incl. the empty-payload
+                                 shapes, the check order, and the RFC
+                                 citations); text-fragment UTF-8 delegates to
+                                 utf8bound
                 gen/gen_model.py emits the SMV model from common.trans (nuXmv
                                  encodes the machine independently for the
                                  reachability cross-check)
                 gen/gen_traces.py minimal frame traces by BFS over the machine,
                                  cross-checked against nuXmv, one JSON per
                                  (transition, side) -> ws/testdata/mbt/
-                gen/check_props.py model self-consistency (P1/P2/completeness/
-                                 encoding), pure Python
+                gen/check_props.py model self-consistency (P1/P2/P6
+                                 projection/completeness/encoding), pure
+                                 Python
                 gen/check_traces.py committed-trace <-> model consistency,
                                  pure Python
                 gen/closehandshake.py the close-handshake machine: the RFC's

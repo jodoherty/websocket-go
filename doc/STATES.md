@@ -11,13 +11,16 @@ from the RFC, not from observed implementation behavior.
 ## Pipeline
 
 ```
-RFC 6455 §5–§7
+RFC 6455 §5–§7 (+ RFC 3629 §3–§4 for UTF-8 boundaries)
         │  careful transformation (this document + gen/common.py)
         ▼
-   common.py            the transition function trans(state, frame) and
-        │               wire_close(state, frame) — single source of truth
+   utf8bound.py         the exact RFC 3629 boundary machine over fragment
+        │               boundaries (shared: also the RSV1 machine's)
+   common.py            the transition function trans(state, frame)
+        │               — single source of truth (text-fragment UTF-8
+        │               delegates to utf8bound)
         ├──► gen_model.py      → SMV model (nuXmv encoding, IVAR peer)
-        ├──► check_props.py    → P1/P2/completeness/encoding (pure Python)
+        ├──► check_props.py    → P1/P2/P6/completeness/encoding (pure Python)
         ├──► gen_traces.py     → minimal frame traces (BFS) + nuXmv
         │                         reachability cross-check → JSON
         ├──► check_traces.py   → trace ↔ model consistency (pure Python)
@@ -29,7 +32,9 @@ RFC 6455 §5–§7
 
 `common.py` is the one authoritative artifact. The SMV model is *generated*
 from it (so the two encodings cannot drift), and the traces are generated
-from it. nuXmv plays two roles: an independent re-encoding of the model
+from it. Text-fragment UTF-8 is not re-derived here: the fragment states
+carry the shared boundary machine's state, so the §5.6 check at completion
+is exactly "the boundary is at a code-point boundary". nuXmv plays two roles: an independent re-encoding of the model
 (reachability cross-check in `gen_traces.py`) and a property oracle
 (`make model` cross-checks reachability; the safety properties are checked
 exhaustively in Python because they are properties of the transition
@@ -43,17 +48,33 @@ function, not of reachability). The nuXmv 2.2 user manual is included at
 | state | meaning |
 |---|---|
 | `IDLE` | not in a message |
-| `FGB{n}` | accumulating a **binary** fragment, `n` tokens so far (1..3) |
-| `FGT{n}` | accumulating a **text** fragment, `n` tokens so far, valid UTF-8 so far |
-| `FGT{n}B` | accumulating a text fragment, `n` tokens so far, **not** valid UTF-8 so far |
+| `FGB{n}` | accumulating a **binary** fragment, `n` tokens so far (0..3) |
+| `FGT{n}<S>` | accumulating a **text** fragment, `n` tokens so far, suffix `<S>` = the shared UTF-8 boundary machine's state for the accumulated bytes (see below) |
 | `TERM` | terminal (absorbing) |
 
 The message-size limit in the model is 3 tokens (`MAXMSG`), so fragment
-counts top out at 3 and any further accumulation overflows. The `B` suffix
-on text fragments exists because RFC 6455 §5.6 validates the *whole*
-(concatenated) text message, so a fragment must remember whether the bytes
-accumulated so far are already broken — a peer can split an invalid UTF-8
-sequence across frames to defeat a per-frame check.
+counts top out at 3 and any further accumulation overflows; count 0 is a
+real state (RFC 6455 §5.5 allows an empty payload, so a fragment may start
+empty).
+
+The `<S>` suffix is the shared UTF-8 boundary machine (`gen/utf8bound.py`,
+the exact RFC 3629 §3/§4 state machine, 10 states): no suffix is `CLEAN`
+(a code-point boundary), `B` is `BROKEN` (an unrepairable byte), and the
+other suffixes (`W`, `E0`, `P3`, `ED`, `F0`, `P4`, `F4`, `K2`) are its
+pending states (the accumulation ends mid-rune). The suffix exists because
+RFC 6455 §5.6 validates the *whole* (concatenated) text message, so a
+fragment must remember where its bytes stand in that machine — a peer can
+split an invalid UTF-8 sequence across frames to defeat a per-frame check,
+or split a *valid* one (a fragment may legally end mid-rune).
+
+Over this machine's alphabet the reachable suffixes are exactly `CLEAN` and
+`BROKEN` (every payload is either complete code points or carries an
+unrepairable byte): the legacy two-state B dimension is a sound projection
+of the shared machine, and `check_props.py` pins that (P6). The pending
+suffixes are live states of the model (total, deterministic, in the SMV
+encoding) and become reachable when the alphabet grows — which is the
+RSV1 / compressed-message machine, where a decompressed chunk may end
+mid-rune by construction.
 
 ### Events (the peer's frame alphabet)
 
@@ -62,7 +83,8 @@ concrete bytes (side-specific masking: a server under test receives masked
 frames, a client under test receives unmasked ones, RFC 6455 §5.1).
 
 - well-formed data / continuation: `text1`, `text0`, `text0ff`, `bin0`,
-  `bin02`, `cont0`, `cont02`, `cont1`, `cont12`, `contff`, `textbad`
+  `bin02`, `cont0`, `cont02`, `cont1`, `cont12`, `contff`, `textbad`, and
+  the empty-payload shapes `bin0e`, `text0e`, `cont0e`, `cont1e`
 - well-formed controls: `ping`, `ping1`, `pong`
 - well-formed closes: `close1000`, `close1000r`, `close3000`, `closeempty`
 - close-code faults: `close999` (unusable), `close1005` (must-not-set),
@@ -141,7 +163,8 @@ because `ws.go` now sends the 1002 frame on those violations too.
 
 ## Properties
 
-Checked by `make model` (pure Python, no container):
+Checked by `make model` (pure Python, no container; the shared boundary
+machine first, via `make utf8-model`):
 
 - **P1 — wire close-code legitimacy.** The close code the machine transmits
   is always `0` (no close frame), a usable code in 1000–4999 (1004/1005/
@@ -154,6 +177,16 @@ Checked by `make model` (pure Python, no container):
   pair — a gap would be a silent omission in the model.
 - **encoding round-trip.** each frame encodes to exactly the byte length its
   header claims, on both sides.
+- **P6 — projection.** Over this machine's alphabet, the boundary states
+  reachable in text fragments are exactly {CLEAN, BROKEN}: the legacy
+  two-state B dimension is pinned as a sound projection of the shared
+  boundary machine. Extending the alphabet with lead-byte payloads must
+  extend this property deliberately, not silently.
+
+The shared boundary machine's own properties (B1–B7: totality, BROKEN
+absorption, agreement with the RFC 3629 §4 acceptance sets, the hazard
+corpus, composition, edge coverage, decoder cross-check) run in
+`make utf8-model`, which `make model` depends on.
 
 `gen_traces.py` additionally cross-checks, with the independent nuXmv
 encoding, that every target transition is reachable (and that Python and
@@ -197,14 +230,20 @@ obligations; item 2 is this library's `maxMessageSize` policy:
    limit is rejected with 1002. The model instantiates the limit at 3 bytes
    to exercise the overflow and reason-echo behavior with small frames.
 3. **Per-message UTF-8 on fragments.** A text fragment is validated on the
-   concatenated payload at completion, not per frame: `FGT1 + contff`
-   (0x41 then 0xff) fails with 1007, and a fragment that is already broken
-   (`FGT1B`) fails on completion regardless of the final fragment.
+   concatenated payload at completion, not per frame, through the shared
+   RFC 3629 boundary machine: the message completes valid exactly when the
+   boundary is at a code-point boundary. `FGT1 + contff` (0x41 then 0xff)
+   fails with 1007, and a fragment already `BROKEN` fails on completion
+   regardless of the final fragment. The pending boundary states (mid-rune
+   fragment ends) are defined in the model but unreachable over this
+   alphabet — P6 pins that, and they are the states the RSV1 / compressed
+   machine will reach.
 
 ## Running it
 
 ```
-make model        # pure Python: P1/P2/completeness/encoding + trace↔model
+make utf8-model   # pure Python: the shared RFC 3629 boundary machine (B1-B7)
+make model        # pure Python: P1/P2/P6/completeness/encoding + trace↔model
 make test         # replays the committed traces (in the normal suite)
 make mbt-report   # print the MBT warning count (the assessable summary)
 make mbt-gen      # regenerate the traces (needs the podman container);
@@ -231,7 +270,9 @@ the pilot:
   `vectors_test.go` / `protocol_test.go`;
 - **permessage-deflate** (RFC 7692) — the RSV1 context and
   context-reset-on-protocol-error rules (a second machine, same trace
-  vocabulary);
+  vocabulary; its groundwork — the shared RFC 3629 boundary machine the text
+  fragment states delegate to — is in place, and the pending boundary
+  states it will reach are already defined and total in this model);
 - **concurrency** — stays the race detector's job; the model is
   per-connection by construction.
 

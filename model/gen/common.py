@@ -13,26 +13,72 @@ validation first (RFC 6455 Section 5.2, 5.5), then the message-level rules
 (Section 5.4, 5.5, 5.6), then close resolution (Section 5.5.1, 7.4). A frame
 that trips a header check never reaches the message-level rules.
 
+Text-fragment UTF-8 tracking delegates to the shared boundary machine
+(utf8bound.py, RFC 3629 Section 3/4): a text fragment state carries the
+boundary state of its accumulated bytes, and the 5.6 check on message
+completion is exactly "the boundary is at a code-point boundary". This
+machine's alphabet reaches only the two boundary states CLEAN and BROKEN,
+so its legacy two-state B dimension is a sound projection of the shared
+machine; check_props.py pins that (P6).
+
 The payload is symbolic (token count, not raw bytes) for the model; the
 concrete byte encoding lives in encode_frame and is side-dependent (the mask
 bit flips with which side is under test).
 """
 
-MAXMSG = 3  # abstract message size limit, in token units (concrete: bytes)
-C_TERM = "TERM"  # forward ref used by wire_close before the state list
+import utf8bound as U
 
-# Assembler states. IDLE: not in a message. FGB: accumulating a binary
-# fragment, subscript = token count so far (1..MAXMSG). FGT / FGT..B:
-# accumulating a text fragment, subscript = count, optional B suffix = the
-# accumulated bytes so far are not valid UTF-8 (RFC 6455 5.6 checks the
-# whole message, so a fragment must remember whether it is already broken).
-# TERM: terminal.
+MAXMSG = 3  # abstract message size limit, in token units (concrete: bytes)
+
+# Assembler states. IDLE: not in a message. FGBn: accumulating a binary
+# fragment, subscript n = tokens accumulated so far (0..MAXMSG). FGTn<S>:
+# accumulating a text fragment, subscript n = tokens so far, suffix S = the
+# shared UTF-8 boundary machine's (utf8bound) state for the accumulated
+# bytes (RFC 6455 5.6 checks the whole message, so a fragment must remember
+# where its bytes stand in that machine). The legacy two-state B dimension
+# (valid / broken) is a sound projection of it over this alphabet, pinned by
+# check_props.py (P6); the legacy names survive (no suffix = CLEAN, B =
+# BROKEN). TERM: terminal.
 IDLE = "IDLE"
-FGB = ["FGB1", "FGB2", "FGB3"]
-FGT = ["FGT1", "FGT2", "FGT3"]
-FGTB = ["FGT1B", "FGT2B", "FGT3B"]
 TERM = "TERM"
-STATES = [IDLE] + FGB + FGT + FGTB + [TERM]
+
+# Suffix <-> utf8bound state, for the text fragment states.
+_SUFFIX_BOUND = {
+    "": U.CLEAN,
+    "B": U.BROKEN,
+    "W": U.PEND1,
+    "E0": U.PEND_E0,
+    "P3": U.PEND3,
+    "ED": U.PEND_ED,
+    "F0": U.PEND_F0,
+    "P4": U.PEND4,
+    "F4": U.PEND_F4,
+    "K2": U.PEND4K2,
+}
+_BOUND_SUFFIX = {v: k for k, v in _SUFFIX_BOUND.items()}
+
+
+def _frag_state(mode, count, boundary):
+    """The state name for (mode, token count, boundary state)."""
+    if mode == "binary":
+        return "FGB%d" % count
+
+    return "FGT%d%s" % (count, _BOUND_SUFFIX[boundary])
+
+
+def _parse_frag(state):
+    """(mode, count, boundary) for a fragment state: mode is 'binary' or
+    'text', count the tokens accumulated, boundary the utf8bound state for
+    the accumulated bytes (None for binary)."""
+    if state[2] == "B":
+        return "binary", int(state[3]), None
+
+    return "text", int(state[3]), _SUFFIX_BOUND[state[4:]]
+
+
+FGB = ["FGB%d" % n for n in range(MAXMSG + 1)]
+FGT = [_frag_state("text", n, b) for n in range(MAXMSG + 1) for b in U.STATES]
+STATES = [IDLE] + FGB + FGT + [TERM]
 
 # Frame classes: the peer's alphabet. Each is a symbolic frame; the concrete
 # wire bytes come from encode_frame. Fields: op (opcode), fin, rsv1, rsv23
@@ -52,6 +98,11 @@ FRAMES = {
     "cont12": dict(op=0, fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=2, payload=b"\x41\x42", fault=None),
     "contff": dict(op=0, fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=1, payload=b"\xff", fault=None),
     "textbad":  dict(op=1, fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=1, payload=b"\xff", fault=None),
+    # empty data frames (RFC 6455 5.5: the payload may be empty)
+    "bin0e":  dict(op=2, fin=0, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=0, payload=b"", fault=None),
+    "text0e": dict(op=1, fin=0, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=0, payload=b"", fault=None),
+    "cont0e": dict(op=0, fin=0, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=0, payload=b"", fault=None),
+    "cont1e": dict(op=0, fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=0, payload=b"", fault=None),
     # well-formed controls
     "ping":    dict(op=9,  fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=0, payload=b"", fault=None),
     "ping1":   dict(op=9,  fin=1, rsv1=0, rsv23=0, maskok=1, lenform="short", plen=1, payload=b"\x41", fault=None),
@@ -126,7 +177,7 @@ def should_close(state, frame):
     never 1005/1006/1015, and never outside 1000-4999. Property P1 asserts
     this over every (state, frame).
     """
-    if state == C_TERM:
+    if state == TERM:
         return 0
     if frame in ANY_STATE_1002:
         return 1002
@@ -157,41 +208,28 @@ def should_close(state, frame):
 
 def frag_count(state):
     """Token count accumulated in a fragment state, else 0."""
-    if state in FGB or state in FGT or state in FGTB:
-        return int(state.rstrip("B")[-1])
+    if state in FGB or state in FGT:
+        return _parse_frag(state)[1]
+
     return 0
 
 
 def frag_op(state):
-    return "binary" if state in FGB else ("text" if state in FGT or state in FGTB else None)
+    """'binary' / 'text' for a fragment state, else None."""
+    if state in FGB or state in FGT:
+        return _parse_frag(state)[0]
+
+    return None
 
 
-def frag_bad(state):
-    """True when a text fragment's accumulated bytes are not valid UTF-8."""
-    return state in FGTB
+def frag_boundary(state):
+    """The shared boundary machine's state for a text fragment's accumulated
+    bytes (CLEAN at a code-point boundary, BROKEN when an unrepairable byte
+    has been seen, a pending state mid-rune); None for a binary fragment."""
+    if state in FGT:
+        return _parse_frag(state)[2]
 
-
-def _bump(state, add, bad):
-    """Advance a fragment state by `add` tokens, or None if it overflows.
-
-    `bad` is True when the incoming frame's payload is not valid UTF-8; for
-    text fragments the broken flag is sticky.
-    """
-    is_text = state in FGT or state in FGTB
-    c = frag_count(state) + add
-    if c > MAXMSG:
-        return None
-    if state in FGB:
-        return "FGB%d" % c
-    was_bad = state in FGTB
-    if is_text and (was_bad or bad):
-        return "FGT%dB" % c
-    return "FGT%d" % c
-
-
-def payload_bad(frame):
-    """True when the frame's payload is not valid UTF-8."""
-    return not _utf8(FRAMES[frame]["payload"])
+    return None
 
 
 def trans(state, frame):
@@ -246,7 +284,7 @@ def _close(state, frame):
 def _data(state, frame):
     f = FRAMES[frame]
     is_cont = f["op"] == 0
-    in_frag = state in FGB or state in FGT or state in FGTB
+    in_frag = state in FGB or state in FGT
 
     # A data frame (text/binary) may not arrive while a fragment is in
     # progress; a continuation may not arrive with no fragment in progress.
@@ -261,33 +299,39 @@ def _data(state, frame):
     # check, so it is not a separate transition here.
 
     if in_frag:
-        to = _bump(state, f["plen"], payload_bad(frame))
-        if to is None:
+        mode, count, boundary = _parse_frag(state)
+        new_count = count + f["plen"]
+        if new_count > MAXMSG:
             return TERM, [term_proto()], FAULT_RFC["cross-frame-too-big"], "cross-frame-too-big"
+        # The boundary machine composes the frame's bytes onto the
+        # accumulation (RFC 3629; a binary fragment carries no boundary).
+        to_boundary = boundary if mode == "binary" else U.apply(boundary, f["payload"])
         if not f["fin"]:
-            return to, [], "RFC 6455 5.4", None
+            return _frag_state(mode, new_count, to_boundary), [], "RFC 6455 5.4", None
         # Final fragment: the message completes. RFC 6455 5.6 validates the
-        # whole (concatenated) text message, so a text fragment that is
-        # already broken -- or is broken by this final fragment -- fails
-        # with 1007.
-        if frag_op(state) == "text" and frag_bad(to):
+        # whole (concatenated) text message: the boundary must be at a
+        # code-point boundary. A text fragment already broken, broken by
+        # this final fragment, or left mid-rune fails with 1007.
+        if mode == "text" and to_boundary != U.CLEAN:
             return TERM, [term(1007)], FAULT_RFC["utf8-invalid"], "utf8-invalid"
-        return IDLE, [msg(frag_op(state), _frag_payload(state, frame))], "RFC 6455 5.4", None
+        return IDLE, [msg(mode, _frag_payload(state, frame))], "RFC 6455 5.4", None
 
     # Not in a fragment: this frame starts a multi-frame message.
     if not f["fin"]:
         if f["plen"] > MAXMSG:
             return TERM, [term(1002)], FAULT_RFC["frame-too-big"], "frame-too-big"
         if f["op"] == 1:
-            if payload_bad(frame):
-                return "FGT%dB" % f["plen"], [], "RFC 6455 5.4", None
-            return "FGT%d" % f["plen"], [], "RFC 6455 5.4", None
-        return "FGB%d" % f["plen"], [], "RFC 6455 5.4", None
+            to_boundary = U.apply(U.CLEAN, f["payload"])
+
+            return _frag_state("text", f["plen"], to_boundary), [], "RFC 6455 5.4", None
+
+        return _frag_state("binary", f["plen"], None), [], "RFC 6455 5.4", None
 
     # Single-frame message (fin=1, not in a fragment).
     op = "text" if f["op"] == 1 else "binary"
-    if op == "text" and not _utf8(f["payload"]):
+    if op == "text" and U.apply(U.CLEAN, f["payload"]) != U.CLEAN:
         return TERM, [term(1007)], FAULT_RFC["utf8-invalid"], "utf8-invalid"
+
     return IDLE, [msg(op, f["payload"])], "RFC 6455 5.5", None
 
 
@@ -297,14 +341,6 @@ def _frag_payload(state, frame):
     # continuation payloads; the concrete bytes are rebuilt by the runner
     # from the frame bytes, so here we only track validity / length.
     return b""
-
-
-def _utf8(b):
-    try:
-        b.decode("utf-8")
-        return True
-    except UnicodeDecodeError:
-        return False
 
 
 # --- Concrete wire encoding -------------------------------------------------
@@ -485,17 +521,17 @@ def trace_assertions(frames):
     acc = b""
     for f in frames[:-1]:
         fr = FRAMES[f]
-        was_frag = state in FGB or state in FGT or state in FGTB
+        was_frag = state in FGB or state in FGT
         if was_frag:
             acc += fr["payload"]
         to, _, _, _ = trans(state, f)
-        if (not was_frag) and (to in FGB or to in FGT or to in FGTB):
+        if (not was_frag) and (to in FGB or to in FGT):
             acc = fr["payload"]  # started a multi-frame message
         state = to
 
     f = frames[-1]
     fr = FRAMES[f]
-    was_frag = state in FGB or state in FGT or state in FGTB
+    was_frag = state in FGB or state in FGT
     if was_frag:
         acc += fr["payload"]
     to, emits, _, _ = trans(state, f)

@@ -1,7 +1,8 @@
 """Model self-consistency checks (the proof layer), pure Python.
 
 Run by `make model`. These validate the frame-reassembly transition function
-(common.trans / common.wire_close) independent of the implementation:
+(common.trans) independent of the implementation, on top of the shared UTF-8
+boundary machine (utf8bound.py, checked by check_utf8props.py):
 
   P1  the close code the machine transmits is always legitimate -- 0 (no
       close frame), a usable code in 1000-4999 (1004/1005/1006/1015 excluded)
@@ -13,6 +14,11 @@ Run by `make model`. These validate the frame-reassembly transition function
       (the table is a total function -- a gap would be a silent omission).
   CF  the concrete encoding round-trips: each frame encodes to the byte
       length its header claims, on both sides.
+  P6  projection: over this machine's alphabet, the boundary states reachable
+      in text fragments are exactly {CLEAN, BROKEN} -- the legacy two-state
+      B dimension is pinned as a sound projection of the shared boundary
+      machine. Extending the alphabet with lead-byte payloads (mid-rune
+      fragment ends) must extend this property deliberately, not silently.
 
 A failure here means the model (and therefore the traces it generates) is
 wrong; fix common.py, regenerate the traces, and re-run.
@@ -21,6 +27,7 @@ wrong; fix common.py, regenerate the traces, and re-run.
 import sys
 
 import common as C
+import utf8bound as U
 
 MUST_NOT_SET = {1004, 1005, 1006, 1015}
 
@@ -104,11 +111,33 @@ def main():
             if len(b) != off + claimed:
                 failures.append("CF: encode(%s, %s) len %d != header %d" % (f, side, len(b), off + claimed))
 
+    # P6: projection -- over this alphabet, the boundary states reachable in
+    # text fragments are exactly {CLEAN, BROKEN}: no fragment state can hold
+    # a mid-rune pending boundary, so the legacy two-state B dimension (the
+    # old FGT..B names) is a sound projection of the shared boundary machine.
+    seen = {C.IDLE}
+    stack = [C.IDLE]
+    while stack:
+        s = stack.pop()
+        for f in C.FRAME_NAMES:
+            to = C.trans(s, f)[0]
+            if to == C.TERM or to in seen:
+                continue
+            seen.add(to)
+            stack.append(to)
+    bounds = set()
+    for s in seen:
+        if s in C.FGT:
+            bounds.add(C.frag_boundary(s))
+    if bounds != {U.CLEAN, U.BROKEN}:
+        failures.append("P6: reachable text boundaries %r, want {CLEAN, BROKEN} "
+                        "(alphabet extension needs a deliberate property update)" % sorted(bounds))
+
     if failures:
         for line in failures:
             print("FAIL", line, file=sys.stderr)
         sys.exit("model check failed (%d)" % len(failures))
-    print("model check: P1, P2, completeness, encoding all pass "
+    print("model check: P1, P2, P6, completeness, encoding all pass "
           "(%d states x %d frames)" % (len(C.STATES), len(C.FRAME_NAMES)))
 
 

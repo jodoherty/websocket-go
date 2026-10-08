@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGB0, pong); frames: bin0e, pong",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "pong",
+      "t": "event"
+    }
+  ],
+  "frame": "pong",
+  "frames": [
+    "028001020304",
+    "8a8001020304"
+  ],
+  "fromState": "FGB0",
+  "id": "T_FGB0_pong_server",
+  "machine": "reassembly",
+  "maxMessageSize": 3,
+  "rfc": [
+    "RFC 6455 5.4",
+    "RFC 6455 5.5"
+  ],
+  "side": "server",
+  "terminal": null
+}

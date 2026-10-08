@@ -40,15 +40,17 @@ def targets():
     """
     t = [(C.IDLE, f) for f in C.FRAME_NAMES]
     frag = [
-        ("FGB1", ["cont0", "cont1", "cont02", "cont12", "ping", "pong", "text1", "bin0", "close1000", "close999"]),
-        ("FGB2", ["cont1", "cont02", "cont0", "close1000"]),
-        ("FGB3", ["cont0", "cont1"]),
-        ("FGT1", ["cont0", "cont1", "contff", "cont12", "ping", "text1"]),
-        ("FGT2", ["cont0", "contff", "cont1"]),
-        ("FGT3", ["cont0", "cont1"]),
-        ("FGT1B", ["cont0", "cont1", "contff"]),
-        ("FGT2B", ["cont1", "cont0"]),
-        ("FGT3B", ["cont1"]),
+        ("FGB0", ["cont0", "cont1", "cont02", "cont12", "cont0e", "cont1e", "ping", "pong", "text1", "bin0", "close1000", "close999"]),
+        ("FGB1", ["cont0", "cont1", "cont02", "cont12", "cont0e", "cont1e", "ping", "pong", "text1", "bin0", "close1000", "close999"]),
+        ("FGB2", ["cont1", "cont02", "cont0", "cont0e", "cont1e", "close1000"]),
+        ("FGB3", ["cont0", "cont1", "cont0e", "cont1e"]),
+        ("FGT0", ["cont0", "cont1", "contff", "cont12", "cont0e", "cont1e", "ping", "text1"]),
+        ("FGT1", ["cont0", "cont1", "contff", "cont12", "cont0e", "cont1e", "ping", "text1"]),
+        ("FGT2", ["cont0", "contff", "cont1", "cont0e", "cont1e"]),
+        ("FGT3", ["cont0", "cont1", "cont0e", "cont1e"]),
+        ("FGT1B", ["cont0", "cont1", "contff", "cont0e", "cont1e"]),
+        ("FGT2B", ["cont1", "cont0", "cont0e", "cont1e"]),
+        ("FGT3B", ["cont1", "cont0e", "cont1e"]),
     ]
     for s, frames in frag:
         for f in frames:
