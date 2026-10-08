@@ -1,7 +1,7 @@
 GOLANGCI ?= golangci-lint
 MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report deflate-model defl-gen defl-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report deflate-model defl-gen defl-report deflstream deflstream-gen mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -9,7 +9,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc model close-model deflate-model mut branchcov coverage multiver e2e e2e-connect
+gate: all race fuzz bench mcdc model close-model deflate-model deflstream mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -162,6 +162,24 @@ defl-gen: model-image
 		echo "defl-gen: committed traces unchanged"; \
 	else \
 		echo "defl-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/deflate; exit 1; \
+	fi
+
+# The DEFLATE stream machine's container-free self-check (doc/
+# DEFLATE-STREAM.md): the RFC 1951/7692 reference classifier against the
+# RFC's own worked examples and tables, the 7.2.1 shape, and the
+# implementation's committed decompression oracle. The Go side replays the
+# exhaustive 1-2 byte table in the normal suite as TestDecompressStreamTable.
+deflstream:
+	python3 model/gen/check_deflstreamprops.py
+
+# Regenerate the committed DEFLATE stream table; it must be deterministic
+# (same rule as defl-gen).
+deflstream-gen:
+	@python3 model/gen/deflate_stream.py gen ws/testdata/deflstream/oracle.json 2
+	@if git diff --quiet -- ws/testdata/deflstream 2>/dev/null; then \
+		echo "deflstream-gen: committed table unchanged"; \
+	else \
+		echo "deflstream-gen: table changed -- commit it"; git --no-pager diff --stat -- ws/testdata/deflstream; exit 1; \
 	fi
 
 # Build the model container (nuXmv). Rebuild only when model/Containerfile

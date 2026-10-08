@@ -109,6 +109,9 @@ make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make model       # frame-reassembly machine: model properties + trace fidelity
 make close-model # close-handshake machine: model properties + trace fidelity
+make deflstream  # DEFLATE stream machine (part 1): the RFC 1951/7692
+                # reference classifier self-check; the Go suite replays the
+                # exhaustive 1-2 byte table as TestDecompressStreamTable
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
 make multiver    # build + vet + ws unit + Go e2e, all under -race, on
@@ -281,6 +284,14 @@ ws/mbt_deflate_test.go model-based validation runner for the RSV1 /
                     entries are the RFC 7692 silences (a failed decompression
                     owes no Close frame the RFC names; a decompressed size
                     overflow likewise)
+ws/deflstream_test.go the DEFLATE stream machine replay (part 1, doc/
+                    DEFLATE-STREAM.md): every row of the exhaustive 1-2 byte
+                    table (ws/testdata/deflstream/oracle.json, 65,792 rows)
+                    against the live decompress pipeline; asserts the
+                    implementation-layer match and the spec-COMPLETE
+                    acceptance, and counts the accepted PREFIX/MALFORMED
+                    leniencies against NOTES.json (three MAY:deflate-accept
+                    entries)
 ws/testdata/mbt/   committed model-based traces (JSON): one per (transition,
                     side); plus NOTES.json, the allowlist of accepted SHOULD/
                     MAY divergences (each with its RFC basis + reason)
@@ -293,6 +304,12 @@ ws/testdata/deflate/
                     committed RSV1 / compressed-message traces (JSON): one per
                     (transition, side) over the 349-state machine; plus
                     NOTES.json (two accepted RFC 7692 silences)
+ws/testdata/deflstream/
+                    the exhaustive DEFLATE stream table (oracle.json, 65,792
+                    rows: every 1-2 byte buffer, implementation layer + RFC
+                    7692 spec layer) and NOTES.json (three accepted MAY
+                    leniencies: stream-incomplete, padding-nonzero,
+                    tail-missing)
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
@@ -311,11 +328,16 @@ doc/CONFIDENCE.md the layers of test evidence and security invariants
 doc/LINTING.md    the lint gate and its documented exclusions
 doc/rfc6455.txt   the RFC 6455 reference
 doc/rfc7692.txt   the RFC 7692 reference (permessage-deflate)
+doc/rfc1950.txt   the RFC 1950 reference (DEFLATE format overview)
+doc/rfc1951.txt   the RFC 1951 reference (the DEFLATE compressed data format)
 doc/rfc3629.txt   the RFC 3629 reference (UTF-8; the shared boundary machine's spec)
 doc/rfc8307.txt   the RFC 8307 reference (QUIC)
 doc/rfc8441.txt   the RFC 8441 reference (HTTP/2 extended CONNECT)
 doc/rfc9220.txt   the RFC 9220 reference (HTTP/3 extended CONNECT)
 doc/COMPRESSION.md permessage-deflate design + interop evidence
+doc/DEFLATE-STREAM.md the DEFLATE stream machine (part 1): the RFC 7692
+                    7.2.1 compliant shape, the reference classifier (RFC
+                    1951), the exhaustive table, the ledger
 doc/STATES.md     the frame-reassembly state machine: the RFC 6455
                     transformation, the shared RFC 3629 boundary machine
                     (P6 projection), trace
@@ -387,7 +409,26 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                                  the implementation's decompress() on
                                  deflate_oracle.json, every wire the machine
                                  can accumulate)
+                gen/deflate_stream.py the DEFLATE stream machine (part 1,
+                                 doc/DEFLATE-STREAM.md): the spec reference
+                                 classifier for permessage-deflate compressed
+                                 data -- flate_decode (RFC 1951: the bit-
+                                 packing, the canonical code construction,
+                                 the three block types, the fault classes),
+                                 impl_decompress (the ws/ws.go decompress
+                                 loop with its size-guard ordering), and
+                                 spec7692 (the RFC 7692 7.2.1 compliant
+                                 shape: stream + truncated empty stored
+                                 tail); plus the exhaustive table generator
+                gen/check_deflstreamprops.py the stream self-check (A-H):
+                                 the RFC's worked examples and tables, the
+                                 7.2.1 shape, and exhaustive agreement with
+                                 the committed decompression oracle
                 gen/deflate_oracle.json the decompression oracle: the
+                                 implementation's decompress() on all 1,531
+                                 alphabet accumulations up to the limit
+                                 (generated by the Go oracle test; the same
+                                 code the traces replay against)
                                  implementation's decompress() on all 1,531
                                  alphabet accumulations up to the limit
                                  (generated by the Go oracle test; the same
@@ -425,7 +466,8 @@ Makefile        the repeatable gate: make gate (the full set) plus the
                     individual lint / staticcheck / test / race / fuzz /
                     mut / bench / mcdc / model / close-model / model-image /
                     mbt-gen / mbt-report / close-mbt-gen / close-report /
-                    branchcov / coverage / e2e targets
+                    deflate-model / defl-gen / defl-report / deflstream /
+                    deflstream-gen / branchcov / coverage / e2e targets
 ```
 
 ## Workflow

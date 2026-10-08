@@ -1,0 +1,17 @@
+[
+  {
+    "id": "MAY:deflate-accept:stream-incomplete",
+    "basis": "RFC 7692 7.2.1 (the compressed message ends in the truncated empty stored block; the implementation completes the last segment by appending the 9-octet completion tail) + RFC 7692's silence on decompression failure (as MAY:decompress-close-omitted records).",
+    "reason": "A buffer whose stream is truncated (no BFINAL block in the wire bytes) is not the RFC 7692 7.2.1 shape, but the implementation's completion tail happens to complete some of them -- the appended octets form the final block the decoder then reaches. RFC 7692's failure clause is absent, so accepting such a buffer (with the bytes the tail supplies) is a MAY leniency, not a MUST violation. Accepted: the implementation's documented tail-append policy; a receiver that rejects these instead is equally conformant."
+  },
+  {
+    "id": "MAY:deflate-accept:padding-nonzero",
+    "basis": "RFC 7692 7.2.1 (an endpoint MUST add minimal padding bits of 0 when a final block does not end at a byte boundary) + RFC 1951 (the stream simply ends at the final block; a bare flate reader discards anything after it).",
+    "reason": "Nonzero bits after the final block violate the compressor's padding MUST, but the padding obligation binds the compressor, not the receiver: RFC 1951's stream ends at the final block and the reader ignores the trailing bits. The implementation takes that leniency. Accepted: a MAY outcome; a receiver that rejected nonzero padding would also be conformant."
+  },
+  {
+    "id": "MAY:deflate-accept:tail-missing",
+    "basis": "RFC 7692 7.2.1 (a compliant compressed message ends in the truncated empty stored header) + RFC 1951 (a complete byte-aligned stream is valid DEFLATE data in its own right).",
+    "reason": "A complete byte-aligned stream with no truncated tail byte is what a bare RFC 1951 stream looks like; the implementation's final-block boundary loop terminates at the final block and does not require the 7.2.1 tail. The tail is what a compliant 7.2.1 compressor emits, but the RFC assigns the receiver no obligation to check for it. Accepted: a MAY leniency."
+  }
+]
