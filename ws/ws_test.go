@@ -26,6 +26,30 @@ func principal(r *http.Request) string {
 	return p
 }
 
+// sayGoodbye runs the polite close a test means when it passes a close code:
+// Shutdown puts the close frame on the wire, Close takes the transport down.
+// The drain between them (RFC 6455 §7.1.1's recv-until-0 step) is the test's
+// own read loop, when it has one.
+func sayGoodbye(c interface {
+	Shutdown(code int, reason string) error
+	Close() error
+}, code int, reason string) {
+	_ = c.Shutdown(code, reason)
+	_ = c.Close()
+}
+
+// sayGoodbyeNil is sayGoodbye for a handler return: the close frame goes out,
+// the handler reports success, and the upgrader's own teardown finishes the
+// job. The close-frame write status is not the handler's error to report.
+func sayGoodbyeNil(c interface {
+	Shutdown(code int, reason string) error
+	Close() error
+}, code int, reason string) error {
+	_ = c.Shutdown(code, reason)
+
+	return nil
+}
+
 func echo(c *ws.Session) error {
 	for {
 		op, data, err := c.ReadMessage()
@@ -57,7 +81,7 @@ func startServer(t *testing.T) *httptest.Server {
 	}))
 	mux.Handle("/bye", up.Handle(func(_ *http.Request, c *ws.Session) error {
 		_ = c.WriteMessage(ws.OpText, []byte("farewell"))
-		_ = c.Close(ws.StatusGoingAway, "later")
+		sayGoodbye(c, ws.StatusGoingAway, "later")
 		return nil
 	}))
 	mux.Handle("/data", up.Handle(func(r *http.Request, c *ws.Session) error {
@@ -85,7 +109,7 @@ func startServer(t *testing.T) *httptest.Server {
 		if err != nil {
 			return
 		}
-		defer c.Close(ws.StatusNormalClosure, "")
+		defer sayGoodbye(c, ws.StatusNormalClosure, "")
 		err = echo(c)
 		if err != nil {
 			t.Logf("auth echo ended: %v", err)
@@ -123,7 +147,7 @@ func TestAppPingPongRoundTrip(t *testing.T) {
 			ws.WithPongHandler(func(payload []byte) {
 				pong <- append([]byte(nil), payload...)
 			}))
-		defer c.Close(ws.StatusNormalClosure, "")
+		defer sayGoodbye(c, ws.StatusNormalClosure, "")
 		done := make(chan error, 1)
 		go func() { _, _, err := c.ReadMessage(); done <- err }()
 
@@ -139,7 +163,7 @@ func TestAppPingPongRoundTrip(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("pong handler never fired")
 		}
-		_ = c.Close(ws.StatusNormalClosure, "")
+		sayGoodbye(c, ws.StatusNormalClosure, "")
 		err = <-done
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("pump after close: %v, want io.EOF", err)
@@ -182,7 +206,7 @@ func TestAppPingPongRoundTrip(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("server pong handler never fired")
 		}
-		_ = c.Close(ws.StatusNormalClosure, "")
+		sayGoodbye(c, ws.StatusNormalClosure, "")
 		<-clientDone
 	})
 }
@@ -211,7 +235,7 @@ func TestAppPingValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("write after a refused ping: %v", err)
 	}
-	_ = c.Close(ws.StatusNormalClosure, "")
+	sayGoodbye(c, ws.StatusNormalClosure, "")
 	err = c.Ping(nil)
 	if !errors.Is(err, ws.ErrClosed) {
 		t.Fatalf("ping on a closed connection: %v, want ErrClosed", err)
@@ -223,7 +247,7 @@ func TestEchoTextAndBinary(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo", ws.WithSubprotocols("binary"))
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	got := c.Subprotocol()
 	if got != "binary" {
 		t.Fatalf("negotiated subprotocol = %q, want %q", got, "binary")
@@ -258,7 +282,7 @@ func TestSubprotocolNotAdvertised(t *testing.T) {
 	// design — requiring a subprotocol is an application decision), and the
 	// client's §1.9 check accepts the empty selection.
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo", ws.WithSubprotocols("nope"))
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	if got := c.Subprotocol(); got != "" {
 		t.Fatalf("negotiated subprotocol = %q, want empty", got)
 	}
@@ -269,7 +293,7 @@ func TestLargeMessage(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 
 	big := make([]byte, 1<<20) // 1 MiB
 	for i := range big {
@@ -290,7 +314,7 @@ func TestServerInitiatedClose(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/bye")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 
 	_, data, err := c.ReadMessage()
 	if err != nil || string(data) != "farewell" {
@@ -308,7 +332,7 @@ func TestCleanCloseIsEOF(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo")
-	_ = c.Close(ws.StatusNormalClosure, "done")
+	sayGoodbye(c, ws.StatusNormalClosure, "done")
 	_, _, err := c.ReadMessage()
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("clean close should yield io.EOF, got %v", err)
@@ -324,7 +348,7 @@ func TestHandlerPolicyFailure(t *testing.T) {
 	// reaches the peer as a 1011 close — not a misreported normal
 	// closure.
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/data")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	err := c.WriteMessage(ws.OpText, []byte("x"))
 	if err != nil {
 		t.Fatal(err)
@@ -392,7 +416,7 @@ func TestAuthBearer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial with bearer: %v", err)
 	}
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	err = c.WriteMessage(ws.OpText, []byte("hi"))
 	if err != nil {
 		t.Fatal(err)
@@ -443,7 +467,7 @@ func TestKeepaliveDetectsDeadPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close(ws.StatusAbnormalClosure, "")
+	defer sayGoodbye(c, ws.StatusAbnormalClosure, "")
 	_ = c.WriteMessage(ws.OpText, []byte("start")) // one exchange resets the clock
 
 	start := time.Now()

@@ -1,0 +1,28 @@
+{
+  "desc": "transition (OPEN, closeempty)",
+  "disposition": "clean",
+  "frames": [
+    "8800"
+  ],
+  "id": "T_OPEN_closeempty_client",
+  "initCode": null,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": null,
+      "disposition": "clean",
+      "id": null,
+      "mod": "must",
+      "note": "5.5.1 MUST answer; 7.4: 1005 resolves but MUST NOT be set",
+      "resolution": 1005,
+      "wire": "empty"
+    }
+  ],
+  "resolution": 1005,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "shape": "closeempty",
+  "side": "client",
+  "state": "OPEN"
+}

@@ -1,0 +1,28 @@
+{
+  "desc": "transition (OPEN, close1002)",
+  "disposition": "clean",
+  "frames": [
+    "880203ea"
+  ],
+  "id": "T_OPEN_close1002_client",
+  "initCode": null,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": 1002,
+      "disposition": "clean",
+      "id": null,
+      "mod": "must",
+      "note": "5.5.1 MUST answer, SHOULD echo the received code (7.4)",
+      "resolution": 1002,
+      "wire": "coded"
+    }
+  ],
+  "resolution": 1002,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "shape": "close1002",
+  "side": "client",
+  "state": "OPEN"
+}

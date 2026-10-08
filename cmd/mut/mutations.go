@@ -235,8 +235,8 @@ func closeFrameMutations() []mutation {
 		},
 		{
 			Name:        "close-echo-swap",
-			Pattern:     "_ = c.Close(code, reason)",
-			Replacement: "_ = c.Close(StatusPolicyViolation, reason)",
+			Pattern:     "_ = c.sendCloseFrame(code, reason)",
+			Replacement: "_ = c.sendCloseFrame(StatusPolicyViolation, reason)",
 			Invariant:   "the close reply must echo the peer's code; swapping in a fixed code corrupts every close handshake",
 		},
 		{
@@ -298,7 +298,7 @@ func closeCodeMutations() []mutation {
 			Name:        "close-write-timeout-zero",
 			Pattern:     "closeWriteTimeout     = 5 * time.Second",
 			Replacement: "closeWriteTimeout     = 0 * time.Second",
-			Invariant:   "Close's close-frame write must stay bounded when the caller set no write timeout",
+			Invariant:   "Shutdown's close-frame write must stay bounded when the caller set no write timeout",
 		},
 	}
 }
@@ -313,28 +313,53 @@ func closeStateMutations() []mutation {
 		},
 		{
 			Name:        "writeframe-closed-check-invert",
-			Pattern:     "defer c.mu.Unlock()\n\tif c.state.Load() == stClosed {\n\t\treturn c.closedWriteErr()",
+			Pattern:     "defer c.mu.Unlock()\n\tif c.state.Load() != stOpen {\n\t\treturn c.closedWriteErr()",
 			Replacement: "defer c.mu.Unlock()\n\tif c.state.Load() == stOpen {\n\t\treturn c.closedWriteErr()",
-			Invariant: "an internal write (pong, keepalive ping, close) on a closed connection " +
+			Invariant: "an internal write (pong, keepalive ping, close) on a closing or closed connection " +
 				"must return the recorded error",
 		},
 		{
-			Name:        "writemessage-closed-check-invert",
-			Pattern:     "c.mu.Lock()\n\tif c.state.Load() == stClosed {\n\t\tc.mu.Unlock()",
-			Replacement: "c.mu.Lock()\n\tif c.state.Load() == stOpen {\n\t\tc.mu.Unlock()",
-			Invariant: "a write on a closed connection must fail with the recorded error, " +
-				"never succeed for a frame that is not sent",
+			Name: "writemessage-closed-check-invert",
+			Pattern: "c.mu.Lock()\n\tif c.state.Load() != stOpen {\n" +
+				"\t\t// Read the recorded error while still holding the lock: closeErr is",
+			Replacement: "c.mu.Lock()\n\tif c.state.Load() == stOpen {\n" +
+				"\t\t// Read the recorded error while still holding the lock: closeErr is",
+			Invariant: "a write on a closing or closed connection must fail with the recorded error, " +
+				"never succeed for a frame that is not sent (RFC 6455 §5.5.1: no data frames after a Close)",
 		},
 		{
-			Name:        "closewith-store-invert",
-			Pattern:     "c.state.Store(stClosed)\n\tc.closeErr = closeErrFor(code, reason)",
-			Replacement: "c.state.Store(stOpen)\n\tc.closeErr = closeErrFor(code, reason)",
-			Invariant:   "Close must mark the connection closed; storing stOpen leaves it open with a recorded error",
+			Name:        "sendclose-store-invert",
+			Pattern:     "payload := c.buildClosePayload(code, reason)\n\tc.state.Store(stClosing)",
+			Replacement: "payload := c.buildClosePayload(code, reason)\n\tc.state.Store(stOpen)",
+			Invariant: "sending a Close frame must move the connection to stClosing; leaving it stOpen " +
+				"lets a second Close frame and further data frames out (§5.5.1 forbids both)",
+		},
+		{
+			Name: "sendclose-guard-drop",
+			Pattern: "func (c *RawConn) sendCloseFrame(code int, reason string) error {\n" +
+				"\tc.mu.Lock()\n\tif c.state.Load() != stOpen {",
+			Replacement: "func (c *RawConn) sendCloseFrame(code int, reason string) error {\n" +
+				"\tc.mu.Lock()\n\tif false {",
+			Invariant: "only one Close frame may ever be sent; dropping the guard lets " +
+				"a second one reach the wire",
+		},
+		{
+			Name:        "finalize-close-echo-always",
+			Pattern:     "func (c *RawConn) finalizeClose(code int, reason string) {\n\tif c.state.Load() == stOpen {",
+			Replacement: "func (c *RawConn) finalizeClose(code int, reason string) {\n\tif true {",
+			Invariant:   "an endpoint that already sent a Close must not send another in reply (§5.5.1)",
+		},
+		{
+			Name:        "close-swap-inert",
+			Pattern:     "if c.state.Swap(stClosed) == stClosed {",
+			Replacement: "if c.state.Load() == stClosed {",
+			Invariant: "Close must actually take the connection down; a load-only check never stores " +
+				"stClosed, so the connection stays open with the transport shut",
 		},
 		{
 			Name:        "finish-store-invert",
-			Pattern:     "if c.state.Load() == stOpen {\n\t\tc.state.Store(stClosed)\n\t\tc.closeErr = err",
-			Replacement: "if c.state.Load() == stOpen {\n\t\tc.state.Store(stOpen)\n\t\tc.closeErr = err",
+			Pattern:     "if c.state.Load() != stClosed {\n\t\t// stOpen -> stClosed (a protocol failure, a transport EOF) or",
+			Replacement: "if c.state.Load() == stClosed {\n\t\t// stOpen -> stClosed (a protocol failure, a transport EOF) or",
 			Invariant: "finish must record the terminal state; skipping the store leaves " +
 				"a torn state (error recorded, connection open)",
 		},

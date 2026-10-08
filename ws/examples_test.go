@@ -92,7 +92,7 @@ func Example() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hello"))
 	if err != nil {
@@ -154,7 +154,7 @@ func ExampleUpgrader() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hi"))
 	if err != nil {
@@ -208,7 +208,7 @@ func ExampleDial() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hi"))
 	if err != nil {
@@ -253,7 +253,7 @@ func ExampleWithDialer() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hi"))
 	if err != nil {
@@ -404,7 +404,7 @@ func ExampleWithDialer_mtls() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hi"))
 	if err != nil {
@@ -470,7 +470,7 @@ func ExampleWithCheckOrigin() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 	err = c.WriteMessage(OpText, []byte("delete_user"))
 	if err != nil {
 		panic(err)
@@ -512,7 +512,9 @@ func ExampleDialRaw() {
 				if writeErr != nil {
 					return writeErr
 				}
-				return c.Close(StatusGoingAway, "done")
+				_ = c.Shutdown(StatusGoingAway, "done")
+
+				return nil
 			default:
 			}
 		}
@@ -524,7 +526,7 @@ func ExampleDialRaw() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	pingErr := c.Ping([]byte("hi"))
 	if pingErr != nil {
@@ -585,7 +587,7 @@ func ExampleCloseCode() {
 	if err != nil {
 		panic(err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 
 	err = c.WriteMessage(OpText, []byte("hi"))
 	if err != nil {
@@ -636,7 +638,7 @@ func ExampleSession_WriteText() {
 	fmt.Println(err)
 	err = client.WriteText("delivered")
 	fmt.Println(err)
-	_ = client.Close(StatusNormalClosure, "")
+	sayGoodbye(client, StatusNormalClosure, "")
 	<-serverDone
 	<-clientDone
 	// Output:

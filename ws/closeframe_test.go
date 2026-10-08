@@ -2,16 +2,18 @@ package ws
 
 import (
 	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
 	"time"
 )
 
-// TestCloseFrame pins [RawConn.CloseFrame]'s contract: the low-level half of
-// [RawConn.Close] that reports the close-frame write status instead of the
-// recorded terminal error.
-func TestCloseFrame(t *testing.T) {
+// TestShutdown pins [RawConn.Shutdown]'s contract: it puts the close frame on
+// the wire and reports the status of *that write* — not how the connection
+// ended, which is what the read's terminal error reports — and it leaves the
+// transport up.
+func TestShutdown(t *testing.T) {
 	t.Parallel()
 
 	t.Run("writeSucceeds", func(t *testing.T) {
@@ -47,16 +49,28 @@ func TestCloseFrame(t *testing.T) {
 		}
 		client := newRawConn(serverConn, serverConn, true, 1<<20, 0, 0)
 
-		writeErr := client.CloseFrame(StatusGoingAway, "bye")
+		writeErr := client.Shutdown(StatusGoingAway, "bye")
 		if writeErr != nil {
-			t.Fatalf("CloseFrame on a live transport = %v, want nil (frame written)", writeErr)
+			t.Fatalf("Shutdown on a live transport = %v, want nil (frame written)", writeErr)
 		}
-		// Close after CloseFrame: the recorded terminal error, idempotent.
-		termErr := client.Close(StatusNormalClosure, "")
-		code, reason, ok := CloseCode(termErr)
-		if !ok || code != StatusGoingAway || reason != "bye" {
-			t.Fatalf("Close after CloseFrame = %v (%d %q), want the recorded 1001 bye",
-				termErr, code, reason)
+		// Shutdown half-closes the write side only: the connection is
+		// closing, not closed, and a second Shutdown sends no second frame
+		// (RFC 6455 5.5.1) — it reports that this side is already done.
+		if !client.Closed() {
+			t.Fatal("Closed() false after Shutdown; the write side should be shut")
+		}
+		second := client.Shutdown(StatusNormalClosure, "")
+		if !errors.Is(second, ErrClosed) {
+			t.Fatalf("second Shutdown = %v, want ErrClosed (no second close frame)", second)
+		}
+		// Close is the transport teardown, and it is idempotent.
+		closeErr := client.Close()
+		if closeErr != nil {
+			t.Fatalf("Close = %v, want nil", closeErr)
+		}
+		closeErr = client.Close()
+		if closeErr != nil {
+			t.Fatalf("second Close = %v, want nil (idempotent)", closeErr)
 		}
 		_ = serverConn.Close()
 	})
@@ -64,24 +78,24 @@ func TestCloseFrame(t *testing.T) {
 	t.Run("stalledTransport", func(t *testing.T) {
 		t.Parallel()
 		// A blackhole transport whose Write blocks until the write bound
-		// fires: CloseFrame must report the write failure, not the
-		// terminal error.
+		// fires: Shutdown must report the write failure, and a close frame
+		// that cannot reach the peer fails the connection like any other
+		// broken-pipe write.
 		nc := &deadlineConn{
 			entered: make(chan struct{}),
 			stuck:   make(chan struct{}), // never closed: a permanent blackhole
 			closed:  make(chan struct{}),
 		}
 		client := newRawConn(nc, nc, true, 1<<20, 0, 50*time.Millisecond)
-		writeErr := client.CloseFrame(StatusGoingAway, "gone")
+		writeErr := client.Shutdown(StatusGoingAway, "gone")
 		if !errors.Is(writeErr, os.ErrDeadlineExceeded) {
-			t.Fatalf("CloseFrame on a stalled transport = %v, want the deadline error", writeErr)
+			t.Fatalf("Shutdown on a stalled transport = %v, want the deadline error", writeErr)
 		}
 		// The connection is failed: a later write reports the recorded
-		// close error at once instead of re-stalling.
+		// error at once instead of re-stalling.
 		late := client.WriteText("late")
-		code, _, ok := CloseCode(late)
-		if !ok || code != StatusGoingAway {
-			t.Fatalf("write after a failed CloseFrame = %v, want the recorded 1001", late)
+		if !errors.Is(late, writeErr) {
+			t.Fatalf("write after a failed Shutdown = %v, want the recorded %v", late, writeErr)
 		}
 	})
 
@@ -90,10 +104,10 @@ func TestCloseFrame(t *testing.T) {
 		s, c := pipeConnPair()
 		drain(t, s)
 		drain(t, c)
-		_ = c.Close(StatusNormalClosure, "")
-		writeErr := c.raw.CloseFrame(StatusGoingAway, "late")
+		sayGoodbye(c, StatusNormalClosure, "")
+		writeErr := c.raw.Shutdown(StatusGoingAway, "late")
 		if !errors.Is(writeErr, ErrClosed) {
-			t.Fatalf("CloseFrame after a normal close = %v, want ErrClosed", writeErr)
+			t.Fatalf("Shutdown after a normal close = %v, want ErrClosed", writeErr)
 		}
 	})
 
@@ -102,24 +116,136 @@ func TestCloseFrame(t *testing.T) {
 		s, c := pipeConnPair()
 		drain(t, s)
 		drain(t, c)
-		writeErr := c.raw.CloseFrame(999, "")
+		writeErr := c.raw.Shutdown(999, "")
 		if writeErr == nil || !errors.Is(writeErr, errBadCloseCode) {
-			t.Fatalf("CloseFrame(999) = %v, want errBadCloseCode", writeErr)
+			t.Fatalf("Shutdown(999) = %v, want errBadCloseCode", writeErr)
 		}
 		// The connection is untouched: a write still succeeds, and the
-		// ordinary Close still works.
+		// polite close still works afterwards.
 		writeErr2 := c.WriteText("still open")
 		if writeErr2 != nil {
-			t.Fatalf("write after a refused CloseFrame = %v, want nil", writeErr2)
+			t.Fatalf("write after a refused Shutdown = %v, want nil", writeErr2)
 		}
-		_ = c.Close(StatusNormalClosure, "")
+		sayGoodbye(c, StatusNormalClosure, "")
 	})
 }
 
-// TestCloseFrameRawWire pins what CloseFrame puts on the wire: the peer's
-// close arrives as an OpClose event with the code and reason intact, so the
+// TestCloseIsAbrupt pins [RawConn.Close] as pure teardown: it never blocks,
+// never writes, and sends no close frame. A connection closed without a
+// preceding Shutdown is an abrupt close — the peer sees the transport go down
+// with no Close frame, which RFC 6455 7.1.5 resolves to 1006.
+func TestCloseIsAbrupt(t *testing.T) {
+	t.Parallel()
+	fc := &fakeConn{}
+	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
+
+	closeErr := c.Close()
+	if closeErr != nil {
+		t.Fatalf("Close = %v, want nil", closeErr)
+	}
+	if len(fc.written) != 0 {
+		t.Fatalf("Close wrote %d bytes to the wire, want none (no close frame)", len(fc.written))
+	}
+	if !c.Closed() {
+		t.Fatal("Closed() false after Close")
+	}
+	// The peer end sees no Close frame at all: the transport simply ends.
+	peer := newRawConn(&fakeConn{}, &fakeConn{}, true, 1<<20, 0, 0)
+	peerCloseErr := peer.Close()
+	if peerCloseErr != nil {
+		t.Fatalf("peer Close = %v, want nil", peerCloseErr)
+	}
+}
+
+// TestCloseNeverBlocksOnAStalledTransport is the regression for the wedge the
+// old blocking Close had: teardown takes no write lock and performs no write,
+// so a peer that has stopped reading cannot hold it open.
+func TestCloseNeverBlocksOnAStalledTransport(t *testing.T) {
+	t.Parallel()
+	nc := &deadlineConn{
+		entered: make(chan struct{}),
+		stuck:   make(chan struct{}), // never closed: a permanent blackhole
+		closed:  make(chan struct{}),
+	}
+	c := newRawConn(nc, nc, true, 1<<20, 0, time.Hour)
+
+	// Wedge a writer inside Write, holding the write mutex for the full
+	// (here: one hour) write bound.
+	stuck := make(chan error, 1)
+	go func() { stuck <- c.WriteMessage(OpText, make([]byte, 64<<10)) }()
+	<-nc.entered
+
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close blocked behind a stuck writer: teardown must not take the write lock")
+	}
+}
+
+// TestShutdownLeavesTheReadSideLive is the CLOSING state as RFC 6455 draws it:
+// §5.5.1 forbids sending more *data* frames after a Close frame, but says
+// nothing about receiving, and §7.1.5 defines the connection's close code as
+// the first Close frame *received*. So after Shutdown the peer's frames must
+// still arrive, and its close must still resolve the connection.
+func TestShutdownLeavesTheReadSideLive(t *testing.T) {
+	t.Parallel()
+	sr, cr := net.Pipe()
+	server := newRawConn(sr, sr, false, 1<<20, 0, 0)
+	client := newRawConn(cr, cr, true, 1<<20, 0, 0)
+	defer server.Close()
+	defer client.Close()
+
+	// The client pumps first: net.Pipe is synchronous, so the server's close
+	// frame needs a reader before it can be written at all.
+	clientDone := make(chan error, 1)
+	go func() {
+		for {
+			_, err := client.ReadEvent()
+			if err != nil {
+				clientDone <- err
+
+				return
+			}
+		}
+	}()
+
+	// The server shuts its write side, then keeps reading — the §7.1.1
+	// shutdown(SHUT_WR) then recv-until-0 shape.
+	shutdownErr := server.Shutdown(StatusGoingAway, "leaving")
+	if shutdownErr != nil {
+		t.Fatalf("server Shutdown = %v, want nil", shutdownErr)
+	}
+	// A data write after Shutdown is refused (§5.5.1).
+	writeErr := server.WriteText("too late")
+	if !errors.Is(writeErr, ErrClosed) {
+		t.Fatalf("write after Shutdown = %v, want ErrClosed", writeErr)
+	}
+
+	ev, err := server.ReadEvent()
+	if err != nil {
+		t.Fatalf("server ReadEvent after Shutdown = %v, want the client's close event", err)
+	}
+	if ev.Op != OpClose {
+		t.Fatalf("server read %v after Shutdown, want the peer's OpClose", ev.Op)
+	}
+	// Both frames exchanged: §5.5.1 requires the transport down, so the next
+	// read is the terminal and the read loop ends on its own.
+	_, err = server.ReadEvent()
+	if !errors.Is(err, io.EOF) && err == nil {
+		t.Fatalf("server second read = %v, want the terminal error", err)
+	}
+	<-clientDone
+}
+
+// TestShutdownWireRaw pins what Shutdown puts on the wire: the peer's close
+// arrives as an OpClose event with the code and reason intact, so the
 // write-status API and the event API cannot drift apart.
-func TestCloseFrameRawWire(t *testing.T) {
+func TestShutdownWireRaw(t *testing.T) {
 	t.Parallel()
 	sr, cr := net.Pipe()
 	server := newRawConn(sr, sr, false, 1<<20, 0, 0)
@@ -145,9 +271,9 @@ func TestCloseFrameRawWire(t *testing.T) {
 		serverErr <- err
 	}()
 
-	writeErr := client.CloseFrame(StatusGoingAway, "bye")
+	writeErr := client.Shutdown(StatusGoingAway, "bye")
 	if writeErr != nil {
-		t.Fatalf("CloseFrame = %v, want nil", writeErr)
+		t.Fatalf("Shutdown = %v, want nil", writeErr)
 	}
 
 	// The server saw the peer's close as an event: code and reason intact.
@@ -165,7 +291,7 @@ func TestCloseFrameRawWire(t *testing.T) {
 	}
 	// Release the loop's close replies, which have no readers past this
 	// point, by tearing both transports down.
-	_ = server.Close(StatusNormalClosure, "")
-	_ = client.Close(StatusNormalClosure, "")
+	sayGoodbye(server, StatusNormalClosure, "")
+	sayGoodbye(client, StatusNormalClosure, "")
 	<-clientDone
 }

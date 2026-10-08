@@ -135,7 +135,7 @@ func FuzzRawTraffic(f *testing.F) {
 					// fast-fail, never panic or block.
 					_ = raw.WriteText("done")
 					_ = raw.Ping([]byte("x"))
-					_ = raw.Close(StatusNormalClosure, "bye")
+					sayGoodbye(raw, StatusNormalClosure, "bye")
 
 					return
 				}
@@ -157,7 +157,7 @@ func FuzzRawTraffic(f *testing.F) {
 				case 3:
 					_ = raw.Ping(chunk)
 				default:
-					_ = raw.Close(1000+int(data[3])%3000, "fuzz")
+					_ = raw.Shutdown(1000+int(data[3])%3000, "fuzz")
 				}
 			}
 		}

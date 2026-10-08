@@ -1,0 +1,28 @@
+{
+  "desc": "transition (CLOSING, close1001)",
+  "disposition": "clean",
+  "frames": [
+    "880203e9"
+  ],
+  "id": "T_CLOSING_close1001_client",
+  "initCode": 1000,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": null,
+      "disposition": "clean",
+      "id": "SHOULD:close-712",
+      "mod": "should",
+      "note": "5.5.1 no second Close; 7.1.2: SHOULD close once both sent and received, resolving to the first Close received (7.1.5)",
+      "resolution": 1001,
+      "wire": "none"
+    }
+  ],
+  "resolution": 1001,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.1.2"
+  ],
+  "shape": "close1001",
+  "side": "client",
+  "state": "CLOSING"
+}

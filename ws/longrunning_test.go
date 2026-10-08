@@ -92,9 +92,11 @@ func (d *deadlineConn) Close() error {
 }
 
 // TestWriteDeadlineUnsticksClose is the regression test for the wedge: a
-// WriteMessage stuck on a blackhole holds the write mutex, and a concurrent
-// Close must complete once the write deadline fires — not block forever. On
-// the pre-fix code Close never returns, so the bound below fails.
+// WriteMessage stuck on a blackhole holds the write mutex, and neither the
+// close-frame write nor the teardown may be held open by it. Shutdown queues
+// behind the stuck writer but is bounded by the write deadline; Close takes no
+// write lock at all and returns at once. On the pre-fix code the single
+// blocking Close never returns, so the bounds below fail.
 func TestWriteDeadlineUnsticksClose(t *testing.T) {
 	nc := &deadlineConn{
 		entered: make(chan struct{}),
@@ -111,14 +113,15 @@ func TestWriteDeadlineUnsticksClose(t *testing.T) {
 	// inside Write (no real sleep: this is a channel signal).
 	<-nc.entered
 
-	// A concurrent Close must now complete after the write deadline fires.
+	// Teardown does not queue behind the stuck writer at all: it takes no
+	// write lock, so it completes immediately.
 	cerr := make(chan error, 1)
-	go func() { cerr <- c.Close(StatusNormalClosure, "") }()
+	go func() { cerr <- c.Close() }()
 
 	select {
 	case <-cerr:
 	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return within 2s: the stuck write still holds the write mutex (wedge not fixed)")
+		t.Fatal("Close did not return within 2s: teardown must not wait on the write mutex")
 	}
 
 	// The stuck writer must have failed with a deadline, not blocked.
@@ -228,11 +231,8 @@ func TestWriteTransportFailureFailsConnection(t *testing.T) {
 	if !errors.Is(second, writeErr) {
 		t.Fatalf("second write = %v, want the recorded %v", second, writeErr)
 	}
-	err := c.Close(StatusNormalClosure, "")
-	if !errors.Is(err, writeErr) {
-		t.Fatalf("Close = %v, want the recorded %v", err, writeErr)
-	}
-	_, _, err = c.ReadMessage()
+	_ = c.Close()
+	_, _, err := c.ReadMessage()
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("ReadMessage = %v, want the recorded %v", err, writeErr)
 	}
@@ -334,9 +334,9 @@ func TestCloseRespectsWriteTimeout(t *testing.T) {
 	nc := &immediateConn{}
 	c := newRawConn(nc, nc, true, 1<<20, 0, 250*time.Millisecond)
 
-	err := c.Close(StatusNormalClosure, "")
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("Close: got %v, want io.EOF for a normal closure", err)
+	shutdownErr := c.Shutdown(StatusNormalClosure, "")
+	if shutdownErr != nil {
+		t.Fatalf("Shutdown: got %v, want the close frame written", shutdownErr)
 	}
 	dl := nc.lastArmed()
 	if d := time.Until(dl) - 250*time.Millisecond; d < -100*time.Millisecond || d > 100*time.Millisecond {
@@ -351,9 +351,9 @@ func TestCloseFallbackBoundWithoutWriteTimeout(t *testing.T) {
 	nc := &immediateConn{}
 	c := newRawConn(nc, nc, true, 1<<20, 0, 0)
 
-	err := c.Close(StatusNormalClosure, "")
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("Close: got %v, want io.EOF for a normal closure", err)
+	shutdownErr := c.Shutdown(StatusNormalClosure, "")
+	if shutdownErr != nil {
+		t.Fatalf("Shutdown: got %v, want the close frame written", shutdownErr)
 	}
 	dl := nc.lastArmed()
 	if d := time.Until(dl) - closeWriteTimeout; d < -100*time.Millisecond || d > 100*time.Millisecond {
@@ -380,7 +380,7 @@ func TestClosedSignal(t *testing.T) {
 			}
 		})
 	}
-	_ = c.Close(StatusNormalClosure, "")
+	sayGoodbye(c, StatusNormalClosure, "")
 	wg.Wait()
 
 	if !c.Closed() {
@@ -436,7 +436,7 @@ func TestDefaultWriteTimeoutApplies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 	if got := c.raw.writeTimeout; got <= 0 {
 		t.Fatalf("client default write bound = %v, want the positive default", got)
 	}

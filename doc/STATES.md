@@ -176,9 +176,8 @@ correct.
 
 ## Behaviors the model pins (and why they matter)
 
-These are behaviors the traces pin explicitly — the close-frame policy for
-each violation class, the size limit that applies to close frames too, and
-the per-fragment UTF-8 rule:
+These are behaviors the traces pin explicitly — items 1 and 3 are RFC 6455
+obligations; item 2 is this library's `maxMessageSize` policy:
 
 1. **Every protocol violation sends the SHOULD close frame.** Header
    violations (masking, RSV, non-minimal length, control size, single-frame
@@ -190,11 +189,13 @@ the per-fragment UTF-8 rule:
    state-corrupting error) as a permitted alternative, so the suite would
    warn if the implementation ever regressed to a bare teardown; today it
    takes the SHOULD everywhere, so the warning ledger is empty.
-2. **`maxMessageSize` bounds every frame, including close frames.** The
-   frame codec rejects any frame whose payload exceeds the limit, so a
-   close frame with a reason larger than the limit is rejected with 1002.
-   The model's close-with-reason frames are kept within the limit
-   (3 bytes) to exercise the reason-echo behavior.
+2. **`maxMessageSize` bounds every frame, including close frames** (project
+   policy, not RFC). `maxMessageSize` is this library's limit, not an RFC 6455
+   concept, so this is a project convention the traces pin — not an RFC
+   obligation the model derives. The frame codec rejects any frame whose
+   payload exceeds the limit, so a close frame with a reason larger than the
+   limit is rejected with 1002. The model instantiates the limit at 3 bytes
+   to exercise the overflow and reason-echo behavior with small frames.
 3. **Per-message UTF-8 on fragments.** A text fragment is validated on the
    concatenated payload at completion, not per frame: `FGT1 + contff`
    (0x41 then 0xff) fails with 1007, and a fragment that is already broken

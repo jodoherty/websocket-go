@@ -190,7 +190,7 @@ func TestMCDCCloseCodeRange(t *testing.T) {
 		return newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 	}
 	badCode := func(code int) bool {
-		err := fresh().Close(code, "probe")
+		err := fresh().Shutdown(code, "probe")
 
 		return errors.Is(err, errBadCloseCode)
 	}
@@ -229,7 +229,7 @@ func TestMCDCCloseCodePayload(t *testing.T) {
 	closeFrame := func(code int, reason string) []byte {
 		transport := &fakeConn{}
 		c := newRawConn(transport, transport, false, 1<<20, 0, 0)
-		_ = c.Close(code, reason)
+		sayGoodbye(c, code, reason)
 
 		return transport.written
 	}

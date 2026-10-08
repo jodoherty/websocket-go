@@ -120,14 +120,14 @@ func TestWriteMessageClearsDeadlineOnCompressFailure(t *testing.T) {
 }
 
 // TestCloseRejectsOutOfRangeCode pins the close-code range check in
-// Close: codes outside 1000-4999 are rejected before any I/O.
+// Shutdown: codes outside 1000-4999 are rejected before any I/O.
 func TestCloseRejectsOutOfRangeCode(t *testing.T) {
 	c := newRawConn(failWriteConn{}, failWriteConn{}, true, 1<<20, 0, 0)
 
 	for _, code := range []int{999, 5000, 0} {
-		closeErr := c.Close(code, "bad")
+		closeErr := c.Shutdown(code, "bad")
 		if closeErr == nil || !errors.Is(closeErr, errBadCloseCode) {
-			t.Fatalf("Close(%d) = %v, want errBadCloseCode", code, closeErr)
+			t.Fatalf("Shutdown(%d) = %v, want errBadCloseCode", code, closeErr)
 		}
 	}
 }

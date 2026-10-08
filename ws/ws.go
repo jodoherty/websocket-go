@@ -24,7 +24,7 @@
 //
 //	c, err := ws.Dial(ctx, "wss://example.com/ws")
 //	// err: TLS failure, an HTTP status, or a rejected handshake
-//	defer c.Close(ws.StatusNormalClosure, "")
+//	defer c.Close()
 //	// err = c.WriteMessage(ws.OpText, []byte("hello"))
 //
 // Executable, runnable versions of both halves — plus bearer auth, the
@@ -56,7 +56,7 @@
 //     if err != nil {
 //     return // an appropriate 4xx/5xx response was already written
 //     }
-//     defer c.Close(ws.StatusNormalClosure, "")
+//     defer c.Close()
 //
 //     for {
 //     op, data, err := c.ReadMessage()
@@ -137,8 +137,10 @@
 // [WithDialer] dial function takes one. On a live connection, the
 // *deadlines* do the bounding: the keepalive window (or a read deadline
 // when keepalive is disabled) bounds reads, and the write timeout bounds
-// writes and [Session.Close]. Cancelling a live connection is therefore
-// [Session.Close] from another goroutine — bounded, idempotent, and safe
+// writes and [Session.Shutdown] — the call that puts a close frame on the
+// wire. [Session.Close] itself only tears the transport down, so it never
+// blocks and needs no bound. Cancelling a live connection is therefore
+// [Session.Close] from another goroutine — idempotent, immediate, and safe
 // from anywhere — rather than a context cancellation, which is what the
 // deadline ownership above makes the cheaper answer. The deadline options
 // bind only where the underlying stream can enforce them (a hijacked net.Conn
@@ -375,9 +377,28 @@ func (s *Session) WriteJSON(v any) error { return s.raw.WriteJSON(v) }
 // [WithPongHandler], if one was set).
 func (s *Session) Ping(payload []byte) error { return s.raw.Ping(payload) }
 
-// Close closes the connection, exactly as [RawConn.Close]: idempotent,
-// safe from any goroutine, best-effort close frame, bounded write.
-func (s *Session) Close(code int, reason string) error { return s.raw.Close(code, reason) }
+// Close closes the underlying transport, exactly as [RawConn.Close]: it never
+// blocks and never writes, so a connection that has been read to its terminal
+// is already down here and this is an idempotent no-op. To close politely,
+// send a close frame first with [Session.Shutdown] and let the read loop run
+// to its terminal; a bare Close is an abrupt close that the peer resolves to
+// 1006. It is safe to call from any goroutine.
+func (s *Session) Close() error { return s.raw.Close() }
+
+// Shutdown starts the closing handshake the way RFC 6455 §7.1.2 defines it:
+// it sends a close frame with the given code and reason and stops this side
+// from sending more data, but leaves the transport up and the read side live.
+// The peer's frames keep arriving on [Session.ReadMessage] until its own close
+// lands, and that read loop ending is how the handshake completes — §7.1.5
+// defines the connection's close code as the first close frame received, so
+// reading is the only way to learn it.
+//
+// This is the writer's half of the close: write your last messages, Shutdown,
+// then [Session.Close]. A reader instead loops on [Session.ReadMessage] until
+// it returns the terminal error and then calls [Session.Close]. Shutdown is
+// idempotent, safe from any goroutine, and returns the status of the close-
+// frame write rather than how the connection ended.
+func (s *Session) Shutdown(code int, reason string) error { return s.raw.Shutdown(code, reason) }
 
 // Closed reports whether the connection has been closed, exactly as
 // [RawConn.Closed].
@@ -532,7 +553,7 @@ func WithIdleTimeout(d time.Duration) Option {
 
 // WithWriteTimeout bounds how long a single [Session.WriteMessage] may block
 // writing to the transport, so a blackholed peer cannot wedge the write
-// mutex and, with it, [Session.Close]. The default is 30 s; pass 0 to remove
+// mutex and, with it, [Session.Shutdown]. The default is 30 s; pass 0 to remove
 // the bound (a write then blocks until the transport completes or the
 // connection is closed). A negative bound is invalid and is replaced by
 // the default, never by "unbounded".
@@ -1258,13 +1279,14 @@ func (u *Upgrader) Handle(handler func(request *http.Request, c *Session) error)
 		// cleanup — never swallowed.
 		defer func() {
 			if panicked := recover(); panicked != nil {
-				_ = conn.Close(StatusUnexpectedCondition, "handler panic")
+				_ = conn.Shutdown(StatusUnexpectedCondition, "handler panic")
+				_ = conn.Close()
 
 				panic(panicked)
 			}
 		}()
 
-		closeAfterHandler(conn, handler(request, conn))
+		closeAfterHandler(conn.raw, handler(request, conn))
 	})
 }
 
@@ -1283,7 +1305,8 @@ func (u *Upgrader) HandleRaw(handler func(request *http.Request, c *RawConn) err
 		// the hijacked transport; the panic propagates after cleanup.
 		defer func() {
 			if panicked := recover(); panicked != nil {
-				_ = conn.Close(StatusUnexpectedCondition, "handler panic")
+				_ = conn.Shutdown(StatusUnexpectedCondition, "handler panic")
+				_ = conn.Close()
 
 				panic(panicked)
 			}
@@ -1302,29 +1325,29 @@ func (u *Upgrader) HandleRaw(handler func(request *http.Request, c *RawConn) err
 // normally. When the handler's error already tore the connection down (the
 // common case for transport errors: the read fails and records the error),
 // the recorded close wins and nothing more goes on the wire.
-func closeAfterHandler(conn interface {
-	Close(code int, reason string) error
-}, err error) {
+func closeAfterHandler(conn *RawConn, err error) {
 	var closeErr *CloseError
-	if ok := errors.As(err, &closeErr); ok {
-		code := closeErr.Code
+	code, reason := StatusNormalClosure, ""
+	switch {
+	case errors.As(err, &closeErr):
+		code = closeErr.Code
+		reason = closeErr.Reason
 		if code < closeCodeMin || code > closeCodeMax {
 			// An out-of-range code cannot go on the wire; tear down with
 			// 1002 so the connection is always closed.
-			_ = conn.Close(StatusProtocolError, "invalid close code from handler")
-
-			return
+			code, reason = StatusProtocolError, "invalid close code from handler"
 		}
-		_ = conn.Close(code, closeErr.Reason)
-
-		return
+	case err != nil:
+		code, reason = StatusUnexpectedCondition, "handler failure"
 	}
-	if err == nil {
-		_ = conn.Close(StatusNormalClosure, "")
-
-		return
-	}
-	_ = conn.Close(StatusUnexpectedCondition, "handler failure")
+	// The server does not drain here. RFC 6455 §7.1.1 draws the asymmetry
+	// explicitly: a server instructed to close "SHOULD initiate a TCP Close
+	// immediately", where it is the client that "SHOULD wait for a TCP Close
+	// from the server". The handler's own read loop has already returned, so
+	// there is no reader left to complete the handshake with, and waiting for
+	// a peer that may never answer is exactly what this path must not do.
+	_ = conn.Shutdown(code, reason)
+	_ = conn.Close()
 }
 
 // Handle is [NewUpgrader].Handle with the default upgrader, for the simple
@@ -2199,6 +2222,10 @@ func checkSubprotocolEcho(offered []string, echoed string) error {
 
 const (
 	stOpen int32 = iota
+	// stClosing: a Close frame has been sent and the transport is still open,
+	// waiting for the peer's Close to complete the closing handshake
+	// (RFC 6455 7.1.3).
+	stClosing
 	stClosed
 )
 
@@ -2230,7 +2257,15 @@ var connSeq atomic.Uint64
 // violation (answered with 1002 per RFC 6455 §7.1.7) or a transport
 // failure. [RawConn.ReadEvent] is the single read loop; like
 // [Session.ReadMessage] it must only be called from one goroutine at a
-// time. Every write and [RawConn.Close] is safe from any goroutine.
+// time. Every write, [RawConn.Shutdown], and [RawConn.Close] is safe from
+// any goroutine.
+//
+// The close API is the RFC's own three-step example (§7.1.1) with one method
+// per step: [RawConn.Shutdown] sends this endpoint's Close frame and half-
+// closes the write side, [RawConn.ReadEvent] drained to its terminal is the
+// read side finishing, and [RawConn.Close] closes the transport. There is no
+// method that waits for the closing handshake, because the only thing that
+// can finish it is reading — and reading belongs to the pumping goroutine.
 type RawConn struct {
 	nc transport
 	// deadlines is the channel's deadline enforcement, resolved once at
@@ -2246,7 +2281,7 @@ type RawConn struct {
 	id          uint64
 	subprotocol string
 
-	state    atomic.Int32 // stOpen or stClosed
+	state    atomic.Int32 // stOpen, stClosing, or stClosed
 	closeErr error        // valid once state == stClosed; guarded by c.mu
 
 	idleTimeout  time.Duration
@@ -2429,11 +2464,10 @@ func (c *RawConn) ReadEvent() (Event, error) {
 			if closeErr != nil {
 				return Event{}, closeErr
 			}
-			// The close is resolved: reply with the same code and finish,
-			// then deliver the event; the next ReadEvent reports the
-			// terminal error the finish recorded.
-			_ = c.Close(code, reason)
-			_ = c.finish(closeErrFor(code, reason))
+			// The close is resolved: echo it if we haven't sent one ourselves,
+			// then close the transport and record the terminal; the next
+			// ReadEvent reports that terminal error.
+			c.finalizeClose(code, reason)
 
 			return Event{Op: OpClose, Code: code, Reason: reason}, nil
 		case OpText, OpBinary, OpContinuation:
@@ -2770,10 +2804,13 @@ func truncateReason(reason string) string {
 // with 1002, the code the SHOULD carries for a protocol violation that is not
 // the invalid-data-type 1007.
 func (c *RawConn) failWith(code int, what string) error {
-	err := fmt.Errorf("%w: %s", errProtocol, what)
-	_ = c.Close(code, what)
+	// Send the close frame (the 7.1.7 SHOULD) and finalize immediately on the
+	// code we are answering with — the peer's close is not expected here (we
+	// are failing the connection, not completing a handshake it initiated), so
+	// there is nothing to wait for and the transport goes down at once.
+	_ = c.Shutdown(code, what)
 
-	return c.finish(err)
+	return c.finish(closeErrFor(code, what))
 }
 
 func (c *RawConn) failProtocol(what string) error { return c.failWith(StatusProtocolError, what) }
@@ -2800,7 +2837,8 @@ func opcodeName(opcode Op) string {
 
 // closedWriteErr is the error a write path returns for a closed
 // connection: the recorded close error when there is one, ErrClosed for a
-// normal closure.
+// normal closure. The caller must hold c.mu: closeErr is written under it by
+// whichever path drove the connection to stClosed.
 func (c *RawConn) closedWriteErr() error {
 	if c.closeErr != nil {
 		return c.closeErr
@@ -2824,7 +2862,7 @@ func (c *RawConn) closedWriteErr() error {
 func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.state.Load() == stClosed {
+	if c.state.Load() != stOpen {
 		return c.closedWriteErr()
 	}
 	if c.writeTimeout > 0 {
@@ -2855,7 +2893,7 @@ func (c *RawConn) writeFrame(opcode Op, payload []byte, compressed bool) error {
 // caller still returns the write error itself. Validation failures are
 // not transport failures and must not use this.
 func (c *RawConn) failTransportWrite(writeErr error) {
-	if c.state.Load() == stOpen {
+	if c.state.Load() != stClosed {
 		c.state.Store(stClosed)
 		c.closeErr = writeErr
 		_ = c.nc.Close()
@@ -2878,8 +2916,8 @@ func (c *RawConn) failTransportWrite(writeErr error) {
 // reaches the transport and fails — the write deadline fires, or the
 // connection resets — means the pipe is broken, so the connection is
 // marked closed with the error recorded, exactly as the read path reacts
-// to a failed pong or keepalive probe. Later writes and [Close] then
-// return the recorded error at once instead of re-stalling, [Closed]
+// to a failed pong or keepalive probe. Later writes then return the
+// recorded error at once instead of re-stalling, [Closed]
 // turns true so background writers can stop, and the transport is closed
 // (as [Close] does) so a reader blocked in [ReadMessage] wakes instead of
 // waiting for keepalive. The write timeout therefore bounds the
@@ -2906,10 +2944,14 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 			errMessageTooBig, len(data), c.fc.maxMsg)
 	}
 	c.mu.Lock()
-	if c.state.Load() == stClosed {
+	if c.state.Load() != stOpen {
+		// Read the recorded error while still holding the lock: closeErr is
+		// written under c.mu by the read path, so reading it after unlocking
+		// would race the very close this branch reports.
+		writeErr := c.closedWriteErr()
 		c.mu.Unlock()
 
-		return c.closedWriteErr()
+		return writeErr
 	}
 	if c.fragWriting {
 		c.mu.Unlock()
@@ -2919,7 +2961,7 @@ func (c *RawConn) WriteMessage(opcode Op, data []byte) error {
 	if c.writeTimeout > 0 {
 		// Bound the write so a blackholed transport cannot hold the write
 		// mutex forever: a stuck write must fail (releasing the mutex) so
-		// [RawConn.Close] can still tear the connection down. Cleared on return
+		// [RawConn.Shutdown] can still get its close frame out. Cleared on return
 		// so the bound is per-write, not sticky.
 		_ = c.deadlines.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
@@ -3006,7 +3048,7 @@ func (c *RawConn) WriteFrame(opcode Op, payload []byte, more bool) error {
 		return validateErr
 	}
 	c.mu.Lock()
-	if c.state.Load() == stClosed {
+	if c.state.Load() != stOpen {
 		writeErr := c.closedWriteErr()
 		c.mu.Unlock()
 
@@ -3157,7 +3199,7 @@ func (c *RawConn) WriteBinary(data []byte) error {
 
 // WriteJSON marshals v to JSON and writes it as a text message. The
 // marshal happens before the write lock is taken, so a large marshal does
-// not hold up other writers or [RawConn.Close]; a marshal failure is returned
+// not hold up other writers or [RawConn.Shutdown]; a marshal failure is returned
 // before anything reaches the wire. JSON output is valid UTF-8 by
 // construction, so the text-frame rule (RFC 6455 §5.6) holds by
 // construction as well.
@@ -3170,136 +3212,175 @@ func (c *RawConn) WriteJSON(v any) error {
 	return c.WriteMessage(OpText, payload)
 }
 
-// closeWith performs the close sequence shared by [RawConn.Close] and
-// [RawConn.CloseFrame]: it validates the close code, builds the payload, and,
-// on an open connection, records the terminal error, sends the close frame
-// (bounded by the write timeout or the fixed fallback, where the stream
-// enforces deadlines), and closes the
-// transport. It returns (writeErr, terminal) — the close-frame write status
-// and the terminal error recorded on the connection. A validation failure
-// returns (error, nil) and leaves the connection untouched; an already
-// closed connection returns (recorded, recorded) without touching the wire.
-func (c *RawConn) closeWith(code int, reason string) (error, error) {
-	if code < closeCodeMin || code > closeCodeMax {
-		return fmt.Errorf("%w: %d", errBadCloseCode, code), nil
+// buildClosePayload assembles the close frame payload from a close code that
+// is already known to be in the valid range: the two-byte status plus the
+// reason, for codes that may carry a status. Codes that MUST NOT appear as
+// a status on the wire (1004-1006, 1015, RFC 6455 §7.4) yield an empty
+// payload; a non-UTF-8 reason is dropped (§5.5: the reason is the UTF-8 of a
+// text message); and the whole payload is truncated to the 125-byte frame
+// limit (2-byte code + reason).
+func (c *RawConn) buildClosePayload(code int, reason string) []byte {
+	if mustNotSetCloseCode(code) {
+		return nil
 	}
-	var payload []byte
-	if !mustNotSetCloseCode(code) {
-		// RFC 6455 §5.5: the reason is the UTF-8 of a text message, so a
-		// non-UTF-8 reason is dropped — the close frame carries the code
-		// alone — rather than putting invalid bytes on the wire.
-		if !utf8.ValidString(reason) {
-			reason = ""
-		}
-		// Close frame payloads max out at 125 bytes: 2-byte code + reason.
-		reason = truncateReason(reason)
-		payload = make([]byte, closeCodeBytes+len(reason))
-		binary.BigEndian.PutUint16(payload, uint16(code))
-		copy(payload[closeCodeBytes:], reason)
+	if !utf8.ValidString(reason) {
+		reason = ""
 	}
+	reason = truncateReason(reason)
+	payload := make([]byte, closeCodeBytes+len(reason))
+	// #nosec G115 -- every caller passes a code already vetted by usableCloseCode
+	// (1000..4999), so the conversion to the wire's 2-byte field cannot truncate.
+	binary.BigEndian.PutUint16(payload, uint16(code))
+	copy(payload[closeCodeBytes:], reason)
+
+	return payload
+}
+
+// sendCloseFrame sends a close frame with the given code and reason on a
+// connection that has not sent one yet, moving it to stClosing. It does not
+// close the transport: that happens when the peer's close is read and resolved
+// (see [RawConn.Shutdown]), or immediately in [RawConn.Close]. It is the
+// single place the library writes a close frame, so it is safe to call from
+// any goroutine and from the read path (the echo of the peer's close).
+//
+// It returns the status of the close-frame write, bounded by the connection's
+// write timeout when set and by a fixed fallback otherwise, so a silent or
+// half-dead peer cannot hold the close open forever. On a connection that is
+// already closing or closed it sends no second frame and returns the recorded
+// (or [ErrClosed]) error.
+func (c *RawConn) sendCloseFrame(code int, reason string) error {
 	c.mu.Lock()
-	if c.state.Load() == stClosed {
+	if c.state.Load() != stOpen {
 		writeErr := c.closedWriteErr()
-		terminal := terminalErr(c.closeErr)
 		c.mu.Unlock()
 
-		return writeErr, terminal
+		return writeErr
 	}
-	c.state.Store(stClosed)
-	c.closeErr = closeErrFor(code, reason)
-	// The close frame is sent best-effort: the kernel delivers queued data
-	// before the FIN, so it reaches the peer in order when the transport
-	// allows. The write is bounded by the connection's write timeout when
-	// the caller set one — the same bound every other write on this
-	// connection obeys — and by the fixed fallback otherwise, so a silent
-	// or half-dead peer must not be able to hold the close open forever.
+	payload := c.buildClosePayload(code, reason)
+	c.state.Store(stClosing)
 	closeBound := closeWriteTimeout
 	if c.writeTimeout > 0 {
 		closeBound = c.writeTimeout
 	}
+	// The close frame is sent best-effort: the kernel delivers queued data
+	// before the FIN, so it reaches the peer in order when the transport
+	// allows.
 	_ = c.deadlines.SetWriteDeadline(time.Now().Add(closeBound))
 	writeErr := c.fc.writeFrame(OpClose, payload, false, true)
 	_ = c.deadlines.SetWriteDeadline(time.Time{})
-	// Read under the lock: closeErr is written only under c.mu, and the
-	// terminal this caller reports is the one recorded on the connection.
-	terminal := terminalErr(c.closeErr)
-	c.mu.Unlock()
-	_ = c.nc.Close()
-
-	return writeErr, terminal
-}
-
-// Close closes the connection, sending a close frame with the given code and
-// reason before tearing down the transport. It is idempotent and safe to
-// call from any goroutine, including the pumping goroutine.
-//
-// Close codes must be in the range 1000-4999. Codes that cannot appear as a
-// status on the wire — 1005, 1006, 1015 (MUST NOT, RFC 6455 §7.4) plus the
-// reserved 1004 — go out with an empty payload. A reason that is not valid
-// UTF-8 is dropped (the frame carries the code alone), because RFC 6455
-// §5.5 says the reason is the UTF-8 of a text message. The return value is the
-// terminal error recorded on the connection — [io.EOF] for a normal
-// closure (1000), a [*CloseError] otherwise — not the status of the
-// close-frame write, which is best effort: the kernel delivers queued data
-// before the FIN, so the frame reaches the peer in order when the transport
-// allows. Concurrent Close callers all observe the same recorded error, from
-// the first one to close.
-//
-// Teardown latency on a stalled transport. Where the stream enforces
-// deadlines, the close-frame write is bounded by the connection's
-// [WithWriteTimeout] when one was set, and by a fixed 5-second fallback
-// otherwise — a silent or half-dead peer must not be able to hold the
-// close open forever. (Over a stream that cannot enforce deadlines, a
-// session only exists with both options zero — [ErrNoDeadlineSupport] —
-// and no bound applies; liveness there is the transport's job.)
-//
-// Two stacking effects are worth knowing:
-// Close takes the same write mutex as every other writer, so it queues
-// behind an in-flight data write (itself bounded by the write timeout), and
-// the read path answers the peer's close frame with its own, so a peer that
-// stops reading can also delay the [Session.ReadMessage] that reports the
-// closure by that same bound. Worst case, handler teardown waits on the
-// order of the write timeout plus the close bound. The close-frame write
-// status itself is [RawConn.CloseFrame]'s return value.
-func (c *RawConn) Close(code int, reason string) error {
-	writeErr, terminal := c.closeWith(code, reason)
-	if terminal == nil {
-		// terminal is nil only when the code was rejected: the connection
-		// is untouched and the validation error is the return value.
-		return writeErr
+	if writeErr != nil {
+		// A close frame that cannot reach the peer means the pipe is broken:
+		// the same verdict as any other transport-level write failure, so the
+		// connection is failed with the write error recorded rather than left
+		// sitting in stClosing on a dead transport.
+		c.failTransportWrite(writeErr)
 	}
-
-	return terminal
-}
-
-// CloseFrame is the low-level half of [RawConn.Close]: the same validation,
-// the same close frame, the same bounded write, and the same teardown —
-// but it returns the status of the close-frame write itself instead of the
-// recorded terminal error. It returns nil when the frame was written, a
-// transport error when the write failed or its deadline fired, the recorded
-// close error (or [ErrClosed] after a normal closure) when the connection
-// was already closed — never a silent success for a frame that will not be
-// sent — and an error wrapping [errBadCloseCode], with the connection
-// untouched, for an out-of-range code. Use it when you need to know whether
-// the peer actually received the close frame, not just how the connection
-// ended.
-//
-// Like [RawConn.Close], it is idempotent and safe to call from any
-// goroutine, including the pumping goroutine. The session face does not
-// expose it: [Session.Close] reports the terminal error.
-func (c *RawConn) CloseFrame(code int, reason string) error {
-	writeErr, _ := c.closeWith(code, reason)
+	c.mu.Unlock()
 
 	return writeErr
 }
 
-// Closed reports whether the connection has been closed, from any goroutine.
-// It is the cheap, race-free signal a background writer goroutine needs to
-// stop: it can check Closed() (or select on work and bail when true) instead
-// of waiting for its next WriteMessage to fail with ErrClosed.
-func (c *RawConn) Closed() bool {
-	return c.state.Load() == stClosed
+// Shutdown starts the closing handshake: RFC 6455 §7.1.2, "_Start the
+// WebSocket Closing Handshake_". It validates the close code and sends a
+// Close frame carrying it, which moves the connection to stClosing. It does
+// not close the transport.
+//
+// This is the shutdown(SHUT_WR) half of the clean-closure sequence the RFC
+// gives as its own example in §7.1.1: shut the write side, keep reading until
+// the peer has said its piece, then close. After Shutdown the write half is
+// closed — RFC 6455 §5.5.1 says an application MUST NOT send any more data
+// frames after sending a Close frame, so writes fail with [ErrClosed] — while
+// the read half stays fully live, and it must: §7.1.5 defines this
+// connection's close code as the first Close frame *received*, which cannot be
+// learned without reading, and §5.5.1 lets the peer keep sending data until it
+// has sent its own Close.
+//
+// So the idiomatic reader is: loop on [RawConn.ReadEvent] until it returns the
+// terminal error, then call [RawConn.Close]. The read loop ends by itself —
+// when the peer's Close arrives the handshake is complete, §5.5.1 requires the
+// transport down, and the next read reports the terminal — so no explicit wait
+// on the closing handshake is needed anywhere.
+//
+// Shutdown is idempotent and safe to call from any goroutine, including the
+// pumping goroutine. Its return value is the status of the close-frame write,
+// bounded by the connection's write timeout when one is set and by a fixed
+// fallback otherwise; it is not how the connection ended, which is what the
+// read's terminal error reports.
+//
+// Close codes must be in the range 1000-4999. Codes that cannot appear as a
+// status on the wire (1004-1006, 1015) go out with an empty payload; a
+// non-UTF-8 reason is dropped (§5.5). The code passed here is what goes out on
+// this endpoint's own frame; the code the connection resolves to is the peer's.
+func (c *RawConn) Shutdown(code int, reason string) error {
+	if code < closeCodeMin || code > closeCodeMax {
+		return fmt.Errorf("%w: %d", errBadCloseCode, code)
+	}
+
+	return c.sendCloseFrame(code, reason)
 }
+
+// finalizeClose completes the closing handshake from the read path, when the
+// peer's close frame has been read and resolved. It echoes the peer's close
+// if this endpoint has not sent one yet — in stOpen the peer's close is the
+// first one we received, and §5.5.1 requires the answer — and then closes the
+// transport, recording the terminal error. In stClosing (we already sent a
+// close via Shutdown) there is nothing to echo: the peer's close is the one
+// that completes the handshake. Either way the recorded close code is the one
+// the peer sent (§7.1.5), not this endpoint's.
+func (c *RawConn) finalizeClose(code int, reason string) {
+	if c.state.Load() == stOpen {
+		_ = c.sendCloseFrame(code, reason)
+	}
+	_ = c.finish(closeErrFor(code, reason))
+}
+
+// Close closes the underlying transport: RFC 6455 §7.1.1, "_Close the
+// WebSocket Connection_". It is the final step of the §7.1.1 example, the
+// close() that follows shutdown(SHUT_WR) and draining the reads.
+//
+// Close never blocks and never writes. It takes no write lock and puts nothing
+// on the wire, so it cannot queue behind a stalled writer, cannot deadlock, and
+// needs no timeout: the closing handshake is completed by *reading* (see
+// [RawConn.Shutdown]), which is the only way to learn the peer's close code,
+// and a connection that has been read to its terminal is already closed here —
+// §5.5.1 requires the transport down once both Close frames have been
+// exchanged.
+//
+// Calling Close without a preceding [RawConn.Shutdown] is an abrupt close: no
+// Close frame goes out, so the peer resolves the connection to 1006 (§7.1.5,
+// no Close frame received). That is deliberate rather than a gap — §7.1.1 lets
+// an endpoint "close the connection via any means available" — and it is what
+// a bare `defer c.Close()` cleanup does when the application never said
+// goodbye. Close records no error of its own: how a connection ended is what
+// the read's terminal error reports, and a connection closed without being read
+// to its terminal reports a clean end rather than an invented one.
+//
+// Close is idempotent and safe to call from any goroutine; only the first call
+// touches the transport. It returns the status of closing the transport.
+func (c *RawConn) Close() error {
+	// A swap, not a check-then-store: Close must not take c.mu, because c.mu is
+	// the write lock and a stalled writer may be holding it for the whole write
+	// bound. That is the wedge this design exists to remove.
+	if c.state.Swap(stClosed) == stClosed {
+		return nil
+	}
+
+	closeErr := c.nc.Close()
+	if closeErr != nil {
+		return fmt.Errorf("ws: closing the transport: %w", closeErr)
+	}
+
+	return nil
+}
+
+// Closed reports whether the connection is closed or closing, from any
+// goroutine. It is true in both stClosing (a close frame has been sent; the
+// transport is still up, awaiting the peer's close) and
+// stClosed (the transport is down). It is the cheap, race-free signal a
+// background writer goroutine needs to stop: it can check Closed() (or select
+// on work and bail when true) instead of waiting for its next WriteMessage to
+// fail with ErrClosed.
+func (c *RawConn) Closed() bool { return c.state.Load() != stOpen }
 
 // EffectiveIdleTimeout reports the idle window this connection actually
 // enforces: the configured window when the stream enforces read deadlines, and
@@ -3351,9 +3432,15 @@ func (c *RawConn) SetWriteDeadline(t time.Time) error { return c.deadlines.SetWr
 // closed state without the recorded error.
 func (c *RawConn) finish(err error) error {
 	c.mu.Lock()
-	if c.state.Load() == stOpen {
+	if c.state.Load() != stClosed {
+		// stOpen -> stClosed (a protocol failure, a transport EOF) or
+		// stClosing -> stClosed (the peer's Close completes the closing
+		// handshake). Either way this is the terminal: record the error that
+		// resolved the connection (first terminal wins).
 		c.state.Store(stClosed)
-		c.closeErr = err
+		if err != nil {
+			c.closeErr = err
+		}
 	}
 	err = terminalErr(c.closeErr)
 	c.mu.Unlock()

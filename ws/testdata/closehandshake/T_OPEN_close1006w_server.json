@@ -1,0 +1,37 @@
+{
+  "desc": "transition (OPEN, close1006w)",
+  "disposition": "failed",
+  "frames": [
+    "88820102030402ec"
+  ],
+  "id": "T_OPEN_close1006w_server",
+  "initCode": null,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": 1002,
+      "disposition": "failed",
+      "id": "SHOULD:close-717",
+      "mod": "should",
+      "note": "7.1.7 SHOULD send a Close with the protocol-error code 1002",
+      "resolution": 1002,
+      "wire": "coded"
+    },
+    {
+      "code": null,
+      "disposition": "failed",
+      "id": "MAY:close-omit",
+      "mod": "may",
+      "note": "7.1.7 MAY omit the Close if the peer is unlikely to process it",
+      "resolution": 1002,
+      "wire": "none"
+    }
+  ],
+  "resolution": 1002,
+  "rfc": [
+    "RFC 6455 7.4"
+  ],
+  "shape": "close1006w",
+  "side": "server",
+  "state": "OPEN"
+}

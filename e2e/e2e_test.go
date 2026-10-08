@@ -297,7 +297,8 @@ func TestMTLSClientCertOpensSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial /ws/mtls with client cert: %v", err)
 	}
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer c.Close()                                               // transport down, whatever is left
+	defer func() { _ = c.Shutdown(ws.StatusNormalClosure, "") }() // say goodbye first (LIFO)
 
 	// The server greets us with the identity from the client certificate.
 	op, data, err := c.ReadMessage()
@@ -395,7 +396,8 @@ func TestInteropGoClientAgainstNodeServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Go client dial node ws server: %v", err)
 	}
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer c.Close()                                               // transport down, whatever is left
+	defer func() { _ = c.Shutdown(ws.StatusNormalClosure, "") }() // say goodbye first (LIFO)
 
 	// permessage-deflate must be negotiated (the Node server accepts the
 	// Go client's offer), and a large compressible message must survive the

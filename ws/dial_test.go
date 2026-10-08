@@ -72,7 +72,7 @@ func TestDialWithCustomDialer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial with custom dialer: %v", err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 	if gotURL == nil || gotURL.Scheme != "wss" || gotURL.Path != "/ws" {
 		t.Fatalf("dialer saw %v, want the parsed wss URL with path /ws", gotURL)
 	}

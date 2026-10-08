@@ -167,7 +167,7 @@ func serverExtensionReply(t *testing.T, offer string) (int, string) {
 			return // the 400 was already written by Upgrade
 		}
 		_, _, _ = conn.ReadMessage()
-		_ = conn.Close(StatusNormalClosure, "")
+		sayGoodbye(conn, StatusNormalClosure, "")
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -386,7 +386,7 @@ func TestDeflateClientVerification(t *testing.T) {
 			conn, err := dialWithServerExtension(t, tc.ext)
 			if tc.wantErr {
 				if err == nil {
-					_ = conn.Close(StatusNormalClosure, "")
+					sayGoodbye(conn, StatusNormalClosure, "")
 					t.Fatalf("ext %q: dial succeeded, want failure", tc.ext)
 				}
 
@@ -395,7 +395,7 @@ func TestDeflateClientVerification(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ext %q: %v", tc.ext, err)
 			}
-			t.Cleanup(func() { _ = conn.Close(StatusNormalClosure, "") })
+			t.Cleanup(func() { sayGoodbye(conn, StatusNormalClosure, "") })
 			if got := conn.Compressed(); got != tc.compress {
 				t.Fatalf("ext %q: Compressed() = %v, want %v", tc.ext, got, tc.compress)
 			}
@@ -534,7 +534,7 @@ func TestDeflateRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close(StatusNormalClosure, "")
+		defer sayGoodbye(conn, StatusNormalClosure, "")
 		if !conn.Compressed() {
 			t.Fatal("Compressed() = false, want true for a default dial")
 		}
@@ -575,7 +575,7 @@ func TestDeflateRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close(StatusNormalClosure, "")
+		defer sayGoodbye(conn, StatusNormalClosure, "")
 		if !conn.Compressed() {
 			t.Fatal("Compressed() = false, want true")
 		}
@@ -598,7 +598,7 @@ func TestDeflateRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close(StatusNormalClosure, "")
+		defer sayGoodbye(conn, StatusNormalClosure, "")
 		if conn.Compressed() {
 			t.Fatal("Compressed() = true, want false for a server with WithCompression(false)")
 		}
@@ -622,7 +622,7 @@ func TestDeflateRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close(StatusNormalClosure, "")
+		defer sayGoodbye(conn, StatusNormalClosure, "")
 		if conn.Compressed() {
 			t.Fatal("Compressed() = true, want false for a client with WithCompression(false)")
 		}
@@ -863,7 +863,7 @@ func TestDecompressedMessageAtLimitSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close(StatusNormalClosure, "")
+	defer sayGoodbye(conn, StatusNormalClosure, "")
 	if !conn.Compressed() {
 		t.Fatal("Compressed() = false, want true for a default dial")
 	}

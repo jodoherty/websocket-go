@@ -234,11 +234,13 @@ func TestRawFragmentedWrite(t *testing.T) {
 		t.Fatalf("peer read = (%d, %q, %v), want one reassembled text message \"Hello\"",
 			res.op, res.data, res.err)
 	}
-	// Close returns the terminal error: io.EOF for a normal closure.
-	closeErr := client.Close(StatusNormalClosure, "")
-	if !errors.Is(closeErr, io.EOF) {
-		t.Fatalf("close: %v, want io.EOF", closeErr)
+	// The client shuts its write side and takes the transport down; the
+	// server's drain reads the close frame.
+	shutErr := client.Shutdown(StatusNormalClosure, "")
+	if shutErr != nil {
+		t.Fatalf("shutdown: %v", shutErr)
 	}
+	_ = client.Close()
 }
 
 // TestMCDCRawWriteFrame pins WriteFrame's opcode handling, one subtest per
@@ -263,7 +265,7 @@ func TestMCDCRawWriteFrame(t *testing.T) {
 				}
 			}
 		}()
-		t.Cleanup(func() { _ = client.Close(StatusNormalClosure, "") })
+		t.Cleanup(func() { sayGoodbye(client, StatusNormalClosure, "") })
 
 		return client
 	}
@@ -445,7 +447,7 @@ func TestDialRawDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialRaw: %v", err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 	if c.idleTimeout != 0 {
 		t.Fatalf("DialRaw armed an idle timeout of %v, want keepalive off by default", c.idleTimeout)
 	}
@@ -471,7 +473,7 @@ func TestDialRawIdleTimeoutOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialRaw: %v", err)
 	}
-	defer c.Close(StatusNormalClosure, "")
+	defer sayGoodbye(c, StatusNormalClosure, "")
 	if c.idleTimeout != 50*time.Millisecond {
 		t.Fatalf("idle timeout = %v, want the requested window", c.idleTimeout)
 	}
@@ -511,9 +513,11 @@ func TestRawServerFaces(t *testing.T) {
 				continue
 			}
 			if ev.Op == OpText {
-				// The client asked the handler to end: close, and let
-				// HandleRaw tear down.
-				return c.Close(StatusNormalClosure, "server done")
+				// The client asked the handler to end: send the close frame
+				// and let HandleRaw tear down.
+				_ = c.Shutdown(StatusNormalClosure, "server done")
+
+				return nil
 			}
 		}
 	}))
@@ -523,7 +527,7 @@ func TestRawServerFaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialRaw: %v", err)
 	}
-	defer client.Close(StatusNormalClosure, "")
+	defer sayGoodbye(client, StatusNormalClosure, "")
 
 	err = client.Ping([]byte("to-server"))
 	if err != nil {

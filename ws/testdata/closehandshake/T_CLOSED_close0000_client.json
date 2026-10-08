@@ -1,0 +1,26 @@
+{
+  "desc": "transition (CLOSED, close0000)",
+  "disposition": "clean",
+  "frames": [
+    "88020000"
+  ],
+  "id": "T_CLOSED_close0000_client",
+  "initCode": 1000,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": null,
+      "disposition": "clean",
+      "id": null,
+      "mod": "must",
+      "note": "7.1.4: CLOSED is absorbing -- a received Close is not processed",
+      "resolution": null,
+      "wire": "none"
+    }
+  ],
+  "resolution": null,
+  "rfc": [],
+  "shape": "close0000",
+  "side": "client",
+  "state": "CLOSED"
+}

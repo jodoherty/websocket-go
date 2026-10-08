@@ -42,7 +42,7 @@ it is.
        if err != nil {
            return                            // 4xx/5xx already written
        }
-       defer c.Close(ws.StatusNormalClosure, "")
+       defer c.Close()
 
        for {
            op, data, err := c.ReadMessage()
@@ -241,13 +241,56 @@ err = c.WriteJSON(event)
 c.WriteMessage(OpText, rawBytes)
 ```
 
+### Closing: three steps, straight out of the RFC
+
+RFC 6455 §7.1.1 gives clean closure as a worked example: "call `shutdown()`
+with SHUT_WR on the socket, call `recv()` until obtaining a return value of 0
+indicating that the peer has also performed an orderly shutdown, and finally
+call `close()` on the socket." The API is that example, one method per step:
+
+```go
+// The reader: pump until the read ends, then take the transport down.
+for {
+    op, data, err := c.ReadMessage()
+    if err != nil {
+        break                 // io.EOF clean; *CloseError carries the peer's code
+    }
+    // ...
+}
+_ = c.Close()
+
+// The writer: say goodbye, then take the transport down.
+_ = c.WriteMessage(ws.OpText, []byte("last word"))
+_ = c.Shutdown(ws.StatusGoingAway, "leaving")
+_ = c.Close()
+```
+
+`Shutdown` is §7.1.2's *Start the WebSocket Closing Handshake*: it puts the
+close frame on the wire and stops this side sending (`WriteMessage` then fails
+with `ErrClosed`, per §5.5.1), but it leaves the transport up and the read side
+live. That matters — §7.1.5 defines the connection's close code as the first
+close frame **received**, so reading is the only way to learn it, and §5.5.1
+lets the peer keep sending until it has sent its own close.
+
+`Close` is §7.1.1's *Close the WebSocket Connection*: it closes the transport.
+It never blocks and never writes, so it cannot queue behind a stalled peer and
+needs no timeout. Called without a preceding `Shutdown` it is an abrupt close —
+no close frame goes out, and the peer resolves the connection to 1006 — which is
+what a bare `defer c.Close()` cleanup does when the application never said
+goodbye.
+
+There is deliberately no method that *waits* for the closing handshake. Only
+reading can finish it, and reading belongs to the pumping goroutine; a blocking
+`Close` would deadlock the moment a handler closed from its own goroutine, which
+is the common case.
+
 ### Teardown is bounded, not instant
 
-`Close` writes a close frame before tearing down the transport, and that
-write is bounded by the connection's `WithWriteTimeout` (falling back to a
-fixed 5 s when unset). On a stalled transport, `Close` can also queue
-behind an in-flight data write, so a handler's `defer c.Close(...)` can
-wait on the order of the write timeout before returning.
+`Shutdown` writes a close frame, and that write is bounded by the connection's
+`WithWriteTimeout` (falling back to a fixed 5 s when unset), and it queues
+behind an in-flight data write — so a `Shutdown` aimed at a stalled peer can
+wait on the order of the write timeout. `Close` itself is not bounded by
+anything: it takes no write lock and performs no write.
 
 ```go
 // good: the write timeout is the staleness budget. A service that wants
@@ -344,7 +387,9 @@ Session.WriteText(s string) error                 // OpText; invalid UTF-8 refus
 Session.WriteBinary(b []byte) error               // OpBinary, bytes untouched
 Session.WriteJSON(v any) error                    // marshal (off-lock) then OpText
 Session.Ping(payload []byte) error                // application ping (≤125 B); auto-ponged; safe from any goroutine
-Session.Close(code int, reason string) error      // best-effort close frame, bounded write; returns the terminal error
+Session.Shutdown(code int, reason string) error   // start the closing handshake: send the close frame, stop
+                                                  // sending, keep reading; returns the write status
+Session.Close() error                             // close the transport; never blocks, never writes
 Session.ID() / Subprotocol() / RemoteAddr() / LocalAddr()
 Session.Compressed() bool     // whether permessage-deflate was negotiated on this connection
 Session.SetReadDeadline / SetWriteDeadline
@@ -365,8 +410,9 @@ RawConn.WriteFrame(op Op, payload []byte, more bool) error  // raw frame; more=t
                                                            // a fragmented message (RFC 6455 §5.4)
 RawConn.Pong(payload []byte) error   // the answer to a received ping (≤125 B); you are the responder
 RawConn.WriteMessage / WriteText / WriteBinary / WriteJSON / Ping / Closed
-RawConn.Close(code int, reason string) error      // teardown; returns the recorded terminal error
-RawConn.CloseFrame(code int, reason string) error // the same close; returns the close-frame write status
+RawConn.Shutdown(code int, reason string) error   // start the closing handshake (§7.1.2); returns the
+                                                  // close-frame write status; transport stays up
+RawConn.Close() error                             // close the transport (§7.1.1); abrupt if no Shutdown
 RawConn.ID() / Subprotocol() / RemoteAddr() / LocalAddr() / Compressed()
 
 // Sentinels
@@ -671,7 +717,7 @@ mux.Handle("/vnc", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request)
     if err != nil {
         return
     }
-    defer c.Close(ws.StatusNormalClosure, "")
+    defer c.Close()
     if err := bridge(c, target); err != nil {        // two goroutines pumping bytes
         log.Printf("vnc bridge for %s failed: %v", user, err)
     }
@@ -680,7 +726,7 @@ mux.Handle("/vnc", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request)
 func bridge(c *ws.Session, target string) error {
     vnc, err := net.Dial("tcp", target)
     if err != nil {
-        _ = c.Close(ws.StatusUnexpectedCondition, "backend unreachable")
+        _ = c.Shutdown(ws.StatusUnexpectedCondition, "backend unreachable")
         return err
     }
     defer vnc.Close()
@@ -712,7 +758,8 @@ func bridge(c *ws.Session, target string) error {
         }
     }()
     err := <-errCh
-    _ = c.Close(ws.StatusNormalClosure, "")           // unwinds the other pump
+    _ = c.Shutdown(ws.StatusNormalClosure, "")       // say goodbye, then...
+    _ = c.Close()                                    // ...unwind the other pump
     return err
 }
 ```

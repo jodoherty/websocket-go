@@ -195,7 +195,7 @@ func TestLocalCloseForbiddenCodes(t *testing.T) {
 	for _, code := range []int{1004, StatusNoStatusReceived, StatusAbnormalClosure, 1015} {
 		fc := &fakeConn{}
 		c := newRawConn(fc, fc, false, 1<<20, 0, 0)
-		_ = c.Close(code, "reason")
+		sayGoodbye(c, code, "reason")
 		reply, ok := closeReply(fc)
 		if !ok {
 			t.Fatalf("code %d: no close frame written", code)
@@ -207,7 +207,7 @@ func TestLocalCloseForbiddenCodes(t *testing.T) {
 	// A normal code still carries code + reason.
 	fc := &fakeConn{}
 	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
-	_ = c.Close(StatusGoingAway, "later")
+	sayGoodbye(c, StatusGoingAway, "later")
 	if reply, ok := closeReply(fc); !ok || replyCode(reply) != StatusGoingAway {
 		t.Fatalf("1001: reply %q ok=%v, want code 1001", reply, ok)
 	}
@@ -321,7 +321,7 @@ func TestSubprotocolEcho(t *testing.T) {
 		if err != nil {
 			t.Fatalf("no selection: %v, want success", err)
 		}
-		defer c.Close(StatusNormalClosure, "")
+		defer sayGoodbye(c, StatusNormalClosure, "")
 		if got := c.Subprotocol(); got != "" {
 			t.Fatalf("Subprotocol() = %q, want empty", got)
 		}
@@ -334,7 +334,7 @@ func TestSubprotocolEcho(t *testing.T) {
 		if err != nil {
 			t.Fatalf("offered token: %v, want success", err)
 		}
-		defer c.Close(StatusNormalClosure, "")
+		defer sayGoodbye(c, StatusNormalClosure, "")
 		if got := c.Subprotocol(); got != "chat.v2" {
 			t.Fatalf("Subprotocol() = %q, want chat.v2", got)
 		}
@@ -531,7 +531,7 @@ func TestClientDuplicate101Headers(t *testing.T) {
 			if dialErr != nil {
 				return dialErr
 			}
-			_ = c.Close(StatusNormalClosure, "")
+			sayGoodbye(c, StatusNormalClosure, "")
 
 			return nil
 		}
@@ -551,7 +551,7 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 	t.Parallel()
 	fc := &fakeConn{}
 	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
-	_ = c.Close(StatusGoingAway, "bad\xffreason")
+	sayGoodbye(c, StatusGoingAway, "bad\xffreason")
 	reply, ok := closeReply(fc)
 	if !ok {
 		t.Fatal("no close frame written")
@@ -564,7 +564,7 @@ func TestCloseReasonDropsInvalidUTF8(t *testing.T) {
 	}
 	fc = &fakeConn{}
 	c = newRawConn(fc, fc, false, 1<<20, 0, 0)
-	_ = c.Close(StatusGoingAway, "bye")
+	sayGoodbye(c, StatusGoingAway, "bye")
 	if reply, ok := closeReply(fc); !ok || !bytes.Equal(reply[closeCodeBytes:], []byte("bye")) {
 		t.Fatalf("valid reason: payload %q, want code + \"bye\"", reply)
 	}
@@ -579,7 +579,7 @@ func TestCloseReasonLengthBoundary(t *testing.T) {
 	// A reason of exactly maxCloseReason (123) bytes fits untruncated.
 	fc := &fakeConn{}
 	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
-	_ = c.Close(StatusGoingAway, strings.Repeat("a", 123))
+	_ = c.Shutdown(StatusGoingAway, strings.Repeat("a", 123))
 	reply, ok := closeReply(fc)
 	if !ok || len(reply) != 2+123 {
 		t.Fatalf("123-byte reason: payload % x, want 125 bytes (code + reason)", reply)
@@ -590,7 +590,7 @@ func TestCloseReasonLengthBoundary(t *testing.T) {
 	// 124 bytes must truncate back to the 123-byte limit.
 	fc = &fakeConn{}
 	c = newRawConn(fc, fc, false, 1<<20, 0, 0)
-	_ = c.Close(StatusGoingAway, strings.Repeat("a", 124))
+	_ = c.Shutdown(StatusGoingAway, strings.Repeat("a", 124))
 	reply, ok = closeReply(fc)
 	if !ok || len(reply) != 2+123 {
 		t.Fatalf("124-byte reason: payload % x, want 125 bytes (truncated)", reply)
@@ -669,9 +669,9 @@ func TestCloseCodeUpperBoundary(t *testing.T) {
 	// Local close 4999: the code goes on the wire.
 	fc := &fakeConn{}
 	c := newRawConn(fc, fc, false, 1<<20, 0, 0)
-	err := c.Close(4999, "boundary")
-	if err == nil {
-		t.Fatal("Close(4999) returned nil, want the recorded CloseError")
+	writeErr := c.Shutdown(4999, "boundary")
+	if writeErr != nil {
+		t.Fatalf("Shutdown(4999) = %v, want the frame written", writeErr)
 	}
 	if reply, ok := closeReply(fc); !ok || replyCode(reply) != 4999 {
 		t.Fatalf("4999 on the wire: % x, want code 4999", reply)
@@ -861,7 +861,7 @@ func dialAgainst101(t *testing.T, headers []string) error {
 	if dialErr != nil {
 		return dialErr
 	}
-	_ = c.Close(StatusNormalClosure, "")
+	sayGoodbye(c, StatusNormalClosure, "")
 
 	return nil
 }

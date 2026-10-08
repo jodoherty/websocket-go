@@ -3,7 +3,6 @@ package ws
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -99,8 +98,8 @@ func BenchmarkConnRoundTrip(b *testing.B) {
 	sr, cr := net.Pipe()
 	server := newSession(newRawConn(sr, sr, false, 1<<20, 0, 0), nil)
 	client := newSession(newRawConn(cr, cr, true, 1<<20, 0, 0), nil)
-	defer client.Close(StatusNormalClosure, "")
-	defer server.Close(StatusNormalClosure, "")
+	defer sayGoodbye(client, StatusNormalClosure, "")
+	defer sayGoodbye(server, StatusNormalClosure, "")
 
 	go func() {
 		for range b.N {
@@ -208,13 +207,14 @@ func BenchmarkClose(b *testing.B) {
 		serverDrain := drain(b, server)
 		clientDrain := drain(b, client)
 		b.StartTimer()
-		closeErr := client.Close(StatusNormalClosure, "")
+		shutdownErr := client.Shutdown(StatusNormalClosure, "")
 		b.StopTimer()
 		<-serverDrain
 		<-clientDrain
-		if !errors.Is(closeErr, io.EOF) {
-			b.Fatalf("close: got %v, want io.EOF", closeErr)
+		if shutdownErr != nil {
+			b.Fatalf("shutdown: got %v, want the close frame written", shutdownErr)
 		}
+		_ = client.Close()
 	}
 }
 

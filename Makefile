@@ -1,7 +1,7 @@
 GOLANGCI ?= golangci-lint
 MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc model model-image mbt-gen mbt-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc model model-image mbt-gen mbt-report close-model close-mbt-gen close-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -9,7 +9,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc model mut branchcov coverage multiver e2e e2e-connect
+gate: all race fuzz bench mcdc model close-model mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -93,6 +93,32 @@ mbt-report:
 	@go test ./ws/ -run TestMBTReassembly -v 2>&1 | \
 		grep -E "MBT-WARNINGS:|NOTES.json|not accepted" | \
 		sed 's/^[[:space:]]*mbt_test.go:[0-9]*: //' || true
+
+# The close-handshake machine (doc/CLOSE-HANDSHAKE.md, model/gen/
+# closehandshake.py): the RFC 6455 OPEN/CLOSING/CLOSED states over the 17
+# close-frame body shapes. Same two-stage shape as `model`: this target is
+# the container-free consistency check (the model's own P1-P6 properties plus
+# trace-to-model faithfulness), and the Go runner replays the committed
+# traces in the normal suite as TestMBTCloseHandshake.
+close-model:
+	python3 model/gen/check_closeprops.py
+	python3 model/gen/check_closetraces.py
+
+# The close-handshake MBT warning count, same purpose as mbt-report.
+close-report:
+	@go test ./ws/ -run TestMBTCloseHandshake -v 2>&1 | \
+		grep -E "MBT-WARNINGS:|NOTES.json|not accepted" | \
+		sed 's/^[[:space:]]*mbt_close_test.go:[0-9]*: //' || true
+
+# Regenerate the committed close-handshake traces, cross-checked against the
+# independent nuXmv encoding. Same determinism rule as mbt-gen.
+close-mbt-gen: model-image
+	@MBT_IMAGE=$(MBT_IMAGE) python3 model/gen/gen_closetraces.py ws/testdata/closehandshake
+	@if git diff --quiet -- ws/testdata/closehandshake 2>/dev/null; then \
+		echo "close-mbt-gen: committed traces unchanged"; \
+	else \
+		echo "close-mbt-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/closehandshake; exit 1; \
+	fi
 
 # Build the model container (nuXmv). Rebuild only when model/Containerfile
 # changes, not when the model does (the model is mounted at run time).

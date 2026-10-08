@@ -23,6 +23,18 @@ func TestRFC6455AcceptKey(t *testing.T) {
 	}
 }
 
+// sayGoodbye runs the polite close a test means when it passes a close code:
+// [Shutdown] puts the close frame on the wire, [Close] takes the transport
+// down. The drain between them (RFC 6455 §7.1.1's recv-until-0 step) is the
+// test's own read loop, when it has one. It accepts either face.
+func sayGoodbye(c interface {
+	Shutdown(code int, reason string) error
+	Close() error
+}, code int, reason string) {
+	_ = c.Shutdown(code, reason)
+	_ = c.Close()
+}
+
 // fakeAddr satisfies net.Addr.
 type fakeAddr struct{}
 

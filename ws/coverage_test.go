@@ -49,7 +49,7 @@ func TestErrorStrings(t *testing.T) {
 func TestConnAccessorsAndDeadlines(t *testing.T) {
 	s := startServer(t)
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/echo")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 
 	if c.ID() == 0 {
 		t.Error("ID() = 0, want non-zero")
@@ -127,14 +127,14 @@ func TestPackageHandle(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return c.Close(ws.StatusNormalClosure, "")
+		return sayGoodbyeNil(c, ws.StatusNormalClosure, "")
 	}))
 	s := httptest.NewServer(mux)
 	defer s.Close()
 
 	host := strings.TrimPrefix(s.URL, "http://")
 	c := mustDial(t, "ws://"+host+"/pkg", ws.WithHeader("Origin", "http://"+host))
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 
 	op, data, err := c.ReadMessage()
 	if err != nil || op != ws.OpText || string(data) != "from ws.Handle" {
@@ -180,7 +180,7 @@ func TestUpgradeRejectBranches(t *testing.T) {
 	up = ws.NewUpgrader(openOrigin)
 	mux := http.NewServeMux()
 	mux.Handle("/ws", up.Handle(func(_ *http.Request, c *ws.Session) error {
-		return c.Close(ws.StatusNormalClosure, "")
+		return sayGoodbyeNil(c, ws.StatusNormalClosure, "")
 	}))
 	s := httptest.NewServer(mux)
 	defer s.Close()
@@ -258,7 +258,7 @@ func TestHandleCloseErrorBranch(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/custom")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	_, _, err := c.ReadMessage()
 	code, reason, ok := ws.CloseCode(err)
 	if !ok || code != 4001 || reason != "policy" {
@@ -280,7 +280,7 @@ func TestHandleErrorBranch(t *testing.T) {
 	defer s.Close()
 
 	c := mustDial(t, "ws"+strings.TrimPrefix(s.URL, "http")+"/boom")
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	_, _, err := c.ReadMessage()
 	code, reason, ok := ws.CloseCode(err)
 	if !ok || code != ws.StatusUnexpectedCondition || reason != "handler failure" {
@@ -401,7 +401,7 @@ func TestDialSkipsReservedHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial with reserved headers: %v", err)
 	}
-	defer conn.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(conn, ws.StatusNormalClosure, "")
 }
 
 // rawResponder answers each accepted connection with a fixed byte string.
@@ -641,7 +641,7 @@ func TestNonPositiveMessageSizeFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close(ws.StatusNormalClosure, "")
+	defer sayGoodbye(c, ws.StatusNormalClosure, "")
 	// A small message round-trips on both faces: the default limit is in
 	// effect, not zero.
 	err = c.WriteMessage(ws.OpText, []byte("fits"))
@@ -725,7 +725,7 @@ func TestHandlerPanicClosesConnection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Dial: %v", name, err)
 		}
-		defer s.Close(ws.StatusNormalClosure, "")
+		defer sayGoodbye(s, ws.StatusNormalClosure, "")
 		t.Logf("%s: handler panicked (recovered by net/http; the log dump is expected)", name)
 		if !tracked.allClosed(2 * time.Second) {
 			t.Fatalf("%s: the hijacked transport was never closed after the handler panicked: connection leaked", name)

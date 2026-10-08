@@ -1,0 +1,28 @@
+{
+  "desc": "transition (OPEN, close3000)",
+  "disposition": "clean",
+  "frames": [
+    "8882010203040aba"
+  ],
+  "id": "T_OPEN_close3000_server",
+  "initCode": null,
+  "machine": "closehandshake",
+  "outcomes": [
+    {
+      "code": 3000,
+      "disposition": "clean",
+      "id": null,
+      "mod": "must",
+      "note": "5.5.1 MUST answer, SHOULD echo the received code (7.4)",
+      "resolution": 3000,
+      "wire": "coded"
+    }
+  ],
+  "resolution": 3000,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "shape": "close3000",
+  "side": "server",
+  "state": "OPEN"
+}

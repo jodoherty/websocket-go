@@ -353,11 +353,15 @@ func TestKeepaliveProbeWriteBounded(t *testing.T) {
 		if err == nil || !errors.As(err, &nerr) || !nerr.Timeout() {
 			t.Fatalf("read loop after failed probe write: %v, want a timeout-classified error", err)
 		}
-		// The failed probe recorded a terminal error, so Close returns it
-		// instead of waiting on the (long finished) stalled write.
-		closeErr := c.Close(StatusNormalClosure, "")
-		if closeErr == nil {
-			t.Fatal("Close returned nil; the failed probe write should have recorded a terminal error")
+		// The failed probe recorded a terminal error, so the connection is
+		// done: a later write reports that recorded error instead of
+		// re-stalling on the (long finished) stalled write.
+		if !c.Closed() {
+			t.Fatal("connection still open after the probe write failed")
+		}
+		writeErr := c.WriteText("late")
+		if writeErr == nil {
+			t.Fatal("write after the failed probe returned nil; the failed probe should have recorded a terminal error")
 		}
 	})
 }

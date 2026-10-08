@@ -74,7 +74,10 @@ Unlicense (see `LICENSE`).
 - The read side is owned by one pumping goroutine in either face:
   `Session.ReadMessage` for a session, `RawConn.ReadEvent` for raw mode —
   and a connection has exactly one of them, never both. `WriteMessage`,
-  `WriteFrame`, `Pong`, and `Close` are safe from any goroutine.
+  `WriteFrame`, `Pong`, and `Shutdown` are safe from any goroutine.
+  `Close` is too, and deliberately takes **no** write lock: it only swaps the
+  state and closes the transport, so a stalled writer holding `c.mu` can never
+  wedge teardown. Nothing outside the pumping goroutine may read.
   Read-side scratch
   (`frameCodec.in/len8/mask`) and write-side scratch (`hdr/rand4/
   maskScratch`) are each owned by exactly one goroutine — do not move
@@ -102,6 +105,8 @@ make mut         # mutation gate: every curated security mutation must be
                 # cannot run the mutants or if every mutant is uncompilable
 make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
+make model       # frame-reassembly machine: model properties + trace fidelity
+make close-model # close-handshake machine: model properties + trace fidelity
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
 make multiver    # build + vet + ws unit + Go e2e, all under -race, on
@@ -177,10 +182,11 @@ ws/keepalive_test.go keepalive probe state machine + timeout classification
 ws/keepalive_synctest_test.go keepalive read loop on a fake clock
                     (testing/synctest): exact probe/kill/refresh timelines,
                     plus the stalled-write bounded-write regression
-ws/closeframe_test.go CloseFrame: the close-frame write status (nil on a
-                    live transport, the write failure on a stalled one,
-                    ErrClosed after a normal closure, the code rejection),
-                    plus the wire shape the peer observes
+ws/closeframe_test.go Shutdown/Close: the close-frame write status (nil on a
+                    live transport, the write failure on a stalled one, the
+                    already-closing refusal, the code rejection), Close as pure
+                    non-blocking teardown (abrupt, no frame, never wedged by a
+                    stalled writer), and that Shutdown leaves the read side live
 ws/raw_test.go      the raw API: the ReadEvent contract (control frames are
                     events, no auto-pong, close resolution), the WriteFrame
                     MC/DC matrix (state, control shape, UTF-8, writable set),
@@ -235,9 +241,22 @@ ws/mbt_test.go     model-based validation runner: replays the committed
                     on an unaccepted or stale entry). Data, not generated
                     code — traces come from model/gen/gen_traces.py, the
                     runner is hand-written (doc/STATES.md)
+ws/mbt_close_test.go model-based validation runner for the close-handshake
+                    machine: replays ws/testdata/closehandshake/*.json against
+                    a RawConn, driving each trace in the shape the RFC's §7.1.1
+                    example prescribes (Shutdown → read to terminal → Close).
+                    Checks the §5.5.1/§7.4 wire rules, the §7.1.5 resolution,
+                    and the §7.1.2 close-once-both-sent-and-received SHOULD, as
+                    the same warning ledger (ws/testdata/closehandshake/
+                    NOTES.json). Currently 0 warnings (doc/CLOSE-HANDSHAKE.md)
 ws/testdata/mbt/   committed model-based traces (JSON): one per (transition,
                     side); plus NOTES.json, the allowlist of accepted SHOULD/
                     MAY divergences (each with its RFC basis + reason)
+ws/testdata/closehandshake/
+                    committed close-handshake traces (JSON): one per
+                    (state, shape, side) over the RFC's three states and 17
+                    close-body shapes; plus NOTES.json (empty: no accepted
+                    divergences)
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
@@ -245,7 +264,7 @@ cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
 cmd/mcdc/       MC/DC audit: enumerates every compound decision, computes
                 the required independence pairs from the boolean structure,
                 and verifies each is traced to an existing test subtest
-cmd/mut/        mutation gate: applies each of 70 curated security-relevant
+cmd/mut/        mutation gate: applies each of 74 curated security-relevant
                 one-spot rewrites (operator flips, bound changes, deleted
                 guards, constant shifts) to a scratch copy of the ws package
                 and requires the full test suite to kill it; a surviving
@@ -260,6 +279,11 @@ doc/COMPRESSION.md permessage-deflate design + interop evidence
 doc/STATES.md     the frame-reassembly state machine: the RFC 6455
                     transformation, the properties (P1/P2/completeness), trace
                     generation, and the behaviors the model pins
+doc/CLOSE-HANDSHAKE.md the close-handshake state machine: the RFC's OPEN/
+                    CLOSING/CLOSED states, the Shutdown/read/Close mapping to
+                    §7.1.1's worked example, the MUST/SHOULD/MAY table, the
+                    properties (P1-P6), and the §7.1.2 finding that drove the
+                    Shutdown/Close split
                 h3/             separate module: a real quic-go HTTP/3 extended-
                                 CONNECT (RFC 9220) round-trip over SessionOnStream
                                 (make e2e-h3)
@@ -282,6 +306,18 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                                  encoding), pure Python
                 gen/check_traces.py committed-trace <-> model consistency,
                                  pure Python
+                gen/closehandshake.py the close-handshake machine: the RFC's
+                                 three states over 17 close-body shapes, with
+                                 the §5.5.1/§7.1.x citations (independent of
+                                 common.py — a different machine)
+                gen/gen_closemodel.py emits the close SMV from closehandshake
+                                 (includes the `initiate` input: CLOSING is
+                                 reached by sending, not only by receiving)
+                gen/gen_closetraces.py one JSON per (state, shape, side),
+                                 cross-checked against nuXmv -> ws/testdata/
+                                 closehandshake/
+                gen/check_closeprops.py close-model self-consistency (P1-P6)
+                gen/check_closetraces.py close-trace <-> model consistency
 e2e/            e2e suites:
                 ws.spec.ts       Playwright, Firefox + Chromium: echo, subprotocols,
                                  binary, bearer accept/reject, mTLS rejection, close codes
@@ -299,8 +335,9 @@ e2e/            e2e suites:
 .golangci.yml   strictest standard lint config: default: all, documented exclusions
 Makefile        the repeatable gate: make gate (the full set) plus the
                     individual lint / staticcheck / test / race / fuzz /
-                    mut / bench / mcdc / model / model-image / mbt-gen /
-                    mbt-report / branchcov / coverage / e2e targets
+                    mut / bench / mcdc / model / close-model / model-image /
+                    mbt-gen / mbt-report / close-mbt-gen / close-report /
+                    branchcov / coverage / e2e targets
 ```
 
 ## Workflow

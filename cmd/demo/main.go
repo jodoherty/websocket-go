@@ -202,7 +202,7 @@ func buildMux() http.Handler {
 	mux.Handle("/ws/goodbye", echoUp.Handle(func(_ *http.Request, conn *ws.Session) error {
 		_ = conn.WriteMessage(ws.OpText, []byte("hello"))
 		time.Sleep(goodbyeDelay)
-		_ = conn.Close(ws.StatusGoingAway, "going away")
+		_ = conn.Shutdown(ws.StatusGoingAway, "going away")
 
 		return nil
 	}))
@@ -245,8 +245,11 @@ func bearerHandler(upgrader *ws.Upgrader) http.HandlerFunc {
 		if err != nil {
 			return // response already written
 		}
+		// The echo loop only returns once the peer has closed or the
+		// connection died, so the handshake is already done: this is pure
+		// teardown.
 		defer func() {
-			_ = conn.Close(ws.StatusNormalClosure, "")
+			_ = conn.Close()
 		}()
 		//nolint:gosec // demo logging: address comes from the peer's socket.
 		log.Printf("bearer session %d from %s", conn.ID(), conn.RemoteAddr())

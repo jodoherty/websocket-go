@@ -80,13 +80,17 @@ type mbtWire struct {
 	Code int    `json:"code"`
 }
 
-func loadMBTTraces(t *testing.T, dir string) []mbtTrace {
+// loadTraces reads and parses every committed trace JSON in dir. Both MBT
+// machines store traces the same way — one JSON object per file in a testdata
+// dir, with NOTES.json as the sidecar ledger rather than a trace — so they
+// share one loader over the trace struct each machine defines.
+func loadTraces[T any](t *testing.T, dir, label string) []T {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read %s: %v", dir, err)
 	}
-	var out []mbtTrace
+	var out []T
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == "NOTES.json" {
 			continue
@@ -97,7 +101,7 @@ func loadMBTTraces(t *testing.T, dir string) []mbtTrace {
 		if err != nil {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
-		var tr mbtTrace
+		var tr T
 		err = json.Unmarshal(b, &tr)
 		if err != nil {
 			t.Fatalf("parse %s: %v", e.Name(), err)
@@ -105,7 +109,7 @@ func loadMBTTraces(t *testing.T, dir string) []mbtTrace {
 		out = append(out, tr)
 	}
 	if len(out) == 0 {
-		t.Fatalf("no MBT traces found in %s", dir)
+		t.Fatalf("no %s traces found in %s", label, dir)
 	}
 	return out
 }
@@ -138,7 +142,7 @@ func loadMBTNotes(t *testing.T, path string) map[string]bool {
 
 func TestMBTReassembly(t *testing.T) {
 	t.Parallel()
-	traces := loadMBTTraces(t, "testdata/mbt")
+	traces := loadTraces[mbtTrace](t, "testdata/mbt", "MBT")
 	allowed := loadMBTNotes(t, "testdata/mbt/NOTES.json")
 	ledger := newMBTLedger()
 	// The check runs after every subtest has finished (parallel subtests
