@@ -1,0 +1,27 @@
+{
+  "desc": "transition (CFB5_1, cont1); frames: cbin0e, ccontA0, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "binary",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "42020300",
+    "0003730400",
+    "800141"
+  ],
+  "fromState": "CFB5_1",
+  "id": "T_CFB5_1_cont1_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2"
+  ],
+  "side": "client",
+  "terminal": null
+}

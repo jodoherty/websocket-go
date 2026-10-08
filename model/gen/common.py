@@ -42,8 +42,10 @@ MAXMSG = 3  # abstract message size limit, in token units (concrete: bytes)
 IDLE = "IDLE"
 TERM = "TERM"
 
-# Suffix <-> utf8bound state, for the text fragment states.
-_SUFFIX_BOUND = {
+# Suffix <-> utf8bound state, for the text fragment states. Exported: the
+# RSV1 / compressed-message machine (deflate.py) names its compressed text
+# fragment states with the same suffixes.
+SUFFIX_BOUND = {
     "": U.CLEAN,
     "B": U.BROKEN,
     "W": U.PEND1,
@@ -55,29 +57,29 @@ _SUFFIX_BOUND = {
     "F4": U.PEND_F4,
     "K2": U.PEND4K2,
 }
-_BOUND_SUFFIX = {v: k for k, v in _SUFFIX_BOUND.items()}
+BOUND_SUFFIX = {v: k for k, v in SUFFIX_BOUND.items()}
 
 
-def _frag_state(mode, count, boundary):
+def frag_state(mode, count, boundary):
     """The state name for (mode, token count, boundary state)."""
     if mode == "binary":
         return "FGB%d" % count
 
-    return "FGT%d%s" % (count, _BOUND_SUFFIX[boundary])
+    return "FGT%d%s" % (count, BOUND_SUFFIX[boundary])
 
 
-def _parse_frag(state):
+def parse_frag(state):
     """(mode, count, boundary) for a fragment state: mode is 'binary' or
     'text', count the tokens accumulated, boundary the utf8bound state for
     the accumulated bytes (None for binary)."""
     if state[2] == "B":
         return "binary", int(state[3]), None
 
-    return "text", int(state[3]), _SUFFIX_BOUND[state[4:]]
+    return "text", int(state[3]), SUFFIX_BOUND[state[4:]]
 
 
 FGB = ["FGB%d" % n for n in range(MAXMSG + 1)]
-FGT = [_frag_state("text", n, b) for n in range(MAXMSG + 1) for b in U.STATES]
+FGT = [frag_state("text", n, b) for n in range(MAXMSG + 1) for b in U.STATES]
 STATES = [IDLE] + FGB + FGT + [TERM]
 
 # Frame classes: the peer's alphabet. Each is a symbolic frame; the concrete
@@ -209,7 +211,7 @@ def should_close(state, frame):
 def frag_count(state):
     """Token count accumulated in a fragment state, else 0."""
     if state in FGB or state in FGT:
-        return _parse_frag(state)[1]
+        return parse_frag(state)[1]
 
     return 0
 
@@ -217,7 +219,7 @@ def frag_count(state):
 def frag_op(state):
     """'binary' / 'text' for a fragment state, else None."""
     if state in FGB or state in FGT:
-        return _parse_frag(state)[0]
+        return parse_frag(state)[0]
 
     return None
 
@@ -227,7 +229,7 @@ def frag_boundary(state):
     bytes (CLEAN at a code-point boundary, BROKEN when an unrepairable byte
     has been seen, a pending state mid-rune); None for a binary fragment."""
     if state in FGT:
-        return _parse_frag(state)[2]
+        return parse_frag(state)[2]
 
     return None
 
@@ -281,6 +283,13 @@ def _close(state, frame):
     return TERM, [term(1002)], FAULT_RFC[FRAMES[frame]["fault"]], FRAMES[frame]["fault"]
 
 
+def close_resolution(state, frame):
+    """Close-frame resolution (RFC 6455 5.5.1, 7.4), shared by the
+    reassembly machine and the RSV1 / compressed-message machine: a close
+    frame carries no RSV1 and resolves identically in both domains."""
+    return _close(state, frame)
+
+
 def _data(state, frame):
     f = FRAMES[frame]
     is_cont = f["op"] == 0
@@ -299,7 +308,7 @@ def _data(state, frame):
     # check, so it is not a separate transition here.
 
     if in_frag:
-        mode, count, boundary = _parse_frag(state)
+        mode, count, boundary = parse_frag(state)
         new_count = count + f["plen"]
         if new_count > MAXMSG:
             return TERM, [term_proto()], FAULT_RFC["cross-frame-too-big"], "cross-frame-too-big"
@@ -307,7 +316,7 @@ def _data(state, frame):
         # accumulation (RFC 3629; a binary fragment carries no boundary).
         to_boundary = boundary if mode == "binary" else U.apply(boundary, f["payload"])
         if not f["fin"]:
-            return _frag_state(mode, new_count, to_boundary), [], "RFC 6455 5.4", None
+            return frag_state(mode, new_count, to_boundary), [], "RFC 6455 5.4", None
         # Final fragment: the message completes. RFC 6455 5.6 validates the
         # whole (concatenated) text message: the boundary must be at a
         # code-point boundary. A text fragment already broken, broken by
@@ -323,9 +332,9 @@ def _data(state, frame):
         if f["op"] == 1:
             to_boundary = U.apply(U.CLEAN, f["payload"])
 
-            return _frag_state("text", f["plen"], to_boundary), [], "RFC 6455 5.4", None
+            return frag_state("text", f["plen"], to_boundary), [], "RFC 6455 5.4", None
 
-        return _frag_state("binary", f["plen"], None), [], "RFC 6455 5.4", None
+        return frag_state("binary", f["plen"], None), [], "RFC 6455 5.4", None
 
     # Single-frame message (fin=1, not in a fragment).
     op = "text" if f["op"] == 1 else "binary"
@@ -349,16 +358,17 @@ def _frag_payload(state, frame):
 _MASK_KEY = b"\x01\x02\x03\x04"
 
 
-def encode_frame(frame_name, side):
+def encode_wire(f, side):
     """The concrete bytes for a symbolic frame on the given side.
 
-    side is the side UNDER TEST ('server' or 'client'). The peer's frames
-    are masked exactly when the side under test is the server (RFC 6455
-    5.1: clients mask, servers do not). 'eof' encodes to the empty byte
-    string (transport end, no frame).
+    f is a frame dict (the FRAMES entries; the RSV1 machine in deflate.py
+    passes its own frame dicts of the same shape). side is the side UNDER
+    TEST ('server' or 'client'). The peer's frames are masked exactly when
+    the side under test is the server (RFC 6455 5.1: clients mask, servers
+    do not). 'eof' encodes to the empty byte string (transport end, no
+    frame).
     """
-    f = FRAMES[frame_name]
-    if frame_name == "eof":
+    if f["op"] == -1:
         return b""
 
     b0 = f["op"]
@@ -394,6 +404,11 @@ def encode_frame(frame_name, side):
     else:
         out += payload
     return bytes(out)
+
+
+def encode_frame(frame_name, side):
+    """encode_wire for a frame of this machine's alphabet by name."""
+    return encode_wire(FRAMES[frame_name], side)
 
 
 # --- ReadEvent result constructors (dicts serialized into the JSON traces) ---
@@ -465,6 +480,12 @@ def _out(wire, term, mod, code=None, wid=None, note=""):
         d["id"] = wid
         d["note"] = note
     return d
+
+
+def out(wire, term, mod, code=None, wid=None, note=""):
+    """Public wrapper for building one close-frame outcome (used by the
+    RSV1 / compressed-message machine's terminal_outcomes as well)."""
+    return _out(wire, term, mod, code, wid, note)
 
 
 def terminal_outcomes(state, frame):

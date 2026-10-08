@@ -1,7 +1,7 @@
 GOLANGCI ?= golangci-lint
 MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report deflate-model defl-gen defl-report mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -9,7 +9,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc model close-model mut branchcov coverage multiver e2e e2e-connect
+gate: all race fuzz bench mcdc model close-model deflate-model mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -131,6 +131,37 @@ close-mbt-gen: model-image
 		echo "close-mbt-gen: committed traces unchanged"; \
 	else \
 		echo "close-mbt-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/closehandshake; exit 1; \
+	fi
+
+# The RSV1 / compressed-message machine (doc/DEFLATE-MACHINE.md,
+# model/gen/deflate.py): RFC 7692 6's framing rules (RSV1 placement, the
+# compressed context, decompressed UTF-8) on a negotiated connection, built
+# on the shared RFC 3629 boundary machine. Same two-stage shape as `model`:
+# this target is the container-free consistency check (the wire self-check
+# W1-W5, the model's P1-P8/RX properties, trace-to-model faithfulness), and
+# the Go runner replays the committed traces in the normal suite as
+# TestMBTDeflate.
+deflate-model:
+	python3 model/gen/deflate.py
+	python3 model/gen/check_deflprops.py
+	python3 model/gen/check_defltraces.py
+
+# The RSV1 machine's MBT warning count, same purpose as mbt-report: the RFC
+# 7692 silences (decompression failure, decompressed size overflow) are the
+# assessable SHOULD/MAY divergences.
+defl-report:
+	@go test ./ws/ -run TestMBTDeflate -v 2>&1 | \
+		grep -E "MBT-WARNINGS:|NOTES.json|not accepted" | \
+		sed 's/^[[:space:]]*mbt_deflate_test.go:[0-9]*: //' || true
+
+# Regenerate the committed RSV1 traces, cross-checked against the
+# independent nuXmv encoding. Same determinism rule as mbt-gen.
+defl-gen: model-image
+	@MBT_IMAGE=$(MBT_IMAGE) python3 model/gen/gen_defltraces.py ws/testdata/deflate
+	@if git diff --quiet -- ws/testdata/deflate 2>/dev/null; then \
+		echo "defl-gen: committed traces unchanged"; \
+	else \
+		echo "defl-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/deflate; exit 1; \
 	fi
 
 # Build the model container (nuXmv). Rebuild only when model/Containerfile

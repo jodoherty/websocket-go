@@ -1,0 +1,26 @@
+{
+  "desc": "transition (FGT3, cont1); frames: text0, cont02, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "41414241",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "010141",
+    "00024142",
+    "800141"
+  ],
+  "fromState": "FGT3",
+  "id": "T_FGT3_cont1_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.4"
+  ],
+  "side": "client",
+  "terminal": null
+}

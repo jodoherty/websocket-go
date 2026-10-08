@@ -151,12 +151,12 @@ func TestMBTReassembly(t *testing.T) {
 	for _, tr := range traces {
 		t.Run(tr.ID, func(t *testing.T) {
 			t.Parallel()
-			runMBTTrace(t, tr, ledger)
+			runMBTTrace(t, tr, ledger, false)
 		})
 	}
 }
 
-func runMBTTrace(t *testing.T, tr mbtTrace, ledger *mbtLedger) {
+func runMBTTrace(t *testing.T, tr mbtTrace, ledger *mbtLedger, compressed bool) {
 	t.Helper()
 	var data []byte
 	for _, h := range tr.Frames {
@@ -170,6 +170,11 @@ func runMBTTrace(t *testing.T, tr mbtTrace, ledger *mbtLedger) {
 	isClient := tr.Side == "client"
 	fc := &fakeConn{data: data}
 	c := newRawConn(fc, fc, isClient, tr.MaxMessageSize, 0, 0)
+	if compressed {
+		// The RSV1 machine traces run on a connection with permessage-deflate
+		// negotiated: RSV1 is the compressed marker, not an extension fault.
+		c.applyCompression()
+	}
 
 	// MUST: the delivered events, in order.
 	for i, exp := range tr.Events {

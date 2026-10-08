@@ -1,0 +1,49 @@
+{
+  "desc": "transition (CFT5_7, cont1); frames: ctext0bomb, cont1",
+  "events": [],
+  "frame": "cont1",
+  "frames": [
+    "41057374040300",
+    "800141"
+  ],
+  "fromState": "CFT5_7",
+  "id": "T_CFT5_7_cont1_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 6455 7.4.2 (project maxMessageSize policy)"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 1002,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1002,
+          "kind": "coded"
+        }
+      },
+      {
+        "code": 1009,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1009,
+          "kind": "coded"
+        }
+      },
+      {
+        "id": "MAY:decompress-size-close-omitted",
+        "mod": "may",
+        "note": "The decompressed payload is bounded by the project's maxMessageSize while decompressing; the RFC names no close for the overflow (1009 'message too big' and 1002 'protocol error' are the candidates). The implementation reports the error directly, no Close frame: the MAY omission.",
+        "term": "proto",
+        "wire": {
+          "kind": "none"
+        }
+      }
+    ]
+  }
+}

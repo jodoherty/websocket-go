@@ -1,0 +1,37 @@
+{
+  "desc": "transition (FGB2, close1000); frames: bin02, close1000",
+  "events": [
+    {
+      "code": 1000,
+      "kind": "close",
+      "reason": "",
+      "t": "event"
+    }
+  ],
+  "frame": "close1000",
+  "frames": [
+    "02024142",
+    "880203e8"
+  ],
+  "fromState": "FGB2",
+  "id": "T_FGB2_close1000_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.4",
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "mod": "must",
+        "term": "eof",
+        "wire": {
+          "code": 1000,
+          "kind": "coded"
+        }
+      }
+    ]
+  }
+}

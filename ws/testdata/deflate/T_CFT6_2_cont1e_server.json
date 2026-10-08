@@ -1,0 +1,27 @@
+{
+  "desc": "transition (CFT6_2, cont1e); frames: ctext0, ccontA0, cont1e",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "4141",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1e",
+  "frames": [
+    "418301020304720603",
+    "008301020304720603",
+    "808001020304"
+  ],
+  "fromState": "CFT6_2",
+  "id": "T_CFT6_2_cont1e_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2"
+  ],
+  "side": "server",
+  "terminal": null
+}

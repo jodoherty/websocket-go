@@ -1,0 +1,26 @@
+{
+  "desc": "transition (CFT3_1W, ccont891); frames: ctext0w, ccont891",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "c289",
+      "t": "event"
+    }
+  ],
+  "frame": "ccont891",
+  "frames": [
+    "41033b0400",
+    "8003eb0400"
+  ],
+  "fromState": "CFT3_1W",
+  "id": "T_CFT3_1W_ccont891_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2"
+  ],
+  "side": "client",
+  "terminal": null
+}

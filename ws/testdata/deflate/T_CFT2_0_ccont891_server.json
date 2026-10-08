@@ -1,0 +1,40 @@
+{
+  "desc": "transition (CFT2_0, ccont891); frames: ctext0e, ccont891",
+  "events": [],
+  "frame": "ccont891",
+  "frames": [
+    "4182010203040202",
+    "808301020304ea0603"
+  ],
+  "fromState": "CFT2_0",
+  "id": "T_CFT2_0_ccont891_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.1, RFC 6455 5.6"
+  ],
+  "side": "server",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 1007,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1007,
+          "kind": "coded"
+        }
+      },
+      {
+        "id": "MAY:close-frame-omitted",
+        "mod": "may",
+        "note": "RFC 6455 7.1.7 MAY: omit the Close frame when the error corrupts message state (the peer is unlikely to receive and process it). The implementation sends the SHOULD 1002 frame on these violations instead, uniform with header-level; a regression to a bare teardown would warn under this ID.",
+        "term": "proto",
+        "wire": {
+          "kind": "none"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "desc": "transition (IDLE, ctext1); frames: ctext1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "ctext1",
+  "frames": [
+    "c18301020304720603"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_ctext1_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6.2"
+  ],
+  "side": "server",
+  "terminal": null
+}

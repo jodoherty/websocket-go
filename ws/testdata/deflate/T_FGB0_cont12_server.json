@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGB0, cont12); frames: bin0e, cont12",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "binary",
+      "payload": "4142",
+      "t": "event"
+    }
+  ],
+  "frame": "cont12",
+  "frames": [
+    "028001020304",
+    "8082010203044040"
+  ],
+  "fromState": "FGB0",
+  "id": "T_FGB0_cont12_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.4"
+  ],
+  "side": "server",
+  "terminal": null
+}

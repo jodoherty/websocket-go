@@ -1,0 +1,24 @@
+{
+  "desc": "transition (IDLE, cbine); frames: cbine",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "binary",
+      "payload": "",
+      "t": "event"
+    }
+  ],
+  "frame": "cbine",
+  "frames": [
+    "c2020300"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_cbine_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6.2"
+  ],
+  "side": "client",
+  "terminal": null
+}

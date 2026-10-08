@@ -1,0 +1,34 @@
+{
+  "desc": "transition (IDLE, closeempty); frames: closeempty",
+  "events": [
+    {
+      "code": 1005,
+      "kind": "close",
+      "reason": "",
+      "t": "event"
+    }
+  ],
+  "frame": "closeempty",
+  "frames": [
+    "888001020304"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_closeempty_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "side": "server",
+  "terminal": {
+    "outcomes": [
+      {
+        "mod": "must",
+        "term": "eof",
+        "wire": {
+          "kind": "empty"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "desc": "transition (CFB2_0, close1000); frames: cbin0e, close1000",
+  "events": [
+    {
+      "code": 1000,
+      "kind": "close",
+      "reason": "",
+      "t": "event"
+    }
+  ],
+  "frame": "close1000",
+  "frames": [
+    "42020300",
+    "880203e8"
+  ],
+  "fromState": "CFB2_0",
+  "id": "T_CFB2_0_close1000_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 6455 5.5.1, 7.4"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "mod": "must",
+        "term": "eof",
+        "wire": {
+          "code": 1000,
+          "kind": "coded"
+        }
+      }
+    ]
+  }
+}

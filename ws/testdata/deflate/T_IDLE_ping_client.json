@@ -1,0 +1,23 @@
+{
+  "desc": "transition (IDLE, ping); frames: ping",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "ping",
+      "t": "event"
+    }
+  ],
+  "frame": "ping",
+  "frames": [
+    "8900"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_ping_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.5"
+  ],
+  "side": "client",
+  "terminal": null
+}

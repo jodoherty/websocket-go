@@ -1,0 +1,25 @@
+{
+  "desc": "transition (CFB2_0, pong); frames: cbin0e, pong",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "pong",
+      "t": "event"
+    }
+  ],
+  "frame": "pong",
+  "frames": [
+    "42020300",
+    "8a00"
+  ],
+  "fromState": "CFB2_0",
+  "id": "T_CFB2_0_pong_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 6455 5.5"
+  ],
+  "side": "client",
+  "terminal": null
+}

@@ -1,0 +1,47 @@
+{
+  "desc": "transition (IDLE, cbinbomb); frames: cbinbomb",
+  "events": [],
+  "frame": "cbinbomb",
+  "frames": [
+    "c2057374040300"
+  ],
+  "fromState": "IDLE",
+  "id": "T_IDLE_cbinbomb_client",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 7.4.2 (project maxMessageSize policy)"
+  ],
+  "side": "client",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 1002,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1002,
+          "kind": "coded"
+        }
+      },
+      {
+        "code": 1009,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1009,
+          "kind": "coded"
+        }
+      },
+      {
+        "id": "MAY:decompress-size-close-omitted",
+        "mod": "may",
+        "note": "The decompressed payload is bounded by the project's maxMessageSize while decompressing; the RFC names no close for the overflow (1009 'message too big' and 1002 'protocol error' are the candidates). The implementation reports the error directly, no Close frame: the MAY omission.",
+        "term": "proto",
+        "wire": {
+          "kind": "none"
+        }
+      }
+    ]
+  }
+}

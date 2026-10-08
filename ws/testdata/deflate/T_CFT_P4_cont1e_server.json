@@ -1,0 +1,50 @@
+{
+  "desc": "transition (CFT_P4, cont1e); frames: ctext0e, cont02, cont1e",
+  "events": [],
+  "frame": "cont1e",
+  "frames": [
+    "4182010203040202",
+    "0082010203044040",
+    "808001020304"
+  ],
+  "fromState": "CFT_P4",
+  "id": "T_CFT_P4_cont1e_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2, RFC 6455 7.1.7"
+  ],
+  "side": "server",
+  "terminal": {
+    "outcomes": [
+      {
+        "code": 1002,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1002,
+          "kind": "coded"
+        }
+      },
+      {
+        "code": 1007,
+        "mod": "should",
+        "term": "closeErr",
+        "wire": {
+          "code": 1007,
+          "kind": "coded"
+        }
+      },
+      {
+        "id": "MAY:decompress-close-omitted",
+        "mod": "may",
+        "note": "RFC 7692 names no Close frame for a failed decompression (6.2 is silent on failure; the RFC 6455 7.1.7 SHOULD applies generically, 1002/1007 the candidate codes). The implementation reports the error directly, no Close frame: the MAY omission.",
+        "term": "proto",
+        "wire": {
+          "kind": "none"
+        }
+      }
+    ]
+  }
+}

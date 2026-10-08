@@ -1,0 +1,28 @@
+{
+  "desc": "transition (CFB_P41_6_1, cont1e); frames: cbin0e, ccontA0, cont0, cont1e",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "binary",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1e",
+  "frames": [
+    "4282010203040202",
+    "008301020304720603",
+    "00810102030440",
+    "808001020304"
+  ],
+  "fromState": "CFB_P41_6_1",
+  "id": "T_CFB_P41_6_1_cont1e_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2"
+  ],
+  "side": "server",
+  "terminal": null
+}

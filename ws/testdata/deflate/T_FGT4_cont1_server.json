@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGT4, cont1); frames: text04, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "4142414241",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "01840102030440404246",
+    "80810102030440"
+  ],
+  "fromState": "FGT4",
+  "id": "T_FGT4_cont1_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.4"
+  ],
+  "side": "server",
+  "terminal": null
+}

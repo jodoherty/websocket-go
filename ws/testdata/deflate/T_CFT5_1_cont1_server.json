@@ -1,0 +1,27 @@
+{
+  "desc": "transition (CFT5_1, cont1); frames: ctext0e, ccontA0, cont1",
+  "events": [
+    {
+      "kind": "msg",
+      "op": "text",
+      "payload": "41",
+      "t": "event"
+    }
+  ],
+  "frame": "cont1",
+  "frames": [
+    "4182010203040202",
+    "008301020304720603",
+    "80810102030440"
+  ],
+  "fromState": "CFT5_1",
+  "id": "T_CFT5_1_cont1_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2"
+  ],
+  "side": "server",
+  "terminal": null
+}

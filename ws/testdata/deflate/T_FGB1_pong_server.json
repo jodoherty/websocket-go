@@ -1,0 +1,25 @@
+{
+  "desc": "transition (FGB1, pong); frames: bin0, pong",
+  "events": [
+    {
+      "kind": "ctrl",
+      "op": "pong",
+      "t": "event"
+    }
+  ],
+  "frame": "pong",
+  "frames": [
+    "02810102030440",
+    "8a8001020304"
+  ],
+  "fromState": "FGB1",
+  "id": "T_FGB1_pong_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 6455 5.4",
+    "RFC 6455 5.5"
+  ],
+  "side": "server",
+  "terminal": null
+}

@@ -1,0 +1,19 @@
+{
+  "desc": "transition (CFB2_0, cont02); frames: cbin0e, cont02",
+  "events": [],
+  "frame": "cont02",
+  "frames": [
+    "4282010203040202",
+    "0082010203044040"
+  ],
+  "fromState": "CFB2_0",
+  "id": "T_CFB2_0_cont02_server",
+  "machine": "rsv1",
+  "maxMessageSize": 6,
+  "rfc": [
+    "RFC 7692 6",
+    "RFC 7692 6.2, RFC 6455 7.1.7"
+  ],
+  "side": "server",
+  "terminal": null
+}
