@@ -15,6 +15,14 @@ implementations. Mutation tests and fuzzing stochastically discover more
 robustness edge cases. Finally, model based testing is done based on an
 RFC-derived formal model of the WebSocket protocol states.
 
+The API started out with high-level usage in mind and then I split out and grew
+a small, RFC-mapped core that can be layered on top of any transport and that
+helps enforce model based testing.
+
+Applications will typically want to use the higher level Session API, whereas
+WebSocket protocol libraries should directly create and use the underlying
+RawConn.
+
 I've set the project up with fairly strict linting and staticcheck rules to
 make it easier to add to any existing project by dropping in the implementation
 file.
