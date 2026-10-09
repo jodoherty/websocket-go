@@ -65,6 +65,21 @@ func TestTextUTF8Validation(t *testing.T) {
 		}
 	})
 
+	t.Run("fragmented text with a rune split across the boundary is delivered", func(t *testing.T) {
+		t.Parallel()
+		// The permissive face of the check above: RFC 6455 §5.6 validates
+		// the reassembled message, not each frame, so 0xc3 | 0xa9 — one
+		// two-byte rune split across the fragment boundary — must complete
+		// and be delivered whole.
+		frames := encodeDataFrame(t, true, false, OpText, []byte{0xc3})
+		frames = append(frames, encodeDataFrame(t, true, true, OpContinuation, []byte{0xa9})...)
+		c := newTestConn(frames, false)
+		op, data, readErr := c.ReadMessage()
+		if readErr != nil || op != OpText || string(data) != "é" {
+			t.Fatalf("split-rune text: (%d, %q, %v), want text \"é\"", op, data, readErr)
+		}
+	})
+
 	t.Run("compressed text with invalid UTF-8 fails", func(t *testing.T) {
 		t.Parallel()
 		stream := deflateStream(t, bad)
