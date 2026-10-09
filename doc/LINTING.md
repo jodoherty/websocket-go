@@ -22,13 +22,15 @@ gets copied into your project passes your linter config, not fights it.
 
 `.golangci.yml` keeps the exclusion list short and each entry carries its
 reason. The whole-repo disables are three linters that conflict with
-deliberate choices:
+deliberate choices — plus their `*_v5` variants and the deprecated
+`gomodguard`, which `default: all` still pulls in:
 
 | disabled | why |
 |---|---|
 | `wsl`, `wsl_v5` | whitespace-cuddle rules are not part of any mainstream strict config; gofmt stays the formatter, and "fixing" cuddles inserts blank lines that hurt readability |
-| `exhaustruct` | forces every struct literal to spell out all fields, including meaningful zeros; for option-heavy types (`tls.Config`, `net.Dialer`, `Config`) that is anti-clarity |
+| `exhaustruct`, `exhaustruct_v5` | forces every struct literal to spell out all fields, including meaningful zeros; for option-heavy types (`tls.Config`, `net.Dialer`, `Config`) that is anti-clarity |
 | `funcorder` | wants all unexported methods after all exported ones; the file is organized by protocol concern instead, so each method sits with the behavior it belongs to |
+| `gomodguard` | deprecated predecessor of `gomodguard_v2`, which is enabled instead (see the config); disabling the old name keeps module-guarding active without the deprecation warning |
 
 One linter *setting* is also deliberate: `exhaustive` runs with
 `default-signifies-exhaustive: true` because the read loops switch on the
