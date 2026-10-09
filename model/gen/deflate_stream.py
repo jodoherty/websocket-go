@@ -40,10 +40,11 @@ increasing authority:
       where [stream] is a complete RFC 1951 stream (at least one block;
       the final block BFINAL=1; and, per the 7.2.1 MUST, the final block
       ends at a byte boundary via minimal zero padding) and [tail] is the
-      truncated empty stored header: the "1" BFINAL bit in position q
-      (0 <= q <= 5, so the three header bits fit in the last octet), the
-      two zero BTYPE bits, and zero bits to the end of the octet --
-      exactly one byte, 1<<q. Nothing else.
+      first octet of the truncated empty stored header -- which starts
+      at that byte boundary: its BFINAL bit (the RFC leaves the
+      appended block's BFINAL unspecified, so 0 or 1), the two zero
+      BTYPE bits, and zero LEN bits: exactly one byte, 0x00 or 0x01.
+      Nothing else.
         complete   buf has exactly that shape.
         prefix     buf is a true prefix of some complete buffer
                    (repairable by adding bytes).
@@ -80,8 +81,15 @@ MALFORMED = "malformed"
 # decoder can reach its final block. (ws/ws.go deflateTailBytes.)
 TAIL9 = bytes([0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0xFF, 0xFF])
 
-# Tail bytes of a compliant 7.2.1 message: 1<<q, q in 0..5.
-TAIL_BYTES = {1 << q for q in range(6)}
+# The last octet of a compliant 7.2.1 message: the first octet of the
+# truncated empty stored block, which starts at a byte boundary -- the
+# RFC mandates zero padding to the boundary when the final block does
+# not end there (7.2.1: "MUST add minimal padding bits of 0"). With
+# BTYPE = 00 and LEN = 0, that octet is its BFINAL bit alone: 0x00
+# (a non-final empty stored block appended after the stream's final
+# block -- what real peers send) or 0x01 (the appended block itself
+# final; the RFC leaves BFINAL unspecified in the append step).
+TAIL_BYTES = {0x00, 0x01}
 
 EOFMARK = -1
 
@@ -541,7 +549,7 @@ def spec7692(buf):
     Returns (class, out, fault): class in {COMPLETE, PREFIX, MALFORMED},
     out the decompressed payload for COMPLETE, fault the reason otherwise.
     A compliant buffer is [stream][tail]: a byte-aligned (7.2.1 MUST
-    padding) complete stream plus exactly one tail byte 1<<q, q in 0..5
+    padding) complete stream plus exactly one tail byte (0x00 or 0x01)
     (the truncated empty stored header)."""
     if not buf:
         return PREFIX, None, "empty"

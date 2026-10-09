@@ -17,8 +17,9 @@ doc/rfc7692.txt) or from the implementation's committed oracle:
      codes 16/17/18, the one-distance-code (1 bit) and no-distance-code
      (empty tree) rules, HLIT range.
   F. Malformed classes: one vector per fault name.
-  G. RFC 7692 7.2.1: the compliant shape [stream][1<<q] in all six tail
-     alignments, the MUST zero padding, the prefix/malformed boundaries.
+  G. RFC 7692 7.2.1: the compliant shape [stream][0x00|0x01] (the
+     truncated stored header's first octet, BFINAL either way), the
+     MUST zero padding, the prefix/malformed boundaries.
   H. The implementation's committed decompression oracle
      (model/gen/deflate_oracle.json): impl_decompress agrees with the
      implementation on every row.
@@ -430,15 +431,22 @@ def main():
 
     # --- G. RFC 7692 7.2.1: the compliant shape ----------------------------
     stream = stored_block(True, b"A")  # 6 bytes, byte-aligned
-    for q in range(6):
+    # The truncated empty stored header starts at the byte boundary
+    # (the 7.2.1 MUST zero padding), so its first octet is its BFINAL
+    # bit alone: 0x00 or 0x01 are compliant; anything else (a BTYPE or
+    # LEN bit set, or the old "1<<q, q in 1..5" mid-octet shapes the
+    # header could not occupy) is not.
+    check("G.tail-q0", D.spec7692(stream + bytes([0x01])),
+          (D.COMPLETE, b"A", None))
+    check("G.tail-zero", D.spec7692(stream + bytes([0x00])),
+          (D.COMPLETE, b"A", None))
+    for q in range(1, 6):
         check("G.tail-q%d" % q, D.spec7692(stream + bytes([1 << q])),
-              (D.COMPLETE, b"A", None))
-    check("G.tail-missing", D.spec7692(stream),
-          (D.PREFIX, None, "tail-missing"))
+              (D.MALFORMED, None, "tail-shape"))
     check("G.tail-q6", D.spec7692(stream + bytes([0x40])),
           (D.MALFORMED, None, "tail-shape"))
-    check("G.tail-zero", D.spec7692(stream + bytes([0x00])),
-          (D.MALFORMED, None, "tail-shape"))
+    check("G.tail-missing", D.spec7692(stream),
+          (D.PREFIX, None, "tail-missing"))
     check("G.tail-extra", D.spec7692(stream + bytes([0x01, 0x00])),
           (D.MALFORMED, None, "tail-shape"))
     # Mid-byte final block with the MUST zero padding, then the tail.

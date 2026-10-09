@@ -1,28 +1,28 @@
 [
   {
     "id": "MAY:deflate-accept:empty",
-    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST).",
-    "reason": "An empty compressed payload is not a complete stream; the implementation's completion tail (a truncated empty stored block, 7.2.1) completes it to the empty message and delivers. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
+    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream plus the truncated empty stored header's first octet, MUST).",
+    "reason": "An empty compressed payload is not a complete stream; the implementation's completion tail completes it to the empty message and delivers. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
   },
   {
     "id": "MAY:deflate-accept:stream-incomplete",
-    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST).",
-    "reason": "A wire that is a valid stream prefix ending at a non-final block boundary is not a complete stream; the implementation's completion tail (the 7.2.1 truncated empty stored block) finishes it and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
+    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream plus the truncated empty stored header's first octet, MUST).",
+    "reason": "A wire that is a valid stream prefix ending at a non-final block boundary is not a complete stream; the implementation's completion tail (the 7.2.1 completion octets plus a final empty stored block) finishes it and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
   },
   {
     "id": "MAY:deflate-accept:tail-shape",
-    "basis": "RFC 7692 7.2.1 (the payload is [stream][exactly one completion octet], MUST).",
-    "reason": "A wire whose final block is followed by bytes other than the one completion octet (extra data, a second stream) is not 7.2.1-shaped; the decoder stops at the final block and the trailing bytes are ignored, so the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to inspect what follows the final block; the lenient parse is counted, not excused."
+    "basis": "RFC 7692 7.2.1 (the truncated empty stored header starts at the byte boundary after the stream's mandated zero padding, so its first octet is its BFINAL bit alone: 0x00 or 0x01, MUST).",
+    "reason": "A wire whose truncated stored header's first octet is neither 0x00 nor 0x01 (a BTYPE or LEN bit set, or extra data after one octet) is not the 7.2.1 shape; the implementation's decoder consumes what the octet decodes to (a literal, a second stream, ...) and delivers the message anyway. Accepted: the RFC assigns the receiver no obligation to inspect the header shape beyond decoding; the lenient parse is counted, not excused."
   },
   {
     "id": "MAY:deflate-accept:padding-nonzero",
-    "basis": "RFC 7692 7.2.1 (padding is the zero bits from the stream's end to the next byte boundary, MUST).",
-    "reason": "A stream ending mid-byte with nonzero padding bits is not a compliant wire; the implementation's completion tail repairs it (the padding bits read as the tail's data) and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to inspect the padding; the lenient parse is counted, not excused."
+    "basis": "RFC 7692 7.2.1 (when the final block does not end at a byte boundary the endpoint MUST add minimal zero padding to the boundary before the truncated stored header).",
+    "reason": "A stream ending mid-byte with nonzero bits between the stream and the truncated stored header is not the compliant shape; the implementation's completion tail repairs it (the stray bits read as header bits) and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to inspect the padding; the lenient parse is counted, not excused."
   },
   {
     "id": "MAY:deflate-accept:lit-badcode",
     "basis": "RFC 7692 7.2.1 + RFC 1951 3.2.6 (the fixed Huffman code assignments).",
-    "reason": "A wire carrying a code the RFC's literal fixed table does not define is malformed under the RFC's table; the implementation's canonical decoder decodes a legal message on some of these wires. Accepted: the fixed-table deviation is documented in doc/DEFLATE-STREAM.md; the acceptance of the legal subset is a counted divergence from the RFC-literal table, not excused."
+    "reason": "A wire carrying a fixed block the RFC's literal table does not define (the implementation's canonical table decodes 7-bit codes 0-23 as the EOB/length codes where the RFC has none) is malformed under the RFC's table; the implementation's canonical decoder decodes a legal message on some of these wires and delivers it. Accepted: the fixed-table deviation is documented in doc/DEFLATE-STREAM.md; the acceptance of the legal subset is a counted divergence from the RFC-literal table, not excused. (The mirror image is live on the wire: an RFC-literal fixed block, e.g. the empty final block 03 00 with EOB = 7-bit code 32, decodes under the canonical table as a literal -- the S_tailshape and witness traces pin both directions.)"
   },
   {
     "id": "MAY:decompress-close-omitted",

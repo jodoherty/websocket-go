@@ -25,10 +25,14 @@ So a compliant compressed message is
 - **[stream]**: a complete RFC 1951 stream — at least one block, the
   final block BFINAL=1, and (per the §7.2.1 MUST) the final block ends
   at a byte boundary via minimal zero padding.
-- **[tail]**: the truncated empty stored header — the "1" BFINAL bit in
-  position q (0 ≤ q ≤ 5, so the three header bits fit in the last
-  octet), the two zero BTYPE bits, zero bits to the end of the octet.
-  Exactly one byte: `1<<q`.
+- **[tail]**: the first octet of the truncated empty stored header,
+  which starts at that byte boundary: its BFINAL bit (the RFC leaves
+  the appended block's BFINAL unspecified, so 0 or 1), the two zero
+  BTYPE bits, and zero LEN bits. Exactly one byte: `0x00` or `0x01`
+  -- nothing else. (The octet is the header's *first* octet, not a
+  mid-octet fragment: the §7.2.1 MUST padding forces the header to
+  start on the boundary, so its BFINAL bit is always bit 0 of the
+  tail octet.)
 
 Nothing else. The classifier `spec7692` (model/gen/deflate_stream.py)
 assigns every buffer one of:
@@ -99,7 +103,8 @@ texts or the implementation's committed oracle:
   the no-distance-code rule (empty tree, all-literal data), HLIT
   range, a repeat without a previous length.
 - **F.** one vector per malformed class.
-- **G.** the §7.2.1 compliant shape: all six tail alignments, the MUST
+- **G.** the §7.2.1 compliant shape: the truncated stored header's
+  first octet (0x00 or 0x01), the non-compliant tail octets, the MUST
   zero padding, the prefix/malformed boundaries.
 - **H.** exhaustive agreement with the implementation's committed
   decompression oracle (model/gen/deflate_oracle.json, 1,531 wires):
@@ -122,18 +127,24 @@ table against the live decompress pipeline, asserting two layers:
 - **ledger**: a PREFIX/MALFORMED buffer that is nevertheless accepted
   is a MAY leniency, counted per spec fault and checked against
   `ws/testdata/deflstream/NOTES.json` (the same allowlist mechanism as
-  the MBT runners). The current ledger is exactly three accepted
+  the MBT runners). The current ledger is exactly six accepted
   entries:
-  - `MAY:deflate-accept:stream-incomplete` (5,312) — a truncated
+  - `MAY:deflate-accept:stream-incomplete` (5,126) — a truncated
     stream the completion tail happens to complete;
-  - `MAY:deflate-accept:padding-nonzero` (63) — nonzero bits after the
-    final block (the padding MUST binds the compressor, not the
-    receiver);
+  - `MAY:deflate-accept:padding-nonzero` (51) — nonzero bits between
+    the final block and the truncated stored header (the padding MUST
+    binds the compressor, not the receiver);
   - `MAY:deflate-accept:tail-missing` (1) — a complete byte-aligned
-    stream without the §7.2.1 tail byte.
+    stream without the §7.2.1 tail octet;
+  - `MAY:deflate-accept:lit-badcode` (86),
+    `MAY:deflate-accept:dist-too-far` (64),
+    `MAY:deflate-accept:dist-reserved` (48) — fixed-block wires the
+    RFC's literal table (7-bit codes 32-55) does not define but the
+    implementation's canonical table decodes (the documented 3.2.6
+    deviation, above).
 
 No COMPLETE buffers exist below 6 bytes (a compliant buffer is a
-stream of at least one block plus the tail byte), so the table's spec
+stream of at least one block plus the tail octet), so the table's spec
 layer exercises the prefix/malformed boundary; the oracle cross-check
 (H) covers the compliant shape at the RSV1 machine's wire sizes.
 
@@ -238,7 +249,7 @@ impossible; the witnesses build the pending deliberately).
 
 ### Frame traces and the Go replay (make deflstate, TestMBTDeflState)
 
-The committed traces (ws/testdata/deflstate/, 174 files, generated
+The committed traces (ws/testdata/deflstate/, 182 files, generated
 by model/gen/gen_deflstatetraces.py) replay against a live RawConn
 with permessage-deflate negotiated, on both sides. A trace is a
 compressed-frame sequence (the shared wire encoder of the
@@ -257,19 +268,24 @@ only frame that decompresses:
     teardown: MAY:decompress-close-omitted), OK (the delivered
     payload, asserted byte-for-byte).
   * the ledger: a delivered message from a wire the RFC 7692
-    7.2.1 class does not name COMPLETE (truncated, wrong tail
-    shape, nonzero padding, a code the RFC's literal fixed table
-    does not define) fires MAY:deflate-accept:<shape> -- the
-    lenient completion is counted, not excused. NOTES.json
-    accepts the seven distinct IDs that fire.
+    7.2.1 class does not name COMPLETE (truncated, a tail octet
+    that is not 0x00/0x01, nonzero padding, a code the RFC's
+    literal fixed table does not define) fires
+    MAY:deflate-accept:<shape> -- the lenient completion is
+    counted, not excused. NOTES.json accepts the seven distinct
+    IDs that fire.
 
 Trace families: every witness state (31 coarse (phase, output)
 classes) as a single final frame, split across a non-final and a
 final frame (RFC 7692 6.2: the stream need not be whole in any
 one fragment), and -- on delivery traces -- with an interleaved
 ping; plus the two-stream-in-one-message wire (DONE starting the
-next stream), the bomb, and the text-frame UTF-8 validity pair
-(RFC 6455 5.6: the decoded payload of a text message is
+next stream: two canonical empty final blocks, 03 00 03 00, whose
+RFC-literal reading is a bad code -- lit-badcode on delivery), the
+wrong-tail-octet wire that still delivers (13 00 04: the RFC-
+literal empty final block plus a tail octet the shape does not
+name -- tail-shape), the bomb, and the text-frame UTF-8 validity
+pair (RFC 6455 5.6: the decoded payload of a text message is
 checked, terminal 1007 when invalid).
 
 The machine's mid-stream state (pending codes, table bytes) is not
@@ -282,7 +298,7 @@ the ledger) while the Q1-Q5 checks pin the byte-level machine.
 ```
 make deflstream       # part 1 self-check (in the gate)
 make test             # TestDecompressStreamTable (65,792 rows) and
-                      # TestMBTDeflState (174 traces)
+                      # TestMBTDeflState (182 traces)
 make deflstate        # part 2 self-check Q1-Q4 (in the gate)
 make deflstate-model  # the coarse nuXmv cross-check (in the gate)
 make deflstream-gen   # regenerate the table; must be deterministic

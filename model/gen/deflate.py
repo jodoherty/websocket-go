@@ -66,6 +66,7 @@ import os
 import zlib
 
 import common as C
+import deflate_stream as DS
 import utf8bound as U
 
 MAXMSG = 6
@@ -242,15 +243,9 @@ def wire_kind(frame):
 # carries self-contained complete DEFLATE block(s), so the concatenation
 # of a compressed message's frames is a concatenation of complete
 # streams and decompresses to the concatenation of the chunks.
-
-# The completion tail the receiver appends before inflating a message's
-# final (possibly truncated) stream. The RFC 7692 7.2.2 prescribes the
-# four octets 00 00 ff ff; real peers additionally end the stream with an
-# empty BFINAL block, and the implementation (a documented interop
-# deviation, see the ws package doc) appends the four RFC octets plus
-# 01 00 00 ff ff. The trace bytes must replay against the implementation,
-# so the model's fate classes are defined against its tail.
-TAIL = bytes([0x00, 0x00, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0xFF, 0xFF])
+# (The receiver's completion tail -- the 7.2.2 four octets plus the
+# interop 01 00 00 ff ff -- is the part-1 reference's TAIL9,
+# deflate_stream.py: the single source of truth.)
 
 
 def _deflate_wire(chunk):
@@ -260,64 +255,29 @@ def _deflate_wire(chunk):
     return co.compress(chunk) + co.flush()
 
 
-def _inflate_tail(segment):
-    """Inflate segment with the completion tail appended: the output bytes
-    when the segment (plus tail) is a complete stream, else None."""
-    try:
-        d = zlib.decompressobj(-15)
-        out = d.decompress(segment + TAIL)
-        if d.eof:
-            return out + d.flush()
-
-        return None
-    except zlib.error:
-        return None
-
-
-def _complete_stream(segment):
-    """Whether segment is a complete DEFLATE stream (reaches a BFINAL
-    block) without a decode error -- no tail involved."""
-    try:
-        d = zlib.decompressobj(-15)
-        d.decompress(segment)
-        if d.eof:
-            d.flush()
-
-            return True
-        return False
-    except zlib.error:
-        return False
+def _stored_wire(chunk):
+    """A complete stored-block stream for chunk (the 5-byte
+    byte-aligned header plus the data, RFC 1951 3.2.4): table-
+    independent, so the compliant-wire family is well-formed under
+    both the RFC's literal fixed table and the implementation's
+    canonical one (a zlib fixed block is not: the empty fixed
+    stream 03 00 is a bad code under the RFC table)."""
+    ln = len(chunk)
+    return bytes([0x01, ln & 0xFF, (ln >> 8) & 0xFF,
+                  (ln ^ 0xFFFF) & 0xFF, (ln ^ 0xFFFF) >> 8 & 0xFF]) + chunk
 
 
 def emu_decompress(wire):
-    """The receiver's decompression over wire: the segment scan (each
+    """The receiver's decompression over wire, via the part-1 reference
+    classifier (deflate_stream.impl_decompress): the segment scan (each
     complete stream decodes in order) with the completion tail on the
-    final remainder -- the implementation's decompress() semantics. The
-    decompressed bytes on success, None on a decompression failure.
-    An empty wire decompresses to the empty payload (no stream at all).
+    final remainder -- the implementation's decompress() semantics, the
+    single source of truth. The decompressed bytes on success, None on
+    a decompression failure. Runs without the size guard: a chunk is
+    either decodable or not, independent of the limit.
     """
-    if wire == b"":
-        return b""
-    out = b""
-    start = 0
-    while start < len(wire):
-        boundary = None
-        for end in range(start + 1, len(wire) + 1):
-            if _complete_stream(wire[start:end]):
-                boundary = end
-                break
-        if boundary is None:
-            tail_out = _inflate_tail(wire[start:])
-            if tail_out is None:
-                return None
-
-            return out + tail_out
-        seg_out = _inflate_tail(wire[start:boundary])
-        if seg_out is None:
-            return None
-        out += seg_out
-        start = boundary
-    return out
+    status, value = DS.impl_decompress(wire, 10 ** 9)
+    return value if status == DS.OK else None
 
 
 # A compressed payload that is not a decodable stream (any corruption the
@@ -992,10 +952,17 @@ def self_check():
           bytes on the same side (a collision would make the concrete
           traces ambiguous -- the receiver's interpretation is the
           machine's context branching, not a class distinction);
-      W6  the decompression oracle: emu_decompress matches the
+      W6  the decompression oracle: emu_decompress (the part-1
+          reference, deflate_stream.impl_decompress) matches the
           implementation's decompress() on every wire the machine can
           accumulate (deflate_oracle.json) -- the pending-41 and
           poisoned state branching is derived from this table.
+      W7  the spec-implementation bridge on compliant wires: every
+          payload the alphabet expresses, in the RFC 7692 7.2.1
+          compliant shape (one complete byte-aligned stream plus the
+          truncated empty stored header's first octet, 0x00 or 0x01),
+          is COMPLETE under the spec classifier and accepted by the
+          receiver's semantics with exactly that payload.
     """
     failures = []
 
@@ -1055,14 +1022,14 @@ def self_check():
         else:
             seen_bytes[b] = name
 
-    # W6: the decompression oracle. emu_decompress must match the
-    # implementation's decompress() on every wire the machine can
-    # accumulate: all sequences of alphabet payloads up to the limit
-    # (deflate_oracle.json, generated by the Go oracle test). The oracle
-    # is the receiver's decompression semantics, pinned by the
-    # implementation's own code -- the same code the traces replay
-    # against -- and it is what the pending-41 / poisoned state branching
-    # is derived from.
+    # W6: the decompression oracle. emu_decompress (now the part-1
+    # reference itself) must match the implementation's decompress()
+    # on every wire the machine can accumulate: all sequences of
+    # alphabet payloads up to the limit (deflate_oracle.json, generated
+    # by the Go oracle test). The oracle is the receiver's
+    # decompression semantics, pinned by the implementation's own code
+    # -- the same code the traces replay against -- and it is what the
+    # pending-41 / poisoned state branching is derived from.
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deflate_oracle.json")) as fh:
             oracle = json.load(fh)
@@ -1083,6 +1050,38 @@ def self_check():
         if mismatches > 5:
             failures.append("W6: %d more oracle mismatches" % (mismatches - 5))
 
+    # W7: the spec-implementation bridge on compliant wires. Every
+    # payload the alphabet expresses, in the RFC 7692 7.2.1 compliant
+    # shape -- one complete byte-aligned stream (the 7.2.1 MUST zero
+    # padding) plus the truncated empty stored header's first octet
+    # (0x00 or 0x01: its BFINAL bit, the RFC leaving BFINAL
+    # unspecified) -- must be COMPLETE under the spec classifier and
+    # accepted by the receiver's semantics with exactly that payload.
+    # The exhaustive 1-2 byte domain and the oracle wires contain no
+    # COMPLETE wire (the minimal compliant payload is six bytes; the
+    # alphabet's frames carry raw complete streams without the
+    # completion octet), so W7 synthesizes the compliant wires.
+    # Stored blocks keep the family table-independent (an RFC-literal
+    # fixed-block wire is misdecoded by the implementation's canonical
+    # table -- the documented 3.2.6 deviation); a two-stream wire is
+    # not compliant (7.2.1 names one stream) and out of scope here.
+    chunks = sorted({f["dec"] for f in FRAMES.values()
+                     if f["dec"] is not None and len(f["dec"]) <= MAXMSG})
+    streams = [_stored_wire(ch) for ch in chunks]
+    stream_outs = list(chunks)
+    for tail in (bytes([0x00]), bytes([0x01])):
+        for wire, out in zip(streams, stream_outs):
+            wire = wire + tail
+            cls, spec_out, _ = DS.spec7692(wire)
+            st, val = DS.impl_decompress(wire, 10 ** 9)
+            if cls != DS.COMPLETE or spec_out != out or st != DS.OK \
+                    or val != out:
+                failures.append("W7: compliant wire %s (tail %s): "
+                                "spec %s/%r, impl %s/%r, want %r"
+                                % (wire.hex(), tail.hex(), cls, spec_out,
+                                   st, val, out))
+                break
+
     return failures
 
 
@@ -1092,4 +1091,4 @@ if __name__ == "__main__":
         for line in bad:
             print("FAIL", line)
         raise SystemExit("deflate self-check failed (%d)" % len(bad))
-    print("deflate self-check: W1-W6 pass (%d states x %d frames)" % (len(STATES), len(FRAME_NAMES)))
+    print("deflate self-check: W1-W7 pass (%d states x %d frames)" % (len(STATES), len(FRAME_NAMES)))

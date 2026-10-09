@@ -226,6 +226,43 @@ def gen():
                 if err:
                     raise AssertionError(err)
                 traces[tr["id"]] = tr
+    # Two complete streams in one message under the wire limit: the
+    # canonical empty fixed block is two bytes (03 00), so two of them
+    # fit; the decoder concatenates their output and the trailing
+    # stream is the tail the 7.2.1 shape does not name (one stream),
+    # so the delivery is a counted tail-shape leniency. (The longer
+    # two-stream wire above the limit is a wire-size trace, not a
+    # decompression one.)
+    two = bytes((0x03, 0x00, 0x03, 0x00))
+    for tid, frames in (("S_twostream",
+                         [frame(2, True, True, two)]),
+                        ("S_twostream_frag",
+                         [frame(2, False, True, two[:2]),
+                          frame(0, True, False, two[2:])])):
+        for side in SIDES:
+            tr = build(tid, side, frames, two)
+            err = machine_check(two, tid)
+            if err:
+                raise AssertionError(err)
+            traces[tr["id"]] = tr
+    # A wire the spec classifier names tail-shape (the truncated
+    # stored header's first octet is not 0x00/0x01) that the
+    # implementation still delivers: the RFC-literal empty final
+    # fixed block (13 00: EOB = 7-bit code 32) plus 0x04, which the
+    # implementation's canonical decode reads as a literal, a
+    # non-final EOB, and a final empty stored block from the tail.
+    tailshape = bytes((0x13, 0x00, 0x04))
+    for tid, frames in (("S_tailshape",
+                         [frame(2, True, True, tailshape)]),
+                        ("S_tailshape_frag",
+                         [frame(2, False, True, tailshape[:1]),
+                          frame(0, True, False, tailshape[1:])])):
+        for side in SIDES:
+            tr = build(tid, side, frames, tailshape)
+            err = machine_check(tailshape, tid)
+            if err:
+                raise AssertionError(err)
+            traces[tr["id"]] = tr
     # A decompression bomb under the wire limit: the repeated
     # length-3 / distance-1 code (0x02 each, from the 0b00000
     # pending) triplets the output; four wire bytes decode to nine,

@@ -1,0 +1,32 @@
+{
+ "desc": "wire 03000300",
+ "events": [
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "4282010203040202",
+  "8082010203040202"
+ ],
+ "id": "S_twostream_frag_server",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "server",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:lit-badcode",
+   "mod": "may",
+   "note": "the wire is malformed (lit-badcode); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

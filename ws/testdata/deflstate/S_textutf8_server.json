@@ -21,12 +21,5 @@
  ],
  "side": "server",
  "terminal": null,
- "warnings": [
-  {
-   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
-   "id": "MAY:deflate-accept:tail-shape",
-   "mod": "may",
-   "note": "the wire is malformed (tail-shape); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
-  }
- ]
+ "warnings": []
 }

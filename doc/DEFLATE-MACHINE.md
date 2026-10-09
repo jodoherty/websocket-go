@@ -303,10 +303,17 @@ correct.
    `0x41` decodes to the empty payload only when the message ends
    exactly on it (the pending-41 states) and poisons the message if any
    byte follows. The pending-41 / poisoned branching is derived from
-   the decompression oracle (W6): `emu_decompress` must match the
+   the decompression oracle (W6): the machine's decompression is the
+   DEFLATE stream machine's reference itself
+   (`deflate_stream.impl_decompress`), which must match the
    implementation's `decompress()` on every wire the machine can
    accumulate (`model/gen/deflate_oracle.json`), so the model cannot
-   drift from the receiver's actual decompression.
+   drift from the receiver's actual decompression. W7 adds the
+   spec-implementation bridge: every payload the alphabet expresses in
+   the RFC 7692 7.2.1 compliant shape (a complete byte-aligned stream
+   plus the truncated stored header's first octet, 0x00 or 0x01) is
+   COMPLETE under the spec classifier and delivered by the receiver's
+   semantics with exactly that payload.
 
 ## Scope and follow-ups
 

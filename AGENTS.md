@@ -298,7 +298,7 @@ ws/deflstream_test.go the DEFLATE stream machine replay (part 1, doc/
                     entries)
 ws/deflstate_test.go  the DEFLATE state-machine replay (part 2, doc/
                     DEFLATE-STREAM.md): the committed frame traces
-                    (ws/testdata/deflstate/, 174 files) against a live
+                    (ws/testdata/deflstate/, 182 files) against a live
                     compressed RawConn on both sides: delivery asserted
                     byte-for-byte, the terminal close codes (wire-side
                     limit 1002, decompression 1002/1009, text UTF-8
@@ -429,10 +429,12 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                                  (wire, decompressed) compressed pairs x the
                                  10 boundary suffixes, the poisoned states,
                                  the pending-41 states), 83 frame classes;
-                                 W1-W6 self-check (W6: emu_decompress matches
-                                 the implementation's decompress() on
-                                 deflate_oracle.json, every wire the machine
-                                 can accumulate)
+                                 W1-W7 self-check (W6: the part-1
+                                 reference matches the implementation's
+                                 decompress() on deflate_oracle.json,
+                                 every wire the machine can accumulate;
+                                 W7: spec-COMPLETE compliant wires
+                                 deliver the exact payload)
                 gen/deflate_stream.py the DEFLATE stream machine (part 1,
                                  doc/DEFLATE-STREAM.md): the spec reference
                                  classifier for permessage-deflate compressed
