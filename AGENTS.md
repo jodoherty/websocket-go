@@ -400,7 +400,7 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                 go.mod stays dependency-free.
                 Containerfile    nuXmv 2.2 (FBK tarball, SHA-256 verified)
                 gen/utf8bound.py the exact RFC 3629 §3/§4 boundary machine over
-                                 fragment boundaries (10 states, the five
+                                 fragment boundaries (10 states, the four
                                  narrow acceptance sets), shared by the
                                  reassembly machine and the RSV1 machine;
                                  B1-B7 self-check

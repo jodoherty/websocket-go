@@ -393,8 +393,9 @@ _frame("cbinbad", op=2, fin=1, rsv1=1, payload=BAD_STREAM, fate="bad")
 _frame("cbinbomb", op=2, fin=1, rsv1=1, payload=_deflate_wire(b"A" * 7), dec=b"A" * 7)
 
 # Compressed starts (RSV1, FIN=0). The fin=0 starts exist so that every
-# boundary-machine state -- including the five narrow hazard states -- is
-# reachable as a compressed text fragment state (the RX property); the
+# boundary-machine state -- including the four narrow hazard states and
+# K2 -- is reachable as a compressed text fragment state (the RX
+# property); the
 # matching single-frame (fin=1) classes exercise the same boundaries at
 # completion instead.
 _frame("ctext0", op=1, fin=0, rsv1=1, payload=_deflate_wire(b"A"), dec=b"A")

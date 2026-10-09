@@ -129,8 +129,8 @@ bytes (side-specific masking, RFC 6455 5.1). Four families:
 - **compressed starts** (RSV1, FIN=0) and **compressed continuations**
   (RSV1=0): `ctext0`, `ctext0w`, `ctext0e0`, ..., `ccontA1`,
   `ccontC31`, `ccont891`, `ccontK20`, `ccont1bomb` — the fin=0 starts
-  reach every boundary state (including the five narrow hazard states)
-  as a live compressed fragment state;
+  reach every boundary state (including the four narrow hazard states
+  and K2) as a live compressed fragment state;
 - **RSV1 misuse** (RFC 7692 6.1 MUST NOT): `rsv1ctrl` (RSV1 on a control
   frame), `ccontR` (RSV1 on a continuation frame).
 
