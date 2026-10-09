@@ -294,8 +294,11 @@ ws/deflstream_test.go the DEFLATE stream machine replay (part 1, doc/
                     against the live decompress pipeline; asserts the
                     implementation-layer match and the spec-COMPLETE
                     acceptance, and counts the accepted PREFIX/MALFORMED
-                    leniencies against NOTES.json (three MAY:deflate-accept
-                    entries)
+                    leniencies against NOTES.json (six MAY:deflate-accept
+                    entries); plus the RFC 7692 7.2.1 compliant-wire pin
+                    (stored stream + 0x00/0x01 tail, and the tail-missing
+                    leniency) -- the implementation's side of W7's
+                    spec-implementation bridge
 ws/deflstate_test.go  the DEFLATE state-machine replay (part 2, doc/
                     DEFLATE-STREAM.md): the committed frame traces
                     (ws/testdata/deflstate/, 182 files) against a live

@@ -143,10 +143,12 @@ table against the live decompress pipeline, asserting two layers:
     implementation's canonical table decodes (the documented 3.2.6
     deviation, above).
 
-No COMPLETE buffers exist below 6 bytes (a compliant buffer is a
-stream of at least one block plus the tail octet), so the table's spec
-layer exercises the prefix/malformed boundary; the oracle cross-check
-(H) covers the compliant shape at the RSV1 machine's wire sizes.
+No COMPLETE buffer exists in the table's 1-2 byte domain (the
+minimal compliant buffer is three bytes: the empty fixed final
+block, which reaches the byte boundary at bit 10 with zero padding,
+plus the tail octet), so the table's spec layer exercises the
+prefix/malformed boundary; the oracle cross-check (H) covers the
+compliant shape at the RSV1 machine's wire sizes.
 
 ## Part 2: the streaming state machine (model/gen/deflate_state.py)
 
@@ -274,6 +276,16 @@ only frame that decompresses:
     MAY:deflate-accept:<shape> -- the lenient completion is
     counted, not excused. NOTES.json accepts the seven distinct
     IDs that fire.
+  * the fixed-table deviation at payload level: a wire the spec
+    class names COMPLETE can still be delivered with a payload the
+    spec does not decode -- the done-1 / text-utf8 witness wire
+    13 00 00 is the RFC-literal empty stream plus the compliant
+    tail (spec payload: empty), while the canonical table reads
+    it as a literal and delivers 0x10. That is the 3.2.6
+    deviation, not a ledger entry (the ledger counts MAY
+    leniencies, and this is the documented table difference);
+    the traces pin the implementation's payload through the
+    events.
 
 Trace families: every witness state (31 coarse (phase, output)
 classes) as a single final frame, split across a non-final and a

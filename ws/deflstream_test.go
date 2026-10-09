@@ -103,3 +103,55 @@ func runDeflStreamRow(t *testing.T, row [5]string, maxMsg int, ledger *mbtLedger
 			row[3]+" "+row[4])
 	}
 }
+
+// TestDecompressCompliantWires pins the receiver's semantics on the
+// RFC 7692 7.2.1 compliant shape itself -- a complete byte-aligned
+// stored-block stream plus the truncated empty stored header's first
+// octet (0x00 or 0x01; the RFC leaves the appended block's BFINAL
+// unspecified) -- which the exhaustive table cannot contain (the
+// domain is 1-2 bytes; the minimal compliant buffer is five plus
+// the tail). The reference classifier's W7 (model/gen/deflate.py)
+// asserts the same shape against the part-1 reference; this pins the
+// implementation's side of the bridge. The stored-block family keeps
+// the pin table-independent: the RFC's literal fixed table and the
+// implementation's canonical one decode fixed blocks differently
+// (the documented 3.2.6 deviation), so a compliant fixed-block wire
+// is not a payload-level bridge.
+func TestDecompressCompliantWires(t *testing.T) {
+	t.Parallel()
+	// stored block: the 5-byte aligned header (01, the two LEN
+	// bytes little-endian, the two NLEN bytes) plus the data octets.
+	cases := []struct {
+		name string
+		wire string
+		want string
+	}{{
+		"stored-empty-tail-zero", "010000FFFF00", ""},
+		{"stored-empty-tail-one", "010000FFFF01", ""},
+		{"stored-A-tail-zero", "010100FEFF4100", "41"},
+		{"stored-A-tail-one", "010100FEFF4101", "41"},
+		// The same streams without the tail octet (the spec class
+		// names tail-missing; the receiver accepts them -- the
+		// table's MAY:deflate-accept:tail-missing ledger entry).
+		{"stored-empty-no-tail", "010000FFFF", ""},
+		{"stored-A-no-tail", "010100FEFF41", "41"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			wire, err := hex.DecodeString(tc.wire)
+			if err != nil {
+				t.Fatalf("wire hex: %v", err)
+			}
+			want, _ := hex.DecodeString(tc.want)
+			conn := newRawConn(&fakeConn{}, &fakeConn{}, false, 6, 0, 0)
+			out, derr := conn.decompress(wire)
+			if derr != nil {
+				t.Fatalf("an RFC-compliant (or tail-missing) buffer was rejected: %v", derr)
+			}
+			if !bytes.Equal(out, want) {
+				t.Fatalf("payload: got %x, want %x", out, want)
+			}
+		})
+	}
+}

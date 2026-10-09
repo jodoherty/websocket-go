@@ -228,11 +228,12 @@ def gen():
                 traces[tr["id"]] = tr
     # Two complete streams in one message under the wire limit: the
     # canonical empty fixed block is two bytes (03 00), so two of them
-    # fit; the decoder concatenates their output and the trailing
-    # stream is the tail the 7.2.1 shape does not name (one stream),
-    # so the delivery is a counted tail-shape leniency. (The longer
-    # two-stream wire above the limit is a wire-size trace, not a
-    # decompression one.)
+    # fit; the decoder concatenates their output and delivers the
+    # empty message. The spec walk faults on the first block already
+    # (03 00 is a bad code under the RFC's literal fixed table -- the
+    # empty block there is 13 00), so the delivery is counted under
+    # lit-badcode. (The longer two-stream wire above the limit is a
+    # wire-size trace, not a decompression one.)
     two = bytes((0x03, 0x00, 0x03, 0x00))
     for tid, frames in (("S_twostream",
                          [frame(2, True, True, two)]),

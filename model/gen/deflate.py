@@ -1058,9 +1058,11 @@ def self_check():
     # unspecified) -- must be COMPLETE under the spec classifier and
     # accepted by the receiver's semantics with exactly that payload.
     # The exhaustive 1-2 byte domain and the oracle wires contain no
-    # COMPLETE wire (the minimal compliant payload is six bytes; the
-    # alphabet's frames carry raw complete streams without the
-    # completion octet), so W7 synthesizes the compliant wires.
+    # COMPLETE wire (the minimal compliant buffer is three bytes --
+    # the empty fixed final block, which reaches the byte boundary at
+    # bit 10, plus the tail octet -- and the alphabet's frames carry
+    # raw complete streams without the completion octet), so W7
+    # synthesizes the compliant wires.
     # Stored blocks keep the family table-independent (an RFC-literal
     # fixed-block wire is misdecoded by the implementation's canonical
     # table -- the documented 3.2.6 deviation); a two-stream wire is
