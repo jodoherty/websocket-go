@@ -1249,9 +1249,9 @@ func deadlineCapable(channel transport) bool {
 // and deadlines, as a [net.Conn] does, is used directly; a stream that
 // implements [DeadlineStream] without addresses is adapted so its deadlines
 // pass through; a bare stream reports a nil address and carries the no-op
-// deadline enforcement, so
-// the deadline options must be zero over it. Standard-library HTTP/2 callers use [Upgrader.Upgrade]
-// instead, which detects the extended CONNECT itself.
+// deadline enforcement, so the deadline options must be zero over it.
+// Standard-library HTTP/2 callers use [Upgrader.Upgrade] instead, which
+// detects the extended CONNECT itself.
 func (u *Upgrader) SessionOnStream(stream io.ReadWriteCloser, subprotocol, extension string) (*Session, error) {
 	var channel transport
 	if full, ok := stream.(transport); ok {
