@@ -711,8 +711,8 @@ certificate against the real demo binary (`e2e/e2e_test.go`).
 | `rfc6455.txt` | **Governing** — fully implemented and vector-pinned | The WebSocket protocol itself |
 | `rfc7692.txt` | **Implemented** — permessage-deflate (RFC 7692), on by default | The only extension with universal browser support; design and interop evidence in `doc/COMPRESSION.md` |
 | `rfc8307.txt` | Reference only | Defines `/ws://host/.well-known/…` URI conventions; no protocol mechanics, nothing to implement |
-| `rfc8441.txt` | Reference only | WebSockets over HTTP/2; Chromium and Firefox support it, but serving it needs HTTP/2 extended-CONNECT, which the Go standard library does not expose — unreachable for a stdlib-only package |
-| `rfc9220.txt` | Reference only | WebSockets over HTTP/3; no browser ships it, and QUIC is categorically outside the stdlib-only constraint |
+| `rfc8441.txt` | **Implemented** — the server-side extended-CONNECT branch of `Upgrader.Upgrade`; proven end-to-end by `e2e/h2` (a real `x/net/http2` extended-CONNECT client) | WebSockets over HTTP/2; the same handler serves it when the HTTP/2 server routes extended CONNECT |
+| `rfc9220.txt` | **Implemented** — the same extended-CONNECT branch plus `SessionOnStream` for external HTTP/3 stacks; proven end-to-end by `e2e/h3` (a real quic-go HTTP/3 server) | WebSockets over HTTP/3; no browser ships it; the quic-go dependency lives in the separate `e2e/h3` module, so the root `go.mod` stays dependency-free |
 
 ## A VNC-shaped example
 

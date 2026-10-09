@@ -809,15 +809,6 @@ func checkHandshakeHeaders(writer http.ResponseWriter, request *http.Request) (s
 	return checkWebSocketKey(writer, request)
 }
 
-// checkWebSocketKey validates the RFC 6455 §4.2 fields carried by BOTH the
-// HTTP/1.1 Upgrade and the HTTP/2/3 extended-CONNECT handshake — exactly one
-// supported Sec-WebSocket-Version and exactly one well-formed
-// Sec-WebSocket-Key, the base64 of 16 octets — and returns the key. Several
-// header lines for a single-value header are a malformed handshake: the value
-// would be ambiguous, so they are rejected rather than resolved to the first
-// line. Each rejection writes the HTTP error response itself; the
-// version-mismatch response additionally names the version(s) the server
-// understands, per §4.2.
 // checkWebSocketVersion validates the Sec-WebSocket-Version header. It is
 // shared by the HTTP/1.1 upgrade and the RFC 8441 extended-CONNECT path:
 // the version is still required over a tunnel, but the handshake key is
@@ -841,6 +832,15 @@ func checkWebSocketVersion(writer http.ResponseWriter, request *http.Request) *U
 	return nil
 }
 
+// checkWebSocketKey validates the RFC 6455 §4.2 fields carried by BOTH the
+// HTTP/1.1 Upgrade and the HTTP/2/3 extended-CONNECT handshake — exactly one
+// supported Sec-WebSocket-Version and exactly one well-formed
+// Sec-WebSocket-Key, the base64 of 16 octets — and returns the key. Several
+// header lines for a single-value header are a malformed handshake: the value
+// would be ambiguous, so they are rejected rather than resolved to the first
+// line. Each rejection writes the HTTP error response itself; the
+// version-mismatch response additionally names the version(s) the server
+// understands, per §4.2.
 func checkWebSocketKey(writer http.ResponseWriter, request *http.Request) (string, *UpgradeError) {
 	versionErr := checkWebSocketVersion(writer, request)
 	if versionErr != nil {
@@ -2827,8 +2827,6 @@ func truncateReason(reason string) string {
 	return reason[:n]
 }
 
-// failProtocol tears the connection down with 1002 (protocol error) and
-// returns the violation for ReadMessage to report.
 // failWith answers a protocol error with a Close frame carrying the given
 // status code and fails the connection; it returns the terminal error
 // recorded on the connection. This is the RFC 6455 7.1.7 SHOULD: an endpoint
@@ -2846,6 +2844,8 @@ func (c *RawConn) failWith(code int, what string) error {
 	return c.finish(closeErrFor(code, what))
 }
 
+// failProtocol tears the connection down with 1002 (protocol error) and
+// returns the violation for ReadMessage to report.
 func (c *RawConn) failProtocol(what string) error { return c.failWith(StatusProtocolError, what) }
 
 // opcodeName is the human-readable name of an opcode for error messages.

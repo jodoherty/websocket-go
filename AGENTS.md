@@ -109,6 +109,8 @@ make bench       # per-message and per-connection cost benchmarks
 make mcdc        # MC/DC audit: every compound decision traced to a test
 make model       # frame-reassembly machine: model properties + trace fidelity
 make close-model # close-handshake machine: model properties + trace fidelity
+make deflate-model # RSV1/compressed-message machine: model properties +
+                # trace fidelity
 make deflstream  # DEFLATE stream machine (part 1): the RFC 1951/7692
                 # reference classifier self-check; the Go suite replays the
                 # exhaustive 1-2 byte table as TestDecompressStreamTable
@@ -122,6 +124,8 @@ make multiver    # build + vet + ws unit + Go e2e, all under -race, on
                 # go1.25.0 / go1.26.0 / go1.27.1 (browsers only on the
                 # default toolchain, via e2e)
 make e2e         # Go mTLS + Node `ws` interop both directions + Playwright
+make e2e-connect # real extended-CONNECT round trips: HTTP/2 (RFC 8441) via
+                # the e2e/h2 module, HTTP/3 (RFC 9220) via the e2e/h3 module
 ```
 
 `e2e` is already in the gate, but run it early and often on protocol or
@@ -236,6 +240,11 @@ ws/deflate_test.go   permessage-deflate (RFC 7692): extension negotiation
                     RSV1 state machine, compressed round trips (incl. empty
                     and fragmented messages), decompression error branches,
                     and the compressed-path allocation budget
+ws/decompressoracle_test.go the RSV1-model decompression oracle pin:
+                    replaying model/gen/deflate_oracle.json (the
+                    implementation's decompress() on every wire the model can
+                    accumulate) against the live decompression pipeline, so a
+                    decompress() change fails until the oracle is regenerated
 ws/protocolerror_test.go RFC 6455 §7.1.7 at the RawConn level: a frame-level
                     protocol violation is answered with a 1002 close frame
                     before the transport is torn down

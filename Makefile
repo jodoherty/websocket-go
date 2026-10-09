@@ -58,7 +58,7 @@ coverage:
 # derives per-branch outcomes (if true/false, for entry/exit, switch
 # cases) from a count-mode profile with cmd/branchcov, merging the unit
 # and e2e suites (the latter via -coverpkg). -min makes it a real gate:
-# the run fails if merged coverage drops below 90% (the current ~94% has
+# the run fails if merged coverage drops below 90% (the current ~92% has
 # headroom over the documented structurally-unreachable error branches).
 branchcov:
 	go test -covermode=count -coverprofile=bc-unit.out ./ws/

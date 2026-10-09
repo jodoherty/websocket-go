@@ -77,9 +77,12 @@ hand-written editing.)
    allocation (the payload), the masked client write is ~190 ns with zero
    allocations, each side of the handshake is ~3 µs, and the accept key is
    ~130 ns.
-10. **Statement coverage** — the library sits at **96.5% statement
-    coverage**, the same figure whether the unit suite alone or the unit
-    and e2e suites are combined. The e2e suite (`go test ./e2e -cover
+10. **Statement coverage** — the library sits at **95.5–95.8% statement
+    coverage** (the half-point spread is run-to-run variance: the
+    dial-cancellation race test hits `cancelHook.fire`'s already-decided
+    branch only when the race lands that way), the same figure whether the
+    unit suite alone or the unit and e2e suites are combined. The e2e
+    suite (`go test ./e2e -cover
     -coverpkg=./ws`) exercises the real-network `Dial` and the mTLS
     handshake; its count-mode profile merges with the unit profile
     (per-block max of the hit counts), and the combined figure confirms
@@ -93,8 +96,10 @@ hand-written editing.)
     count-mode profile (an `if`'s false branch is "the header was evaluated
     more times than its body was entered"; a `for`'s entry and exit are the
     header and body block counts; a `switch` gets one outcome per case plus a
-    no-match). The library sits at **93.8% branch coverage** (451 of 481
-    outcomes). The uncovered outcomes are error paths that are structurally
+    no-match). The library sits at **91.8% branch coverage** (572 of 623
+    outcomes; the count varies by one or two between runs, because a few
+    outcomes depend on scheduling in the stress tests). The uncovered
+    outcomes are error paths that are structurally
     unreachable without fault injection: the `crypto/rand.Read` error paths
     (it does not fail), the flate writer/reader error paths (the encoder and
     decoder do not fail on well-formed input), a guard against an unexpected
@@ -122,13 +127,13 @@ hand-written editing.)
     observable outcome that only that decision flip produces. The tool
     re-checks every trace against the live source — a new or changed
     compound condition, a renamed test, or a pair that no longer flips the
-    decision fails the gate. Current state: **30 compound decisions, 66
-    required pairs, all traced** (the permessage-deflate RSV state machine
-    and the extension-negotiation parsing contribute 8 of the decisions);
-    the other 201 if/for conditions are single-condition (branch-level, no
+    decision fails the gate. Current state: **41 compound decisions, 93
+    required pairs, all traced** (the permessage-deflate RSV gates and the
+    extension-negotiation parsing contribute 14 of the decisions);
+    the other 259 if/for conditions are single-condition (branch-level, no
     MC/DC requirement). `make mcdc` reproduces the audit.
 13. **Mutation gate** (`make mut`) — the reverse check on the test
-    evidence above: `cmd/mut` applies each of **70 curated security-
+    evidence above: `cmd/mut` applies each of **74 curated security-
     relevant mutants** to a scratch copy of the ws package and requires the
     full test suite to kill it. Each mutant is a single one-spot rewrite of
     `ws/ws.go` — an operator flip (`>` → `>=`, `==` → `!=`), a bound
@@ -151,7 +156,7 @@ hand-written editing.)
     toolchain (which every scratch run is pinned to) can load the module,
     and a run in which every single mutant is uncompilable fails it — a
     gate that would verify nothing must never pass. Current state:
-    **70 mutants, 70 killed,
+    **74 mutants, 74 killed,
     0 survivors** — every invariant in the registry is pinned by at least
     one test, and the gate keeps it that way: a test that gets deleted or
     weakened stops killing its mutant.

@@ -14,9 +14,11 @@ Browsers send `Sec-WebSocket-Extension: permessage-deflate;
 client_max_window_bits` on every connection, so the negotiation is part of
 every compressed handshake in the wild — and this library answers it.
 
-The other reference RFCs in `doc/` (8307, 8441, 9220) have no browser
-support and conflict with the stdlib-only invariant; they stay
-reference-only (see the table in `doc/USAGE.md`).
+The other reference RFCs in `doc/`: 8441 and 9220 (extended CONNECT over
+HTTP/2 and HTTP/3) are implemented server-side and proven by the e2e
+round trips (`e2e/h2`, `e2e/h3` — see the Transports section and the
+specification table in `doc/USAGE.md`); 8307 (the well-known URI
+conventions) stays reference-only.
 
 ## Design decisions
 

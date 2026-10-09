@@ -502,8 +502,6 @@ func TestDeflateFragmentedCompressedMessage(t *testing.T) {
 	}
 }
 
-// TestDeflateRoundTrip drives real dials: compressed echo in both
-// directions, and the opt-out paths that leave the session uncompressed.
 // checkEmptyEcho verifies that an empty message of each given opcode
 // round-trips through the (compressed) connection: an empty compressed
 // payload must decompress to zero bytes, and an empty message is legal.
@@ -522,6 +520,8 @@ func checkEmptyEcho(t *testing.T, conn *Session, ops ...Op) {
 	}
 }
 
+// TestDeflateRoundTrip drives real dials: compressed echo in both
+// directions, and the opt-out paths that leave the session uncompressed.
 func TestDeflateRoundTrip(t *testing.T) {
 	t.Parallel()
 
