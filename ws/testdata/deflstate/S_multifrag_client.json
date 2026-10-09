@@ -1,9 +1,16 @@
 {
- "desc": "wire 13000013100000",
- "events": [],
+ "desc": "wire 130000130000",
+ "events": [
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "1010",
+   "t": "event"
+  }
+ ],
  "frames": [
   "42021300",
-  "80050013100000"
+  "800400130000"
  ],
  "id": "S_multifrag_client",
  "machine": "deflstate",
@@ -13,27 +20,13 @@
   "RFC 7692 7.2.1"
  ],
  "side": "client",
- "terminal": {
-  "outcomes": [
-   {
-    "code": 1002,
-    "mod": "should",
-    "term": "closeErr",
-    "wire": {
-     "code": 1002,
-     "kind": "coded"
-    }
-   },
-   {
-    "id": "MAY:wire-size-close-omitted",
-    "mod": "may",
-    "note": "RFC 6455 5.5 (the message-size limit applies to the reassembled message) + RFC 6455 7.1.7 (SHOULD close, MAY omit) + project maxMessageSize policy: a compressed message whose accumulated wire already exceeds the limit fails before any decompression. The implementation reports the error directly and takes the MAY.",
-    "term": "proto",
-    "wire": {
-     "kind": "none"
-    }
-   }
-  ]
- },
- "warnings": []
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:tail-shape",
+   "mod": "may",
+   "note": "the wire is malformed (tail-shape); the implementation decodes it anyway and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
 }

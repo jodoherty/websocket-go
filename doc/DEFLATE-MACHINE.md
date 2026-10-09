@@ -28,7 +28,7 @@ RFC 7692 6/6.1/6.2 (+ RFC 6455 5, RFC 3629 3-4)
                         complete-stream form, RFC 7692 7.2.1/7.2.3.5)
         +--> gen_defmodel.py     --> SMV model (nuXmv encoding, IVAR peer;
                                      state-pruned for the nuXmv BDD limit)
-        +--> check_deflprops.py  --> W1-W6 wire invariants (self-check in
+        +--> check_deflprops.py  --> W1-W7 wire invariants (self-check in
                         deflate.py), P1/P2/P6/P7/P8/RX, completeness,
                         encoding round-trip (pure Python)
         +--> gen_defltraces.py   --> minimal frame traces (BFS) + nuXmv
@@ -347,7 +347,7 @@ correct.
 ## Running it
 
 ```
-make deflate-model   # pure Python: W1-W6 + P1/P2/P6/P7/P8/RX/completeness/
+make deflate-model   # pure Python: W1-W7 + P1/P2/P6/P7/P8/RX/completeness/
                      #   encoding + trace<->model consistency
 make test            # replays the committed traces (in the normal suite)
 make defl-report     # print the RSV1 MBT warning count (the assessable summary)

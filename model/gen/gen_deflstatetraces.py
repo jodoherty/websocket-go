@@ -45,10 +45,24 @@ Trace families (one file each, both sides):
   S_multi:              a wire of two complete streams in one message
                         (the DONE state starting a new stream on the
                         next byte; the decoded output is their
-                        concatenation).
+                        concatenation), whole and split.
   S_textutf8:           a text message whose decoded payload is valid
-                        UTF-8 (delivered) and one whose is not
-                        (terminal 1007).
+                        UTF-8 (delivered) and S_textutf8bad, one
+                        whose is not (terminal 1007).
+  S_twostream[_frag]:   two complete canonical empty streams in one
+                        message under the wire limit (03 00 03 00):
+                        the spec walk faults on the first block
+                        already (bad code under the RFC's literal
+                        table), so the delivery is ledgered under
+                        lit-badcode.
+  S_tailshape[_frag]:   a wire the spec classifier names tail-shape
+                        (13 00 04: the RFC-literal empty final block
+                        plus a tail octet the shape does not name)
+                        that the implementation still delivers.
+  S_distoofar_{fin,frag}:  a length-4 / distance-1 repeat code with
+                        no prior output to copy from (dist-too-far):
+                        the only fault class that no witness wire
+                        fires.
 
 The witness states (gen_deflstatemodel.witnesses) cover every coarse
 (phase, output) class the cross-check proved reachable.
@@ -184,7 +198,7 @@ def build(tid, side, frames, wirebytes, op=2):
         "machine": MACHINE,
         "side": side,
         "maxMessageSize": S.MAXMSG,
-        "desc": "wire %s" % wirebytes.hex(),
+        "desc": "wire %s" % (wirebytes.hex() or "(empty)"),
         "rfc": ["RFC 7692 6.2", "RFC 7692 7.2.1"],
         "frames": [f.hex() for f in wire(frames, side)],
         "events": events,
@@ -263,36 +277,48 @@ def gen():
             if err:
                 raise AssertionError(err)
             traces[tr["id"]] = tr
-    # A decompression bomb under the wire limit: the repeated
-    # length-3 / distance-1 code (0x02 each, from the 0b00000
-    # pending) triplets the output; four wire bytes decode to nine,
-    # past the limit, so the terminal is the decompressed-size 1009
-    # (the only size outcome reachable: under the wire limit the
-    # decoded output of a block is bounded by its wire bytes except
-    # through repetition codes).
-    bomb = bytes((0x03, 0x02, 0x02, 0x02))
-    for tid, frames in (("S_bomb_fin", [frame(2, True, True, bomb)]),
-                        ("S_bomb_frag",
-                         [frame(2, False, True, bomb[:2]),
-                          frame(0, True, False, bomb[2:])])):
+    # A length-4 / distance-1 repeat code with no prior output to
+    # copy from: 0x03 (BFINAL=1, fixed, five pending bits of zero)
+    # plus 0x02 (length code 258 = 4 with no extra bits, then
+    # distance code 0 = 1) -- dist-too-far, the terminal 1002
+    # (RFC 6455 7.1.7). The only trace in the suite firing that
+    # fault class: no witness wire does (the witness faults are
+    # btype-reserved, clen-overfull, dist-reserved, len-nlen-
+    # mismatch, and eof). (The decompressed-size 1009 is pinned by
+    # the stored-LEN witnesses instead: a stored block whose LEN the
+    # completion tail extends past the limit, e.g. S_stored1.)
+    distoofar = bytes((0x03, 0x02, 0x02, 0x02))
+    for tid, frames in (("S_distoofar_fin",
+                         [frame(2, True, True, distoofar)]),
+                        ("S_distoofar_frag",
+                         [frame(2, False, True, distoofar[:2]),
+                          frame(0, True, False, distoofar[2:])])):
         for side in SIDES:
-            tr = build(tid, side, frames, bomb)
-            err = machine_check(bomb, tid)
+            tr = build(tid, side, frames, distoofar)
+            err = machine_check(distoofar, tid)
             if err:
                 raise AssertionError(err)
             traces[tr["id"]] = tr
-    # Two complete streams in one message: DONE starts the next stream
-    # on the following byte; the output is the concatenation.
-    stream_a = bytes(G.witnesses()[("done", 1)])
-    stream_b = bytes(G.witnesses()[("done", 2)])
-    wb = stream_a + stream_b
-    for tid, frames in (("S_multi", [frame(2, True, True, wb)]),
+    # Two complete streams in one message under the wire limit:
+    # two RFC-literal empty final blocks (13 00 each, the EOB = 7-bit
+    # code 32, ending at bit 10 of its two bytes), so the whole wire
+    # is six bytes -- the limit. The canonical decode reads each
+    # stream as a literal (the 3.2.6 deviation) plus a non-final EOB,
+    # and the completion tail finishes each, delivering the
+    # concatenation 0x10 0x10: the DONE state starting a new stream
+    # on the next byte, pinned at the frame level with a non-empty
+    # output (the two-stream wire 03 00 03 00 delivers only the empty
+    # concatenation). The spec walk names tail-shape: the stream
+    # ends mid-byte at bit 10 and the remaining octets are more than
+    # the single 7.2.1 tail octet.
+    multi = bytes((0x13, 0x00, 0x00, 0x13, 0x00, 0x00))
+    for tid, frames in (("S_multi", [frame(2, True, True, multi)]),
                         ("S_multifrag",
-                         [frame(2, False, True, wb[:2]),
-                          frame(0, True, False, wb[2:])])):
+                         [frame(2, False, True, multi[:2]),
+                          frame(0, True, False, multi[2:])])):
         for side in SIDES:
-            tr = build(tid, side, frames, wb)
-            err = machine_check(wb, tid)
+            tr = build(tid, side, frames, multi)
+            err = machine_check(multi, tid)
             if err:
                 raise AssertionError(err)
             traces[tr["id"]] = tr
@@ -301,14 +327,28 @@ def gen():
     for side in SIDES:
         tr = build("S_textutf8", side, [frame(1, True, True, text_ok)],
                    text_ok, op=1)
+        err = machine_check(text_ok, "S_textutf8")
+        if err:
+            raise AssertionError(err)
         traces[tr["id"]] = tr
-    # A wire whose decoded payload is invalid UTF-8 on a text frame:
-    # a stored block with one raw 0xff byte (LEN = 1), which the 7.2.1
-    # tail completes.
-    raw_wire = b"\x00\x01\x00\xfe\xff\xff"
+    # A text frame whose decoded payload is invalid UTF-8 (RFC 6455
+    # 5.6): a stored FINAL block with one raw 0xff byte (LEN = 1) --
+    # six wire bytes, the most data a stored block carries under the
+    # wire limit, so there is no room for the 7.2.1 tail octet and the
+    # delivery is ledgered under tail-missing. The decoded lone 0xff
+    # is produced by no UTF-8 encoder -- the terminal is 1007.
+    # (A NON-final stored block plus the tail does not reach the
+    # UTF-8 check: the completion tail cannot complete it -- the
+    # tail assumes the remainder is the truncated block's header
+    # octet -- and the wire is a decompression failure, terminal
+    # 1002, instead.)
+    raw_wire = b"\x01\x01\x00\xfe\xff\xff"
     for side in SIDES:
         tr = build("S_textutf8bad", side,
                    [frame(1, True, True, raw_wire)], raw_wire, op=1)
+        err = machine_check(raw_wire, "S_textutf8bad")
+        if err:
+            raise AssertionError(err)
         traces[tr["id"]] = tr
     return traces
 

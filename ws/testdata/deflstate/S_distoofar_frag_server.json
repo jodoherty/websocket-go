@@ -2,17 +2,17 @@
  "desc": "wire 03020202",
  "events": [],
  "frames": [
-  "42020302",
-  "80020202"
+  "4282010203040200",
+  "8082010203040300"
  ],
- "id": "S_bomb_frag_client",
+ "id": "S_distoofar_frag_server",
  "machine": "deflstate",
  "maxMessageSize": 6,
  "rfc": [
   "RFC 7692 6.2",
   "RFC 7692 7.2.1"
  ],
- "side": "client",
+ "side": "server",
  "terminal": {
   "outcomes": [
    {

@@ -147,8 +147,10 @@ No COMPLETE buffer exists in the table's 1-2 byte domain (the
 minimal compliant buffer is three bytes: the empty fixed final
 block, which reaches the byte boundary at bit 10 with zero padding,
 plus the tail octet), so the table's spec layer exercises the
-prefix/malformed boundary; the oracle cross-check (H) covers the
-compliant shape at the RSV1 machine's wire sizes.
+prefix/malformed boundary; the compliant shape is exercised
+instead by the W7 spec-implementation bridge (model/gen/deflate.py,
+stored-block wires), the section G vectors, and
+TestDecompressCompliantWires.
 
 ## Part 2: the streaming state machine (model/gen/deflate_state.py)
 
@@ -169,7 +171,7 @@ output-sensitive behavior the receiver has).
 
 ### The phases
 
-Thirteen phases, named by the decoder position:
+Twelve phases, named by the decoder position:
 
   HDR    the 3-bit block header (BFINAL, BTYPE) of the first block.
   SLN    the stored block's LEN field (16 bits).
@@ -243,7 +245,7 @@ machine's observed transitions sound against the SMV edges and the
 reachability of every (phase, output) pair cross-checked by a
 per-pair nuXmv query (G !(phase = p & olen = o) "is false" iff
 reachable). One witness byte sequence per pair is verified against
-the machine (31 witnesses); the witness bytes are chosen against
+the machine (37 witnesses); the witness bytes are chosen against
 the implementation's canonical fixed table, where the 5-bit
 pending after a block header constrains which codes the next byte
 can extend (an 8-bit literal from a 0b00000 pending is
@@ -264,15 +266,20 @@ only frame that decompresses:
     exceeds the limit fails with the coded 1002 (the MAY bare
     teardown stays modeled; it does not fire).
   * decompression outcomes from the reference: SIZE (the
-    decompressed 1009, reachable only under the wire limit
-    through repetition codes -- the bomb trace, four wire bytes
-    decoding to nine), CORRUPT / EOF (the coded 1002, MAY bare
-    teardown: MAY:decompress-close-omitted), OK (the delivered
-    payload, asserted byte-for-byte).
+    decompressed 1009, reachable under the wire limit through a
+    stored block whose LEN the completion tail extends past the
+    limit -- the stored-1..6 witnesses, S_stored1 being 40 00 08
+    FF F7 00, LEN = 8 with one data byte, decoding to eight --
+    and through repetition codes, e.g. the oracle wire 73 74 04
+    03 00, a dynamic block decoding to seven 0x41), CORRUPT / EOF
+    (the coded 1002, MAY bare teardown:
+    MAY:decompress-close-omitted), OK (the delivered payload,
+    asserted byte-for-byte).
   * the ledger: a delivered message from a wire the RFC 7692
-    7.2.1 class does not name COMPLETE (truncated, a tail octet
-    that is not 0x00/0x01, nonzero padding, a code the RFC's
-    literal fixed table does not define) fires
+    7.2.1 class does not name COMPLETE (a truncated stream, a
+    tail octet that is not 0x00/0x01, nonzero padding, a code the
+    RFC's literal fixed table does not define, an empty payload)
+    fires
     MAY:deflate-accept:<shape> -- the lenient completion is
     counted, not excused. NOTES.json accepts the seven distinct
     IDs that fire.
@@ -289,18 +296,22 @@ only frame that decompresses:
     the events, and TestDecompressCompliantWires pins both wires
     at the decompress level.
 
-Trace families: every witness state (31 coarse (phase, output)
+Trace families: every witness state (37 coarse (phase, output)
 classes) as a single final frame, split across a non-final and a
 final frame (RFC 7692 6.2: the stream need not be whole in any
 one fragment), and -- on delivery traces -- with an interleaved
-ping; plus the two-stream-in-one-message wire (DONE starting the
+ping; plus the two-stream-in-one-message wires (DONE starting the
 next stream: two canonical empty final blocks, 03 00 03 00, whose
-RFC-literal reading is a bad code -- lit-badcode on delivery), the
-wrong-tail-octet wire that still delivers (13 00 04: the RFC-
-literal empty final block plus a tail octet the shape does not
-name -- tail-shape), the bomb, and the text-frame UTF-8 validity
-pair (RFC 6455 5.6: the decoded payload of a text message is
-checked, terminal 1007 when invalid).
+RFC-literal reading is a bad code -- lit-badcode on delivery of
+the empty concatenation -- and two RFC-literal empty final blocks,
+13 00 00 13 00 00, which deliver the non-empty concatenation 0x10
+0x10, ledgered under tail-shape), the wrong-tail-octet wire that
+still delivers (13 00 04: the RFC-literal empty final block plus a
+tail octet the shape does not name -- tail-shape), the
+no-prior-output distance-1 wire (dist-too-far, the only trace
+firing that fault class), and the text-frame UTF-8 validity pair
+(RFC 6455 5.6: the decoded payload of a text message is checked,
+terminal 1007 when invalid).
 
 The machine's mid-stream state (pending codes, table bytes) is not
 observable at the frame level -- no per-frame decompression -- so

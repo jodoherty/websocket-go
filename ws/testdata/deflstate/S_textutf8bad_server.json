@@ -1,8 +1,8 @@
 {
- "desc": "wire 000100feffff",
+ "desc": "wire 010100feffff",
  "events": [],
  "frames": [
-  "c18601020304010303fafefd"
+  "c18601020304000303fafefd"
  ],
  "id": "S_textutf8bad_server",
  "machine": "deflstate",
@@ -15,21 +15,12 @@
  "terminal": {
   "outcomes": [
    {
-    "code": 1002,
-    "mod": "should",
+    "code": 1007,
+    "mod": "must",
     "term": "closeErr",
     "wire": {
-     "code": 1002,
+     "code": 1007,
      "kind": "coded"
-    }
-   },
-   {
-    "id": "MAY:decompress-close-omitted",
-    "mod": "may",
-    "note": "RFC 7692 6.2 (silent on failure) + RFC 6455 7.1.7 (SHOULD close, MAY omit): the implementation reports the error directly and takes the MAY.",
-    "term": "proto",
-    "wire": {
-     "kind": "none"
     }
    }
   ]
