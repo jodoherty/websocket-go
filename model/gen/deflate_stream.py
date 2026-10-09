@@ -188,6 +188,25 @@ def fixed_lit_lengths():
     return [8] * 144 + [9] * 112 + [7] * 24 + [8] * 8
 
 
+# The fixed literal table as RFC 1951 3.2.6 prints it: an explicit
+# (code_value, length) -> symbol map with gaps (7-bit codes 0-31 are
+# not EOB/length codes; they are prefixes of the 8-bit literal codes
+# or dead). The canonical construction applied to the same code
+# lengths (canonical_codes(fixed_lit_lengths())) assigns the 24
+# 7-bit codes 0-23 to symbols 256-279 instead -- that is the table
+# the implementation's decoder (compress/flate) actually uses, a
+# documented deviation from 3.2.6 (doc/DEFLATE-STREAM.md): a
+# compliant fixed block (7-bit codes 32-63) is misdecoded by it. The
+# fixed distance table is identical under both constructions (all 32
+# 5-bit codes are used). The spec layer (_walk_stream) walks the RFC
+# table; the implementation layer (flate_decode, impl_decompress)
+# walks the canonical table.
+RFC_FIXED_LIT = ({(48 + b, 8): b for b in range(144)}
+                | {(400 + b, 9): 144 + b for b in range(112)}
+                | {(32 + b, 7): 256 + b for b in range(24)}
+                | {(192 + b, 8): 280 + b for b in range(8)})
+
+
 def fixed_dist_lengths():
     """RFC 1951 3.2.6: distance codes 0-31, 5 bits each."""
     return [5] * 32
@@ -426,7 +445,8 @@ def _first_final_boundary(src):
 def impl_decompress(buf, max_msg):
     """The decompress loop of ws/ws.go: every final-block boundary yields
     one decoded stream (trailing octets ignored by the decoder); the last
-    partial segment is decoded with the 7.2.1 completion tail appended;
+    partial segment is decoded with the 7.2.1 completion tail appended
+    (the read loop appends it on the final frame, not on a fragment);
     the total output is bounded by max_msg. The bound is observed at the
     decoder's flush: what the decoder has produced when it stops
     (completion or fault) is written to the size guard, so an output
@@ -469,7 +489,7 @@ def _walk_stream(buf):
     bytes so far; extra the end bit position for MIDBYTE."""
     bits = Bits(buf)
     out = bytearray()
-    lit_fixed = canonical_codes(fixed_lit_lengths())
+    lit_fixed = RFC_FIXED_LIT  # the spec layer walks the RFC table
     dist_fixed = canonical_codes(fixed_dist_lengths())
     while True:
         hdr = bits.read(3)
@@ -570,6 +590,7 @@ def gen_table(path, max_len, max_msg=6):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump({"maxLen": max_len, "maxMsg": max_msg, "rows": rows}, f)
+        f.write("\n")
     return len(rows)
 
 

@@ -1,0 +1,39 @@
+{
+ "desc": "wire 1310100000",
+ "events": [
+  {
+   "kind": "ctrl",
+   "op": "ping",
+   "t": "event"
+  },
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "101010",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "42810102030412",
+  "898001020304",
+  "80840102030411120304"
+ ],
+ "id": "S_done3_ping_server",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1",
+  "RFC 6455 5.5.2"
+ ],
+ "side": "server",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:padding-nonzero",
+   "mod": "may",
+   "note": "the wire is malformed (padding-nonzero); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

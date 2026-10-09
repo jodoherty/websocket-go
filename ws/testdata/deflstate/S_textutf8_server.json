@@ -1,0 +1,32 @@
+{
+ "desc": "wire 130000",
+ "events": [
+  {
+   "kind": "msg",
+   "op": "text",
+   "payload": "10",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "c18301020304120203"
+ ],
+ "id": "S_textutf8_server",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1",
+  "RFC 6455 5.6"
+ ],
+ "side": "server",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:tail-shape",
+   "mod": "may",
+   "note": "the wire is malformed (tail-shape); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

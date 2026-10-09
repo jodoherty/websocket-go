@@ -225,16 +225,31 @@ def main():
     check("A.single-bit", D.canonical_codes([1]), {(0, 1): 0})
 
     # --- B. Fixed tables (RFC 1951 3.2.6) --------------------------------
-    lit = D.canonical_codes(D.fixed_lit_lengths())
-    check("B.lit0", lit.get((0b00110000, 8)), 0)
-    check("B.lit143", lit.get((0b10111111, 8)), 143)
-    check("B.lit144", lit.get((0b110010000, 9)), 144)
-    check("B.lit255", lit.get((0b111111111, 9)), 255)
-    check("B.eob", lit.get((0, 7)), 256)
-    check("B.lit279", lit.get((0b0010111, 7)), 279)
-    check("B.lit280", lit.get((0b11000000, 8)), 280)
-    check("B.lit287", lit.get((0b11000111, 8)), 287)
-    check("B.lit-count", len(lit), 288)
+    # The RFC's literal table, as 3.2.6 prints it (the spec layer):
+    lit = D.RFC_FIXED_LIT
+    check("B.rfc-lit0", lit.get((0b00110000, 8)), 0)
+    check("B.rfc-lit143", lit.get((0b10111111, 8)), 143)
+    check("B.rfc-lit144", lit.get((0b110010000, 9)), 144)
+    check("B.rfc-lit255", lit.get((0b111111111, 9)), 255)
+    check("B.rfc-eob", lit.get((0b0100000, 7)), 256)
+    check("B.rfc-lit279", lit.get((0b0110111, 7)), 279)
+    check("B.rfc-lit280", lit.get((0b11000000, 8)), 280)
+    check("B.rfc-lit287", lit.get((0b11000111, 8)), 287)
+    check("B.rfc-lit-count", len(lit), 288)
+    # 7-bit codes below 32 are not EOB/length codes in the RFC table
+    # (they are prefixes of the 8-bit literals or dead), and the 24
+    # EOB/length codes occupy 32-55, leaving 56-63 unused:
+    check("B.rfc-eob-gap", lit.get((0, 7)), None)
+    check("B.rfc-gap31", lit.get((31, 7)), None)
+    check("B.rfc-gap63", lit.get((63, 7)), None)
+    # The implementation's decoder walks the canonical construction
+    # over the same code lengths (a documented deviation from the
+    # literal table: the 24 seven-bit codes 0-23 become symbols
+    # 256-279):
+    impl = D.canonical_codes(D.fixed_lit_lengths())
+    check("B.impl-eob", impl.get((0, 7)), 256)
+    check("B.impl-lit279", impl.get((23, 7)), 279)
+    check("B.impl-lit-count", len(impl), 288)
     dist = D.canonical_codes(D.fixed_dist_lengths())
     check("B.dist-count", len(dist), 32)
     check("B.dist0", dist.get((0, 5)), 0)
@@ -277,11 +292,11 @@ def main():
     wbits(0x41, 8)
     fd("C.trunc", finish(), D.EOF, "eof", out=b"A")
 
-    # --- D. Fixed blocks --------------------------------------------------
+    # --- D. Fixed blocks (implementation table: canonical) --------------------------------------------------
     wbit, wbits, whuff, finish = bits_writer()
     wbit(1)
     wbits(1, 2)  # BTYPE=01
-    code, length = next((c, l) for (c, l), s in lit.items() if s == 65)
+    code, length = next((c, l) for (c, l), s in impl.items() if s == 65)
     whuff(code, length)
     whuff(0, 7)  # end-of-block
     buf = finish()
@@ -294,9 +309,9 @@ def main():
     wbit, wbits, whuff, finish = bits_writer()
     wbit(1)
     wbits(1, 2)
-    code, length = next((c, l) for (c, l), s in lit.items() if s == 65)
+    code, length = next((c, l) for (c, l), s in impl.items() if s == 65)
     whuff(code, length)
-    c257, l257 = next((c, l) for (c, l), s in lit.items() if s == 257)
+    c257, l257 = next((c, l) for (c, l), s in impl.items() if s == 257)
     whuff(c257, l257)  # length 257: 3, no extra
     d5 = int(format(0, "05b")[::-1], 2)
     wbits(d5, 5)  # fixed distance code 0: distance 1, no extra
@@ -427,18 +442,25 @@ def main():
     check("G.tail-extra", D.spec7692(stream + bytes([0x01, 0x00])),
           (D.MALFORMED, None, "tail-shape"))
     # Mid-byte final block with the MUST zero padding, then the tail.
-    wbit, wbits, whuff, finish = bits_writer()
-    wbit(1)
-    wbits(1, 2)  # fixed
-    whuff(0, 7)  # EOF: the block ends at bit 10, mid-byte
-    buf = bytearray(finish())
-    buf[1] |= 0x3C  # pad bits 10-15 set to one: not the 7.2.1 padding
-    check("G.padding-nonzero", D.spec7692(bytes(buf)),
+    # The spec layer walks the RFC literal table: the EOB is the
+    # 7-bit code 32 (0100000) -- header (1, 1, 0) plus code bits
+    # (0, 1, 0, 0, 0) make byte 0 = 0x13, and the code's last two
+    # bits (0, 0) land in byte 1, so the empty final fixed block is
+    # 0x13 0x00, ending at bit 10, mid-byte.
+    check("G.padding-nonzero", D.spec7692(bytes([0x13, 0x3C])),
           (D.MALFORMED, None, "padding-nonzero"))
-    check("G.midbyte-complete", D.spec7692(bytes([0x03, 0x00, 0x01])),
+    check("G.midbyte-complete", D.spec7692(bytes([0x13, 0x00, 0x01])),
           (D.COMPLETE, b"", None))
-    check("G.midbyte-prefix", D.spec7692(bytes([0x03, 0x00])),
+    check("G.midbyte-prefix", D.spec7692(bytes([0x13, 0x00])),
           (D.PREFIX, None, "tail-missing"))
+    # The same buffer under the implementation's canonical table
+    # (EOB = 7-bit code 0) is the 0x03 0x00 shape: the implementation
+    # decodes it; the spec layer (above) does not -- the documented
+    # 3.2.6 deviation, pinned by the exhaustive table's ledger.
+    check("G.impl-canonical-empty", D.flate_decode(bytes([0x03, 0x00])),
+          (D.OK, b"", None))
+    check("G.spec-rejects-canonical", D.spec7692(bytes([0x03, 0x00])),
+          (D.MALFORMED, None, "lit-badcode"))
 
     # --- H. The implementation's committed oracle --------------------------
     here = os.path.dirname(os.path.abspath(__file__))

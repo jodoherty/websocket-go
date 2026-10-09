@@ -1,0 +1,39 @@
+{
+ "desc": "wire 40",
+ "events": [
+  {
+   "kind": "ctrl",
+   "op": "ping",
+   "t": "event"
+  },
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "428001020304",
+  "898001020304",
+  "80810102030441"
+ ],
+ "id": "S_stored0_ping_server",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1",
+  "RFC 6455 5.5.2"
+ ],
+ "side": "server",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:stream-incomplete",
+   "mod": "may",
+   "note": "the wire is prefix (stream-incomplete); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

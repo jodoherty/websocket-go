@@ -1,0 +1,38 @@
+{
+ "desc": "wire 400008fff700",
+ "events": [],
+ "frames": [
+  "c206400008fff700"
+ ],
+ "id": "S_stored1_fin_client",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "client",
+ "terminal": {
+  "outcomes": [
+   {
+    "code": 1009,
+    "mod": "should",
+    "term": "closeErr",
+    "wire": {
+     "code": 1009,
+     "kind": "coded"
+    }
+   },
+   {
+    "id": "MAY:decompress-size-close-omitted",
+    "mod": "may",
+    "note": "RFC 6455 7.4.2 (1009) + RFC 7692 8 (informative): the decompressed-size limit is project policy, the RFC assigns no Close frame to the overflow; the implementation reports the error directly and takes the 7.1.7 MAY.",
+    "term": "proto",
+    "wire": {
+     "kind": "none"
+    }
+   }
+  ]
+ },
+ "warnings": []
+}

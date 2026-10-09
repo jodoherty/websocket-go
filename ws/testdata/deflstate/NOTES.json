@@ -1,0 +1,37 @@
+[
+  {
+    "id": "MAY:deflate-accept:empty",
+    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST).",
+    "reason": "An empty compressed payload is not a complete stream; the implementation's completion tail (a truncated empty stored block, 7.2.1) completes it to the empty message and delivers. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
+  },
+  {
+    "id": "MAY:deflate-accept:stream-incomplete",
+    "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST).",
+    "reason": "A wire that is a valid stream prefix ending at a non-final block boundary is not a complete stream; the implementation's completion tail (the 7.2.1 truncated empty stored block) finishes it and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to refuse a truncated stream; the lenient parse is counted, not excused."
+  },
+  {
+    "id": "MAY:deflate-accept:tail-shape",
+    "basis": "RFC 7692 7.2.1 (the payload is [stream][exactly one completion octet], MUST).",
+    "reason": "A wire whose final block is followed by bytes other than the one completion octet (extra data, a second stream) is not 7.2.1-shaped; the decoder stops at the final block and the trailing bytes are ignored, so the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to inspect what follows the final block; the lenient parse is counted, not excused."
+  },
+  {
+    "id": "MAY:deflate-accept:padding-nonzero",
+    "basis": "RFC 7692 7.2.1 (padding is the zero bits from the stream's end to the next byte boundary, MUST).",
+    "reason": "A stream ending mid-byte with nonzero padding bits is not a compliant wire; the implementation's completion tail repairs it (the padding bits read as the tail's data) and the decoded message is delivered. Accepted: the RFC assigns the receiver no obligation to inspect the padding; the lenient parse is counted, not excused."
+  },
+  {
+    "id": "MAY:deflate-accept:lit-badcode",
+    "basis": "RFC 7692 7.2.1 + RFC 1951 3.2.6 (the fixed Huffman code assignments).",
+    "reason": "A wire carrying a code the RFC's literal fixed table does not define is malformed under the RFC's table; the implementation's canonical decoder decodes a legal message on some of these wires. Accepted: the fixed-table deviation is documented in doc/DEFLATE-STREAM.md; the acceptance of the legal subset is a counted divergence from the RFC-literal table, not excused."
+  },
+  {
+    "id": "MAY:decompress-close-omitted",
+    "basis": "RFC 7692 6.2 (decompression algorithm; silent on failure) + RFC 6455 7.1.7 (SHOULD send a Close frame with an appropriate status code, MAY omit it).",
+    "reason": "A failed decompression (a corrupted or truncated DEFLATE stream the completion tail did not repair) is not a failure mode RFC 7692 assigns a Close frame to; the RFC's only obligation is to fail the connection (MUST). The implementation reports the error directly to the reader and sends no Close frame, taking the 7.1.7 MAY. Accepted: the SHOULD target set {1002, 1007} is under-specified by the RFC, and a bare teardown is the MAY outcome the RFC explicitly permits."
+  },
+  {
+    "id": "MAY:decompress-size-close-omitted",
+    "basis": "RFC 6455 7.4.2 (1009 'message too big') + RFC 7692 8 (decompression bombs, informative) + project maxMessageSize policy (the limit is not an RFC concept).",
+    "reason": "A decompressed payload that exceeds the project's maxMessageSize while decompressing has no RFC-mandated Close frame: the limit is project policy and RFC 7692 is silent on the overflow. The implementation reports the error directly to the reader and sends no Close frame, taking the 7.1.7 MAY. Accepted: the SHOULD target set {1002, 1009} is under-specified, and a bare teardown is the MAY outcome the RFC permits."
+  }
+]

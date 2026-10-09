@@ -1,0 +1,32 @@
+{
+ "desc": "wire 13100000",
+ "events": [
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "1010",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "420113",
+  "8003100000"
+ ],
+ "id": "S_done2_frag_client",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "client",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:padding-nonzero",
+   "mod": "may",
+   "note": "the wire is malformed (padding-nonzero); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

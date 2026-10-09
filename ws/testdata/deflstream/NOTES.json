@@ -1,7 +1,7 @@
 [
   {
     "id": "MAY:deflate-accept:stream-incomplete",
-    "basis": "RFC 7692 7.2.1 (the compressed message ends in the truncated empty stored block; the implementation completes the last segment by appending the 9-octet completion tail) + RFC 7692's silence on decompression failure (as MAY:decompress-close-omitted records).",
+    "basis": "RFC 7692 7.2.1 (the compressed message ends in the truncated empty stored block; the implementation completes the last segment by appending the 9-octet completion tail) + RFC 7692's silence on decompression failure.",
     "reason": "A buffer whose stream is truncated (no BFINAL block in the wire bytes) is not the RFC 7692 7.2.1 shape, but the implementation's completion tail happens to complete some of them -- the appended octets form the final block the decoder then reaches. RFC 7692's failure clause is absent, so accepting such a buffer (with the bytes the tail supplies) is a MAY leniency, not a MUST violation. Accepted: the implementation's documented tail-append policy; a receiver that rejects these instead is equally conformant."
   },
   {
@@ -13,5 +13,20 @@
     "id": "MAY:deflate-accept:tail-missing",
     "basis": "RFC 7692 7.2.1 (a compliant compressed message ends in the truncated empty stored header) + RFC 1951 (a complete byte-aligned stream is valid DEFLATE data in its own right).",
     "reason": "A complete byte-aligned stream with no truncated tail byte is what a bare RFC 1951 stream looks like; the implementation's final-block boundary loop terminates at the final block and does not require the 7.2.1 tail. The tail is what a compliant 7.2.1 compressor emits, but the RFC assigns the receiver no obligation to check for it. Accepted: a MAY leniency."
+  },
+  {
+    "id": "MAY:deflate-accept:lit-badcode",
+    "basis": "RFC 1951 3.2.6 (the fixed literal table: 7-bit codes 32-55 are the EOB/length codes; 0-31 are not codes) versus the implementation's canonical fixed table (7-bit codes 0-23 are the EOB/length codes): a documented implementation deviation, and RFC 7692's silence on decompression failure.",
+    "reason": "The implementation's decoder (compress/flate) walks the canonical construction of the fixed code lengths, not the literal table 3.2.6 prints: the 24 seven-bit codes 0-23 decode as symbols 256-279 where the RFC table has none, and the RFC's 7-bit codes 32-63 decode as other symbols. A buffer the spec layer classifies as a malformed fixed block (a bad code under the literal table) can therefore be accepted by the implementation. Accepted: the deviation is the implementation's documented observable behavior, and a compliant peer sending a fixed block (no real-world encoder does -- zlib, Go, and browsers emit stored or dynamic blocks) would hit the mirror-image failure instead; tightening the implementation requires leaving stdlib compress/flate, which the drop-in property does not allow."
+  },
+  {
+    "id": "MAY:deflate-accept:dist-too-far",
+    "basis": "the same fixed-table deviation as lit-badcode (RFC 1951 3.2.6 vs the implementation's canonical fixed table) + RFC 1951 3.2.5 (a distance cannot point before the start of the output) and RFC 7692's silence on decompression failure.",
+    "reason": "Under the spec's literal table the buffer's fixed block carries a distance past the start of the output (a MUST fault); under the implementation's canonical table the same bits decode as a different (acceptable) sequence. Accepted as the implementation's documented observable behavior of the fixed-table deviation; see lit-badcode."
+  },
+  {
+    "id": "MAY:deflate-accept:dist-reserved",
+    "basis": "the same fixed-table deviation as lit-badcode (RFC 1951 3.2.6 vs the implementation's canonical fixed table) + RFC 1951 3.2.6 (distance codes 30 and 31 are reserved) and RFC 7692's silence on decompression failure.",
+    "reason": "Under the spec's literal table the buffer's fixed block hits a reserved distance code; under the implementation's canonical table the same bits decode as a different (acceptable) sequence. Accepted as the implementation's documented observable behavior of the fixed-table deviation; see lit-badcode."
   }
 ]

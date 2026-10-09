@@ -1,0 +1,31 @@
+{
+ "desc": "wire 40",
+ "events": [
+  {
+   "kind": "msg",
+   "op": "binary",
+   "payload": "",
+   "t": "event"
+  }
+ ],
+ "frames": [
+  "c20140"
+ ],
+ "id": "S_stored0_fin_client",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "client",
+ "terminal": null,
+ "warnings": [
+  {
+   "basis": "RFC 7692 7.2.1 (the final frame's payload is a complete stream, MUST) + 7.2.1 completion octets",
+   "id": "MAY:deflate-accept:stream-incomplete",
+   "mod": "may",
+   "note": "the wire is prefix (stream-incomplete); the implementation completes it with the 7.2.1 tail and delivers the message -- a lenient parse the RFC does not require"
+  }
+ ]
+}

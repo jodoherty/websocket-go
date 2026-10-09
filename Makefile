@@ -1,7 +1,7 @@
 GOLANGCI ?= golangci-lint
 MBT_IMAGE ?= websocket-go-model:latest
 
-.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report deflate-model defl-gen defl-report deflstream deflstream-gen mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
+.PHONY: all gate lint staticcheck test race fuzz bench coverage branchcov mcdc utf8-model model model-image mbt-gen mbt-report close-model close-mbt-gen close-report deflate-model defl-gen defl-report deflstream deflstream-gen deflstate deflstate-model deflstate-gen mut multiver e2e e2e-h2 e2e-h3 e2e-connect demo certgen
 
 # The whole gate: strict lint (all linters), independent staticcheck
 # opinion, and the full test suite under the race detector.
@@ -9,7 +9,7 @@ all: lint staticcheck test
 
 # The complete validation gate (AGENTS.md's list plus fuzz and e2e) in one
 # command: there is no CI, so this is the check to run before pushing.
-gate: all race fuzz bench mcdc model close-model deflate-model deflstream mut branchcov coverage multiver e2e e2e-connect
+gate: all race fuzz bench mcdc model close-model deflate-model deflstream deflstate deflstate-model mut branchcov coverage multiver e2e e2e-connect
 
 # Strictest standard lint: every linter enabled. The exclusion list lives in
 # .golangci.yml and is deliberately short and documented.
@@ -180,6 +180,34 @@ deflstream-gen:
 		echo "deflstream-gen: committed table unchanged"; \
 	else \
 		echo "deflstream-gen: table changed -- commit it"; git --no-pager diff --stat -- ws/testdata/deflstream; exit 1; \
+	fi
+
+# The streaming DEFLATE state machine's container-free self-check
+# (doc/DEFLATE-STREAM.md part 2): the byte-granular machine against the
+# byte-level implementation model on every prefix of the committed
+# exhaustive table and every committed oracle wire (outcome, output
+# length, absorption, prefix-set soundness). The Go side replays the
+# concrete frame traces as TestMBTDeflState.
+deflstate:
+	python3 model/gen/check_deflstateprops.py
+
+# The state machine's coarse reachability cross-check: the 6-phase /
+# capped-output SMV model against the independent nuXmv encoding, with
+# the machine's observed transitions sound against the SMV edges and
+# every (phase, output) pair reached in the machine witnessed in the
+# model and vice versa. Needs the model container.
+deflstate-model: model-image
+	@MBT_IMAGE=$(MBT_IMAGE) python3 model/gen/gen_deflstatemodel.py
+
+# Regenerate the committed state-machine traces; the expectations are
+# recomputed from the reference classifier and the machine must agree
+# (same determinism rule as defl-gen).
+deflstate-gen:
+	@python3 model/gen/gen_deflstatetraces.py ws/testdata/deflstate
+	@if git diff --quiet -- ws/testdata/deflstate 2>/dev/null; then \
+		echo "deflstate-gen: committed traces unchanged"; \
+	else \
+		echo "deflstate-gen: traces changed -- commit them"; git --no-pager diff --stat -- ws/testdata/deflstate; exit 1; \
 	fi
 
 # Build the model container (nuXmv). Rebuild only when model/Containerfile

@@ -1,0 +1,38 @@
+{
+ "desc": "wire 12101010",
+ "events": [],
+ "frames": [
+  "c20412101010"
+ ],
+ "id": "S_huff3_fin_client",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "client",
+ "terminal": {
+  "outcomes": [
+   {
+    "code": 1002,
+    "mod": "should",
+    "term": "closeErr",
+    "wire": {
+     "code": 1002,
+     "kind": "coded"
+    }
+   },
+   {
+    "id": "MAY:decompress-close-omitted",
+    "mod": "may",
+    "note": "RFC 7692 6.2 (silent on failure) + RFC 6455 7.1.7 (SHOULD close, MAY omit): the implementation reports the error directly and takes the MAY.",
+    "term": "proto",
+    "wire": {
+     "kind": "none"
+    }
+   }
+  ]
+ },
+ "warnings": []
+}

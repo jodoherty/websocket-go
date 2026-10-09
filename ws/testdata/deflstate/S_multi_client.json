@@ -1,0 +1,38 @@
+{
+ "desc": "wire 13000013100000",
+ "events": [],
+ "frames": [
+  "c20713000013100000"
+ ],
+ "id": "S_multi_client",
+ "machine": "deflstate",
+ "maxMessageSize": 6,
+ "rfc": [
+  "RFC 7692 6.2",
+  "RFC 7692 7.2.1"
+ ],
+ "side": "client",
+ "terminal": {
+  "outcomes": [
+   {
+    "code": 1002,
+    "mod": "should",
+    "term": "closeErr",
+    "wire": {
+     "code": 1002,
+     "kind": "coded"
+    }
+   },
+   {
+    "id": "MAY:wire-size-close-omitted",
+    "mod": "may",
+    "note": "RFC 6455 5.5 (the message-size limit applies to the reassembled message) + RFC 6455 7.1.7 (SHOULD close, MAY omit) + project maxMessageSize policy: a compressed message whose accumulated wire already exceeds the limit fails before any decompression. The implementation reports the error directly and takes the MAY.",
+    "term": "proto",
+    "wire": {
+     "kind": "none"
+    }
+   }
+  ]
+ },
+ "warnings": []
+}

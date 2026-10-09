@@ -52,6 +52,13 @@ type mbtTrace struct {
 	Frames         []string     `json:"frames"`
 	Events         []mbtEvent   `json:"events"`
 	Terminal       *mbtTerminal `json:"terminal"`
+	// Warnings are the counted divergences the trace expects on a
+	// delivered message: the MAY lenient acceptances (a wire the RFC
+	// 7692 7.2.1 class does not name compliant that the implementation
+	// completes with its completion tail and delivers) fire when the
+	// delivery itself is verified. Traces of other machines leave
+	// this empty.
+	Warnings []mbtOutcome `json:"warnings"`
 }
 
 type mbtEvent struct {
@@ -180,6 +187,13 @@ func runMBTTrace(t *testing.T, tr mbtTrace, ledger *mbtLedger, compressed bool) 
 	for i, exp := range tr.Events {
 		ev, err := c.ReadEvent()
 		checkMBTEvent(t, tr.ID, i, exp, ev, err)
+	}
+
+	// Counted divergences on a delivered message (the MAY lenient
+	// acceptances the trace's ledger expects; fired now, with the
+	// delivery verified).
+	for _, w := range tr.Warnings {
+		ledger.add(w.ID, tr.ID, w.Note)
 	}
 
 	// Terminal step: a terminal error is returned (MUST), and the close-frame

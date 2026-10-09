@@ -112,6 +112,10 @@ make close-model # close-handshake machine: model properties + trace fidelity
 make deflstream  # DEFLATE stream machine (part 1): the RFC 1951/7692
                 # reference classifier self-check; the Go suite replays the
                 # exhaustive 1-2 byte table as TestDecompressStreamTable
+make deflstate   # DEFLATE stream machine (part 2): the byte-granular
+                # streaming state machine self-check (Q1-Q4); the Go
+                # suite replays the frame traces as TestMBTDeflState
+make deflstate-model # part 2 coarse reachability cross-check (nuXmv)
 make branchcov   # per-branch coverage, unit + e2e merged
 make coverage    # statement coverage
 make multiver    # build + vet + ws unit + Go e2e, all under -race, on
@@ -292,6 +296,14 @@ ws/deflstream_test.go the DEFLATE stream machine replay (part 1, doc/
                     acceptance, and counts the accepted PREFIX/MALFORMED
                     leniencies against NOTES.json (three MAY:deflate-accept
                     entries)
+ws/deflstate_test.go  the DEFLATE state-machine replay (part 2, doc/
+                    DEFLATE-STREAM.md): the committed frame traces
+                    (ws/testdata/deflstate/, 174 files) against a live
+                    compressed RawConn on both sides: delivery asserted
+                    byte-for-byte, the terminal close codes (wire-side
+                    limit 1002, decompression 1002/1009, text UTF-8
+                    1007), and the MAY lenient acceptances counted
+                    against NOTES.json (seven accepted IDs)
 ws/testdata/mbt/   committed model-based traces (JSON): one per (transition,
                     side); plus NOTES.json, the allowlist of accepted SHOULD/
                     MAY divergences (each with its RFC basis + reason)
@@ -310,6 +322,15 @@ ws/testdata/deflstream/
                     7692 spec layer) and NOTES.json (three accepted MAY
                     leniencies: stream-incomplete, padding-nonzero,
                     tail-missing)
+ws/testdata/deflstate/
+                    committed DEFLATE state-machine traces (JSON): one per
+                    (witness state, variant, side) over the 31 coarse
+                    (phase, output) classes -- single final frame, split
+                    fragment, interleaved ping -- plus the two-stream
+                    wire, the bomb, and the text UTF-8 pair; NOTES.json
+                    accepts the seven MAY IDs that fire (five
+                    deflate-accept shapes + the two close-omitted
+                    silences)
 cmd/demo/       demo TLS server: /ws/echo, /ws/bearer, /ws/mtls, /ws/goodbye, /certinfo
 cmd/certgen/    generates the throwaway CA / server / client certificates
 cmd/branchcov/  branch-coverage tool: derives per-branch outcomes from a
@@ -335,9 +356,12 @@ doc/rfc8307.txt   the RFC 8307 reference (QUIC)
 doc/rfc8441.txt   the RFC 8441 reference (HTTP/2 extended CONNECT)
 doc/rfc9220.txt   the RFC 9220 reference (HTTP/3 extended CONNECT)
 doc/COMPRESSION.md permessage-deflate design + interop evidence
-doc/DEFLATE-STREAM.md the DEFLATE stream machine (part 1): the RFC 7692
+doc/DEFLATE-STREAM.md the DEFLATE stream machine: part 1 -- the RFC 7692
                     7.2.1 compliant shape, the reference classifier (RFC
-                    1951), the exhaustive table, the ledger
+                    1951), the exhaustive table, the ledger; part 2 --
+                    the byte-granular streaming state machine (13
+                    phases, content-agnostic), the Q1-Q5 self-checks,
+                    the coarse nuXmv cross-check, the frame traces
 doc/STATES.md     the frame-reassembly state machine: the RFC 6455
                     transformation, the shared RFC 3629 boundary machine
                     (P6 projection), trace
@@ -424,6 +448,27 @@ model/          model-based validation suite (doc/STATES.md): the RFC 6455
                                  the RFC's worked examples and tables, the
                                  7.2.1 shape, and exhaustive agreement with
                                  the committed decompression oracle
+                gen/deflate_state.py the streaming DEFLATE state machine
+                                 (part 2, doc/DEFLATE-STREAM.md): the
+                                 byte-granular decoder configuration
+                                 machine (13 phases, content-agnostic,
+                                 output tracked as a capped count),
+                                 total on all states
+                gen/check_deflstateprops.py the state-machine
+                                 self-check (Q1-Q4): outcome/output
+                                 agreement with the reference on every
+                                 prefix of the exhaustive table and
+                                 every oracle wire, absorption,
+                                 prefix-set soundness
+                gen/gen_deflstatemodel.py the coarse SMV model (6
+                                 phases x capped output) + witness
+                                 verification + soundness + the per-pair
+                                 nuXmv reachability cross-check (Q5)
+                gen/gen_deflstatetraces.py the frame-trace generator:
+                                 witness states x frame variants, the
+                                 expectations from the reference
+                                 classifier, the machine cross-checked
+                                 on every wire -> ws/testdata/deflstate/
                 gen/deflate_oracle.json the decompression oracle: the
                                  implementation's decompress() on all 1,531
                                  alphabet accumulations up to the limit
@@ -467,7 +512,8 @@ Makefile        the repeatable gate: make gate (the full set) plus the
                     mut / bench / mcdc / model / close-model / model-image /
                     mbt-gen / mbt-report / close-mbt-gen / close-report /
                     deflate-model / defl-gen / defl-report / deflstream /
-                    deflstream-gen / branchcov / coverage / e2e targets
+                    deflstream-gen / deflstate / deflstate-model /
+                    deflstate-gen / branchcov / coverage / e2e targets
 ```
 
 ## Workflow
