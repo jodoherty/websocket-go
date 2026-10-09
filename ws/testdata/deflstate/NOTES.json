@@ -22,7 +22,7 @@
   {
     "id": "MAY:deflate-accept:lit-badcode",
     "basis": "RFC 7692 7.2.1 + RFC 1951 3.2.6 (the fixed Huffman code assignments).",
-    "reason": "A wire carrying a fixed block the RFC's literal table does not define (the implementation's canonical table decodes 7-bit codes 0-23 as the EOB/length codes where the RFC has none) is malformed under the RFC's table; the implementation's canonical decoder decodes a legal message on some of these wires and delivers it. Accepted: the fixed-table deviation is documented in doc/DEFLATE-STREAM.md; the acceptance of the legal subset is a counted divergence from the RFC-literal table, not excused. (The mirror image is live on the wire: an RFC-literal fixed block, e.g. the empty final block 03 00 with EOB = 7-bit code 32, decodes under the canonical table as a literal -- the S_tailshape and witness traces pin both directions.)"
+    "reason": "A wire carrying a fixed block the RFC's literal table does not define (the implementation's canonical table decodes 7-bit codes 0-23 as the EOB/length codes where the RFC has none) is malformed under the RFC's table; the implementation's canonical decoder decodes a legal message on some of these wires and delivers it. Accepted: the fixed-table deviation is documented in doc/DEFLATE-STREAM.md; the acceptance of the legal subset is a counted divergence from the RFC-literal table, not excused. (The mirror image is live on the wire: the RFC-literal empty final block, 13 00 with EOB = 7-bit code 32, decodes under the canonical table as a literal plus a non-final EOB -- the S_tailshape and witness traces pin both directions.)"
   },
   {
     "id": "MAY:decompress-close-omitted",
