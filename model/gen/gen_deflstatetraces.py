@@ -91,10 +91,9 @@ def ledger_for_wire(wirebytes):
              "basis": "RFC 7692 7.2.1 (the final frame's payload is a "
                       "complete stream, MUST) + 7.2.1 completion "
                       "octets",
-             "note": "the wire is %s (%s); the implementation "
-                     "completes it with the 7.2.1 tail and delivers "
-                     "the message -- a lenient parse the RFC does not "
-                     "require" % (cls, fault)}]
+             "note": "the wire is %s (%s); the implementation decodes "
+                     "it anyway and delivers the message -- a lenient "
+                     "parse the RFC does not require" % (cls, fault)}]
 
 
 OUTCOME_WIRE = {"outcomes": [

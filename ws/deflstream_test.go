@@ -106,17 +106,21 @@ func runDeflStreamRow(t *testing.T, row [5]string, maxMsg int, ledger *mbtLedger
 
 // TestDecompressCompliantWires pins the receiver's semantics on the
 // RFC 7692 7.2.1 compliant shape itself -- a complete byte-aligned
-// stored-block stream plus the truncated empty stored header's first
-// octet (0x00 or 0x01; the RFC leaves the appended block's BFINAL
+// stream plus the truncated empty stored header's first octet
+// (0x00 or 0x01; the RFC leaves the appended block's BFINAL
 // unspecified) -- which the exhaustive table cannot contain (the
-// domain is 1-2 bytes; the minimal compliant buffer is five plus
-// the tail). The reference classifier's W7 (model/gen/deflate.py)
+// domain is 1-2 bytes; the minimal compliant buffer is three
+// bytes). The reference classifier's W7 (model/gen/deflate.py)
 // asserts the same shape against the part-1 reference; this pins the
 // implementation's side of the bridge. The stored-block family keeps
 // the pin table-independent: the RFC's literal fixed table and the
 // implementation's canonical one decode fixed blocks differently
 // (the documented 3.2.6 deviation), so a compliant fixed-block wire
-// is not a payload-level bridge.
+// is not a payload-level bridge. The fixed-family group pins that
+// deviation on the implementation's side instead: both wires carry
+// the RFC-literal empty stream plus the compliant tail (spec
+// payload: empty) while the canonical table delivers 0x10 and five
+// 0x10s respectively.
 func TestDecompressCompliantWires(t *testing.T) {
 	t.Parallel()
 	// stored block: the 5-byte aligned header (01, the two LEN
@@ -135,6 +139,16 @@ func TestDecompressCompliantWires(t *testing.T) {
 		// table's MAY:deflate-accept:tail-missing ledger entry).
 		{"stored-empty-no-tail", "010000FFFF", ""},
 		{"stored-A-no-tail", "010100FEFF41", "41"},
+		// The fixed-family compliant wires: the RFC-literal empty
+		// final fixed block (13 00: EOB = 7-bit code 32, ending at
+		// bit 10 with zero padding) plus the tail octet. Spec
+		// payload: empty on both. The canonical table deviates
+		// (3.2.6): 13 00 reads as literal 16 plus a non-final EOB
+		// (the completion tail finishes the stream), and the 0x01
+		// tail octet reads as length 4 / distance 1 (five 0x10)
+		// plus the final EOB.
+		{"fixed-empty-tail-zero", "130000", "10"},
+		{"fixed-empty-tail-one", "130001", "1010101010"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
